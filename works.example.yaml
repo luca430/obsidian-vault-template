@@ -1,0 +1,17 @@
+# Copy to works.yaml (ignored). An empty registry is fully supported.
+works: []
+# Example registration (uncomment only after setting paths and source_roots):
+# works:
+#   - id: draft-001
+#     title: Project manuscript
+#     document_type: manuscript   # Also draft, review, report, etc.
+#     status: drafting
+#     source_type: latex          # Prefer latex when available; otherwise pdf.
+#     source_path: ../manuscript/main.tex
+#     bibliography_path: ../manuscript/references.bib  # Optional.
+#   - id: report-001
+#     title: Project report
+#     document_type: report
+#     status: submitted
+#     source_type: pdf
+#     source_path: ../report/report.pdf

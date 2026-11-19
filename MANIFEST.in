@@ -1,0 +1,12 @@
+include README.md LICENSE AGENTS.md Home.md config.example.yaml works.example.yaml .gitignore
+recursive-include agents *.md
+recursive-include Templates *.md
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include docs *.md
+include .obsidian/app.json .obsidian/core-plugins.json
+include .github/workflows/tests.yml
+include Literature/.gitkeep Concepts/.gitkeep
+include My?Work/.gitkeep My?Notes/.gitkeep
+include Reviews/Links/.gitkeep Reviews/Removals/.gitkeep Reviews/Revisions/.gitkeep
+include .pipeline/.gitkeep

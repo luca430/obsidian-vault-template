@@ -1,0 +1,24 @@
+# Copy to config.yaml (ignored by Git); fill in your own collection key.
+zotero:
+  base_url: http://localhost:23119/api/
+  library: users/0             # Personal local library; groups/<numeric-id> also supported.
+  collection_key: REPLACE_ME  # Eight uppercase letters/digits from Zotero's collection URI.
+  include_subcollections: true
+
+attachments:
+  # Unrecognized non-PDF files are reported as ignored. PDF filenames containing
+  # supplement/supporting/appendix default to supplementary; other PDFs to main.
+  # Override with actual Zotero attachment keys, never filenames:
+  overrides: {}              # {ABCDEFGH: main, IJKLMNPQ: supplementary, RSTUVWXY: ignore}
+  # Alternatively tag attachments research-vault:main or research-vault:supplementary.
+
+# Explicit authorized directories for works.yaml sources and recursive includes.
+# Relative paths resolve from the vault; local absolute paths are also allowed here.
+# Give each manuscript project directory, not a broad home or filesystem directory.
+source_roots: []
+
+codex:
+  executable: codex          # Native binary or standard npm codex.cmd shim; local absolute paths allowed.
+  model: null                # Use CLI default; optionally set an account-supported model.
+  timeout_seconds: 600
+  max_input_chars: 500000     # Hard limit. Never silently truncate pages or graph context.

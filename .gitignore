@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+config.yaml
+works.yaml
+.env
+.env.*
+.pipeline/*
+!.pipeline/.gitkeep
+Literature/*
+!Literature/.gitkeep
+Concepts/*
+!Concepts/.gitkeep
+My Work/*
+!My Work/.gitkeep
+My Notes/*
+!My Notes/.gitkeep
+Reviews/Links/*
+!Reviews/Links/.gitkeep
+Reviews/Removals/*
+!Reviews/Removals/.gitkeep
+Reviews/Revisions/*
+!Reviews/Revisions/.gitkeep
+.obsidian/*
+!.obsidian/app.json
+!.obsidian/core-plugins.json
+*.pdf
+*.bib
+*.tex
+*.log
+.DS_Store
+.ruff_cache/
+.aws/
+.codex/
