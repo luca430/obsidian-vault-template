@@ -60,12 +60,30 @@ def update_note(old: str | None, identity: str, kind: str, title: str, content: 
 
 
 def summary_content(result: dict, sources: list[dict], metadata: dict) -> str:
-    text = result["summary"] + "\n\n### Processed sources\n\n"
+    text = (
+        result["summary"]
+        + "\n\nProcessing limitation: PDF extraction is text only. No OCR or figure/image "
+        "understanding was performed; scanned content and non-text mathematics were not interpreted."
+        + "\n\n### Processed sources\n\n"
+    )
     for source in sources:
         text += f"- {source['source']} — {source['locator']}\n"
     text += "\n### Evidence\n\n"
     for evidence in result["evidence"]:
         text += f"- {evidence['source']}, {evidence['locator']}: {evidence['quote']}\n"
+    text += "\n### Attributed scientific statements\n\n"
+    for claim in result.get("claims", []):
+        refs = "; ".join(f"{e['source']}, {e['locator']}" for e in claim["evidence"])
+        text += f"- {claim['statement']} ({refs}). Uncertainty: {claim['uncertainty']}\n"
+    warnings = sorted(
+        {
+            f"{p['source']}, {p['locator']}: {warning}"
+            for p in sources
+            for warning in p.get("extraction_warnings", [])
+        }
+    )
+    if warnings:
+        text += "\n### Extraction uncertainty\n\n" + "\n".join("- " + w for w in warnings) + "\n"
     # Bibliography is metadata, never an inferred relationship.
     import json
 

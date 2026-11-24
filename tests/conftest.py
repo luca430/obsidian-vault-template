@@ -4,7 +4,7 @@ import shutil
 from copy import deepcopy
 from pathlib import Path
 
-import fitz
+import pymupdf
 import pytest
 import yaml
 
@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 def write_pdf(
     path: Path, text: str = "Synthetic scientific evidence about a shared mechanism."
 ) -> Path:
-    document = fitz.open()
+    document = pymupdf.open()
     page = document.new_page()
     page.insert_text((72, 72), text)
     document.save(path)
@@ -79,7 +79,7 @@ class FakeAgent:
         if self.fail_role == role:
             raise VaultError("Synthetic agent failure")
         if role in {"literature", "manuscript"}:
-            return {
+            result = {
                 "title": "Synthetic summary",
                 "summary": "## Objectives\nSynthetic scientific evidence.\n\nText extraction only; figures were not interpreted.",
                 "evidence": [
@@ -91,8 +91,29 @@ class FakeAgent:
                     for page in payload["pages"]
                 ],
             }
+            result["claims"] = [
+                {
+                    "statement": "Synthetic scientific evidence.",
+                    "evidence": result["evidence"],
+                    "uncertainty": "Synthetic claim; scientific validity not assessed.",
+                }
+            ]
+            return result
+        if role == "concepts":
+            return {"concepts": []}
         if role == "linking":
-            return {"links": deepcopy(self.links)}
+            return {
+                "links": [
+                    deepcopy(link)
+                    for link in self.links
+                    if all(
+                        e["note"] in payload["notes"]
+                        and " ".join(e["quote"].split())
+                        in " ".join(payload["notes"][e["note"]].split())
+                        for e in link["evidence"]
+                    )
+                ]
+            }
         return {"revisions": []}
 
 

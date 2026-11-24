@@ -8,9 +8,18 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
-from .agents import Codex, validate_note_evidence, validate_output, validate_summary
+from .agents import (
+    AuthenticationError,
+    Codex,
+    payload_budget,
+    validate_note_evidence,
+)
 from .config import Config
 from .notes import diagnostics, impact, read_notes, summary_content, update_note
+from .paths import environment
+from .processing import Processor
+from .recipes import reasoning_recipe, stage_recipe
+from .registry import Registry
 from .reviews import (
     apply_decisions,
     checkpoint,
@@ -38,6 +47,10 @@ from .zotero import Zotero
 STATE = ".pipeline/state.json"
 
 
+class IntegrationError(VaultError):
+    """A failed transaction or concurrent edit requires stopping the run."""
+
+
 def initial_state() -> dict:
     return {
         "schema": 1,
@@ -55,8 +68,9 @@ def initial_state() -> dict:
 
 
 class Pipeline:
-    def __init__(self, config: Config, zotero=None, agent=None):
+    def __init__(self, config: Config, zotero=None, agent=None, progress=None):
         self.config, self.root = config, config.root
+        self.on_progress = progress
         self.zotero = zotero if zotero is not None else Zotero(config)
         self.agent = agent if agent is not None else Codex(config)
 
@@ -78,18 +92,23 @@ class Pipeline:
             )
         return state
 
-    def recipe(self) -> str:
-        files = [
-            inside(self.root, "AGENTS.md"),
-            *inside(self.root, "agents").glob("*.md"),
-            *Path(__file__).parent.glob("*.py"),
-        ]
+    def recipe(self, role=None) -> str:
+        if role:
+            return stage_recipe(self.config, role)
         return digest(
-            [sorted((p.name, file_hash(p)) for p in files), self.config.data.get("codex", {})]
+            [
+                stage_recipe(self.config, r)
+                for r in (
+                    "literature",
+                    "manuscript",
+                    "concepts",
+                    "linking",
+                    "synthesis",
+                    "maintenance",
+                    "retrieval",
+                )
+            ]
         )
-
-    def run_agent(self, role: str, payload: dict) -> dict:
-        return validate_output(role, self.agent.run(role, payload))
 
     def dashboard(self, state: dict, reviews: dict, error: str | None = None) -> str:
         path = inside(self.root, "Home.md")
@@ -104,6 +123,34 @@ class Pipeline:
             f"Pending revisions: {pending['revision']}",
             f"Errors: {1 if error else 0}",
         ]
+        for status in ("pending", "skipped", "failed"):
+            total = sum(
+                r.get("status") == status
+                for r in [*state["papers"].values(), *state["works"].values()]
+            )
+            lines.append(f"{status.capitalize()} documents: {total}")
+        for coverage in ("metadata_only", "partial", "complete", "failed"):
+            lines.append(
+                f"{coverage} coverage: "
+                + str(
+                    sum(
+                        r.get("completeness", "complete" if r.get("processed") else "metadata_only")
+                        == coverage
+                        for r in state["papers"].values()
+                    )
+                )
+            )
+        if getattr(self, "last_progress", None):
+            lines.append("Current stage: " + self.last_progress["stage"])
+        if state.get("last_report"):
+            lines.append(
+                "Last attempt: "
+                + (
+                    "complete"
+                    if state["last_report"]["complete"]
+                    else "incomplete; see status for details"
+                )
+            )
         if error:
             lines.append("Last error: see .pipeline/logs/events.jsonl for details.")
         lines += ["Warnings: " + str(len(state.get("warnings", [])))]
@@ -121,177 +168,402 @@ class Pipeline:
             result[pid] = frontmatter(text)[0]
         return result
 
-    def sync(self, full: bool = False, dry_run: bool = False) -> dict:
+    def progress(self, stage: str, **details) -> None:
+        self.last_progress = {"stage": stage, **details}
+        if self.on_progress:
+            self.on_progress(self.last_progress)
+
+    def baseline(self, state):
+        self._baseline_notes = read_notes(self.root)
+        self._baseline_files = {
+            n: inside(self.root, n).read_bytes()
+            for n in [
+                "Home.md",
+                STATE,
+                "config.yaml",
+                "works.yaml",
+                "AGENTS.md",
+                *[
+                    f"agents/{r}.md"
+                    for r in (
+                        "literature",
+                        "manuscript",
+                        "concepts",
+                        "linking",
+                        "synthesis",
+                        "maintenance",
+                    )
+                ],
+                *[r["path"] for r in state["proposals"].values()],
+            ]
+            if inside(self.root, n).exists()
+        }
+
+    def save(self, state, changes=None):
+        changes = dict(changes or {})
+        try:
+            changes["Home.md"] = self.dashboard(state, self.merged_reviews(state, changes))
+            changes[STATE] = json.dumps(state, ensure_ascii=False, indent=2)
+            self._commit_checked(changes)
+        except (OSError, VaultError) as exc:
+            raise IntegrationError(str(exc)) from exc
+        # Advance expected bytes, never absorb a concurrent user edit into our baseline.
+        for name, text in changes.items():
+            if name.startswith(("Literature/", "My Work/", "My Notes/", "Concepts/")):
+                if text is None:
+                    self._baseline_notes.pop(name, None)
+                else:
+                    self._baseline_notes[name] = text
+            else:
+                self._baseline_files[name] = text.encode("utf-8")
+
+    def sync(self, full: bool = False, dry_run: bool = False, startup: bool = False) -> dict:
         state = deepcopy(self.state())
+        if full and startup:
+            raise VaultError("--startup is incremental; use --full separately")
+        self.baseline(state)
         reviews = read_reviews(self.root, state["proposals"])
         if getattr(self.zotero, "server", None) is None:
             self.zotero.server = state.get("server")
-        snapshot = self.zotero.snapshot()  # Any retrieval failure aborts before removals.
+        self.progress("snapshot")
+        snapshot = self.zotero.snapshot()  # Incomplete/API/auth failures never advance membership.
         if state.get("server") and self.zotero.server and state["server"] != self.zotero.server:
             raise VaultError("Zotero instance differs from stored state; use a new vault")
-        notes = read_notes(self.root)
-        self._baseline_notes = deepcopy(notes)
-        self._baseline_files = {
-            n: inside(self.root, n).read_bytes()
-            for n in ["Home.md", *[r["path"] for r in state["proposals"].values()]]
-        }
-        recipe = self.recipe()
+        notes = deepcopy(self._baseline_notes)
+        recipe = reasoning_recipe(self.config)
+        summary_recipe = self.recipe("literature")
+        manuscript_recipe = self.recipe("manuscript")
+        processor = Processor(self.config, self.agent, recipe, self.progress, full)
         changed_papers = [
             key
             for key, item in snapshot.items()
             if full
             or key not in state["membership"]
             or state["papers"].get(key, {}).get("fingerprint")
-            != digest([item["fingerprint"], recipe])
+            != digest([item["fingerprint"], summary_recipe])
+            or state["papers"].get(key, {}).get("status", "successful") != "successful"
+            or state["papers"].get(key, {}).get("completeness", "complete") != "complete"
             or f"Literature/{key}.md" not in notes
         ]
         removed = sorted(set(state["membership"]) - set(snapshot))
-        works, changed_works, warnings = {}, [], []
+        works, changed_works, warnings, skipped, partial_candidates = {}, [], [], {}, {}
         for key, item in snapshot.items():
-            for attachment in item["attachments"]:
+            attachments = item["attachments"]
+            for attachment in attachments:
                 if attachment["classification"] == "ignore":
                     warnings.append(
-                        f"Ignored attachment {attachment['key']} on {key}: {attachment.get('reason', 'configured ignore')}"
+                        f"Ignored attachment {attachment['key']} on {key}: {attachment.get('reason', 'configured ignore or unsupported format')}"
                     )
-        registered = self.config.works()
+            errors = [a["error"] for a in attachments if a.get("error")]
+            readable = [
+                a for a in attachments if a["classification"] != "ignore" and not a.get("error")
+            ]
+            if not any(a["classification"] != "ignore" for a in attachments):
+                errors.append("no processable PDF; no readable main/supplementary PDF")
+            if errors and readable:
+                partial_candidates[key] = "; ".join(errors)
+                warnings.append(
+                    f"Paper {key}: available attachments will be processed with partial coverage: {partial_candidates[key]}"
+                )
+            if errors and not readable:
+                skipped[key] = "; ".join(errors)
+                warnings.append(f"Paper {key} skipped: {skipped[key]}")
+        registered = self.config.works()  # Invalid registry/authorization is fatal.
+        work_errors = {}
         for work in registered:
             key = work["id"]
             old = state["works"].get(key, {})
+            for name in old.get("files", {}):
+                self.config.authorized(
+                    name
+                )  # Revoked include authorization must never be bypassed.
             try:
                 files = old.get("files", {})
                 unchanged = (
                     not full
                     and old.get("metadata") == work
-                    and old.get("recipe") == recipe
+                    and old.get("recipe") == manuscript_recipe
+                    and old.get("status", "successful") == "successful"
                     and old.get("source") == str(self.config.authorized(work["source_path"]))
                     and files
-                    and all(
-                        self.config.authorized(p).is_file()
-                        and file_hash(self.config.authorized(p)) == h
-                        for p, h in files.items()
-                    )
+                    and all(file_hash(self.config.authorized(p)) == h for p, h in files.items())
                     and f"My Work/{key}.md" in notes
                 )
                 if unchanged:
                     continue
-                source = manuscript(self.config, work)
-            except (OSError, VaultError) as exc:
-                # A previously registered disappearing source is a warning, never a deletion.
-                if old and not self.config.authorized(work["source_path"]).exists():
-                    warnings.append(f"Manuscript {key} disappeared; its summary was retained.")
+                if startup and len([k for k in changed_papers if k not in skipped]) + len(
+                    changed_works
+                ) >= self.config.processing("startup_max_documents"):
+                    changed_works.append(key)
                     continue
-                raise VaultError(f"Manuscript {key}: {exc}") from exc
-            works[key] = source
+                works[key] = manuscript(self.config, work, None if dry_run else processor.extract)
+            except (OSError, VaultError) as exc:
+                work_errors[key] = str(exc)
+                warnings.append(
+                    f"Manuscript {key} unavailable/disappeared or invalid: {exc}; its summary was retained."
+                )
             changed_works.append(key)
         for key in state["works"]:
             if key not in {w["id"] for w in registered}:
                 warnings.append(f"Work {key} is no longer registered; its summary was retained.")
-        personal = {
-            name: digest(text) for name, text in notes.items() if name.startswith("My Notes/")
-        }
+        blockers = [
+            f"{role}: input limit cannot fit instructions/schema/output reserve plus source context"
+            for role in (
+                "literature",
+                "manuscript",
+                "concepts",
+                "linking",
+                "synthesis",
+                "maintenance",
+            )
+            if payload_budget(self.config, role) < 1500
+        ]
+        if blockers and not dry_run:
+            raise VaultError("Invalid processing configuration: " + "; ".join(blockers))
+        estimates = {}
+        if dry_run and not blockers:
+            for key in changed_papers:
+                if key in skipped:
+                    continue
+                pages, attachment_errors = [], []
+                for attachment in snapshot[key]["attachments"]:
+                    if attachment["classification"] == "ignore" or attachment.get("error"):
+                        continue
+                    try:
+                        pages.extend(pdf(Path(attachment["path"]), attachment["key"]))
+                    except (VaultError, OSError) as exc:
+                        attachment_errors.append(f"{attachment['key']}: {exc}")
+                if not pages:
+                    skipped[key] = "; ".join(attachment_errors) or "no processable PDF"
+                    warnings.append(f"Paper {key} skipped: {skipped[key]}")
+                    continue
+                if attachment_errors:
+                    partial_candidates[key] = "; ".join(attachment_errors)
+                    warnings.append(f"Paper {key}: partial coverage: {partial_candidates[key]}")
+                try:
+                    chunks = len(list(processor.batches("literature", {}, pages)))
+                    estimates[key] = chunks + (1 if chunks > 1 else 0)
+                except VaultError as exc:
+                    blockers.append(f"Paper {key}: {exc}")
+            if hasattr(self.agent, "authenticate"):
+                try:
+                    self.agent.authenticate()
+                except (VaultError, OSError) as exc:
+                    blockers.append(str(exc))
+        personal = {n: digest(t) for n, t in notes.items() if n.startswith("My Notes/")}
         graph_input = digest([notes, sorted(snapshot), recipe])
         graph_needed = bool(notes or changed_papers or changed_works) and (
             full or graph_input != state["graph_digest"] or bool(changed_papers or changed_works)
         )
-        for key in changed_papers:
-            if not any(a["classification"] != "ignore" for a in snapshot[key]["attachments"]):
-                warnings.append(
-                    f"Paper {key} has no processable PDF; synchronization will fail until a PDF is available."
-                )
         plan = {
             "papers": changed_papers,
             "works": changed_works,
             "removed": removed,
+            "new": [k for k in snapshot if k not in state["papers"]],
+            "modified": [k for k in changed_papers if k in state["papers"]],
+            "unchanged": [k for k in snapshot if k not in changed_papers],
+            "processable": [k for k in snapshot if k not in skipped],
+            "skipped": skipped,
+            "partial_candidates": partial_candidates,
+            "estimated_document_operations": len([k for k in changed_papers if k not in skipped])
+            + len(works)
+            if not dry_run
+            else sum(estimates.values()) + len(works),
+            "document_operation_estimates": estimates,
+            "estimated_graph_operations": (3 * max(1, len(notes))) if graph_needed else 0,
+            "operation_estimate_note": "Minimum summary calls; oversized documents require chunks/consolidation. Graph jobs use bounded retrieved fragments.",
             "personal_notes_changed": personal != state["personal"],
             "reasoning_needed": graph_needed,
             "warnings": warnings,
+            "blocking_errors": blockers,
             "dry_run": dry_run,
+            "startup": startup,
+            "reasoning_deferred": bool(startup and graph_needed),
         }
         if dry_run:
             return plan
-        changes: dict[str, str | None] = {}
+        # Authenticate globally before accepting work requiring inference. Mock agents need no session.
+        if (
+            any(k not in skipped for k in changed_papers) or works or (graph_needed and notes)
+        ) and hasattr(self.agent, "authenticate"):
+            self.agent.authenticate()
+        for key in removed:
+            if key in state["papers"]:
+                old = state["papers"][key]
+                old["removal_epoch"] = old.get("removal_epoch", 0) + 1
+                old["disposition"] = "absent"
         for key in changed_papers:
-            item = snapshot[key]
-            pages = []
-            for attachment in item["attachments"]:
-                if attachment["classification"] == "ignore":
-                    continue
-                path = Path(attachment["path"])
-                pages += [
-                    {**p, "classification": attachment["classification"]}
-                    for p in pdf(path, attachment["key"])
-                ]
-                if file_hash(path) != attachment["sha256"]:
-                    raise VaultError("PDF changed while extracting; retry sync")
-            if not pages:
-                raise VaultError(
-                    f"Paper {key} has no readable main/supplementary PDF. Attach/download a PDF or configure a supported source; no fabricated summary was made."
-                )
-            result = self.run_agent(
-                "literature",
+            state["papers"].setdefault(
+                key,
                 {
-                    "item_key": key,
-                    "metadata": item["metadata"],
-                    "pages": pages,
-                    "annotations": item.get("annotations", []),
-                    "attachments": item["attachments"],
+                    "note": f"Literature/{key}.md",
+                    "processed": False,
+                    "removal_epoch": 0,
+                    "completeness": "metadata_only",
                 },
             )
-            validate_summary(result, pages)
-            if any(
-                file_hash(Path(a["path"])) != a["sha256"]
-                for a in item["attachments"]
-                if a["classification"] != "ignore"
-            ):
-                raise VaultError("PDF changed while summarizing; retry sync")
-            if {p["source"] for p in pages} - {e["source"] for e in result["evidence"]}:
-                raise VaultError(
-                    "Literature summary must provide evidence from every processed PDF, including supplements"
+            state["papers"][key].update(status="pending", disposition="active")
+            if startup and key in skipped:
+                record = state["papers"][key]
+                record.update(status="skipped", completeness="metadata_only", error=skipped[key])
+                record["attachment_processing"] = {
+                    a["key"]: {
+                        "completeness": "metadata_only",
+                        "error": a.get("error"),
+                        "classification": a["classification"],
+                    }
+                    for a in snapshot[key]["attachments"]
+                }
+        for work in registered:
+            if work["id"] in changed_works:
+                state["works"].setdefault(work["id"], {})["status"] = "pending"
+        state.update(
+            identity=self.config.identity,
+            server=self.zotero.server,
+            membership=sorted(snapshot),
+            personal=personal,
+            warnings=warnings,
+            last_attempt=now(),
+        )
+        # Membership is complete independently of attachment processing; never infer removals from I/O.
+        self.save(state)
+        failed, partial = {}, {}
+        scheduled_papers, scheduled_works = changed_papers, changed_works
+        if startup:
+            limit = self.config.processing("startup_max_documents")
+            candidates = [k for k in changed_papers if k not in skipped]
+            candidates.sort(
+                key=lambda k: (
+                    bool(state["papers"][k].get("processed")),
+                    state["papers"][k].get("completeness") == "partial",
+                    k,
                 )
-            path = f"Literature/{key}.md"
-            content = summary_content(
-                result, pages, {"zotero": item["metadata"], "attachments": item["attachments"]}
             )
+            scheduled_papers = candidates[:limit]
+            scheduled_works = changed_works[: max(0, limit - len(scheduled_papers))]
+        deferred = (
+            len(changed_papers)
+            + len(changed_works)
+            - len(scheduled_papers)
+            - len(scheduled_works)
+            - (len([k for k in changed_papers if k in skipped]) if startup else 0)
+        )
+        total = len(scheduled_papers) + len(scheduled_works)
+        completed = 0
+        for key in scheduled_papers:
+            self.progress(
+                "documents",
+                current=key,
+                processed=completed,
+                remaining=total - completed,
+                skipped=len(skipped),
+                failed=len(failed),
+            )
+            item, old = snapshot[key], state["papers"][key]
+            try:
+                result, pages, attachment_errors, unavailable = self.process_paper(
+                    key, item, old, processor, state
+                )
+                if result is not None:
+                    content = summary_content(
+                        result,
+                        pages,
+                        {
+                            "zotero": item["metadata"],
+                            "attachments": item["attachments"],
+                            "completeness": old["completeness"],
+                        },
+                    )
+            except (AuthenticationError, IntegrationError):
+                raise
+            except (OSError, VaultError) as exc:
+                result = None
+                old["completeness"] = "failed"
+                attachment_errors, unavailable = {key: str(exc)}, {}
+            if result is None:
+                error = (
+                    "; ".join([*attachment_errors.values(), *unavailable.values()])
+                    or "no processable PDF; no readable main/supplementary PDF"
+                )
+                if old["completeness"] == "failed":
+                    failed[key] = error
+                    old.update(status="failed", error=error)
+                else:
+                    skipped[key] = error
+                    old.update(status="skipped", error=error)
+                warnings.append(f"Paper {key}: {error}; existing note retained.")
+                self.save(state)
+                completed += 1
+                continue
+            path = f"Literature/{key}.md"
             notes[path] = update_note(
                 notes.get(path), f"zotero:{key}", "literature", result["title"], content
             )
-            changes[path] = notes[path]
-            old = state["papers"].get(key, {})
-            state["papers"][key] = {
-                "fingerprint": digest([item["fingerprint"], recipe]),
-                "note": path,
-                "processed": True,
-                "disposition": "active",
-                "files": item["attachments"],
-                "removal_epoch": old.get("removal_epoch", 0),
-            }
-        for key in changed_works:
+            if old["completeness"] == "partial":
+                partial[key] = {**attachment_errors, **unavailable}
+                warnings.append(
+                    f"Paper {key} partially processed; outstanding attachments: {', '.join(partial[key])}"
+                )
+            old.update(
+                fingerprint=digest([item["fingerprint"], summary_recipe]),
+                note=path,
+                processed=True,
+                status="successful",
+                disposition="active",
+                files=item["attachments"],
+                passages=self.store_passages(key, item["fingerprint"], pages),
+                error="; ".join(partial.get(key, {}).values()) or None,
+            )
+            self.save(state, {path: notes[path]})
+            completed += 1
+        for key in scheduled_works:
+            self.progress(
+                "manuscripts", current=key, processed=completed, remaining=total - completed
+            )
+            old = state["works"][key]
+            if key in work_errors:
+                old.update(status="skipped", completeness="metadata_only", error=work_errors[key])
+                self.save(state)
+                completed += 1
+                continue
             source = works[key]
-            result = self.run_agent("manuscript", source)
-            validate_summary(result, source["pages"])
-            if any(file_hash(Path(p)) != h for p, h in source["files"].items()):
-                raise VaultError("Manuscript changed while summarizing; retry sync")
+            try:
+                result = processor.summarize("manuscript", source)
+                if any(file_hash(Path(p)) != h for p, h in source["files"].items()):
+                    raise VaultError("Manuscript changed while summarizing; retry sync")
+                content = summary_content(result, source["pages"], source["metadata"])
+            except (AuthenticationError, IntegrationError):
+                raise
+            except (OSError, VaultError) as exc:
+                failed[f"work:{key}"] = str(exc)
+                old.update(status="failed", completeness="failed", error=str(exc))
+                warnings.append(f"Manuscript {key} failed: {exc}")
+                self.save(state)
+                completed += 1
+                continue
             path = f"My Work/{key}.md"
             notes[path] = update_note(
                 notes.get(path),
                 f"work:{key}",
                 "manuscript",
                 result["title"],
-                summary_content(result, source["pages"], source["metadata"]),
+                content,
             )
-            changes[path] = notes[path]
-            state["works"][key] = {
-                "fingerprint": source["fingerprint"],
-                "files": source["files"],
-                "metadata": source["metadata"],
-                "recipe": recipe,
-                "source": str(self.config.authorized(source["metadata"]["source_path"])),
-                "note": path,
-            }
-        for key in removed:
-            state["papers"][key]["removal_epoch"] = state["papers"][key].get("removal_epoch", 0) + 1
-            state["papers"][key]["disposition"] = "absent"
-        # Re-evaluate pending removal impact when graph/user notes change.
+            old.update(
+                fingerprint=source["fingerprint"],
+                files=source["files"],
+                metadata=source["metadata"],
+                recipe=manuscript_recipe,
+                completeness="complete",
+                source=str(self.config.authorized(source["metadata"]["source_path"])),
+                note=path,
+                status="successful",
+                error=None,
+                passages=self.store_passages(f"work-{key}", source["fingerprint"], source["pages"]),
+            )
+            self.save(state, {path: notes[path]})
+            completed += 1
+        changes = {}
         for key, paper in state["papers"].items():
             path = paper["note"]
             if key not in snapshot and paper.get("disposition") == "absent" and path in notes:
@@ -308,48 +580,249 @@ class Pipeline:
                     notes,
                     changes,
                 )
-        if graph_needed:
-            payload = {
-                "notes": notes,
-                "active_literature": sorted(snapshot),
-                "note_categories": {
-                    "Literature": "external findings",
-                    "My Work": "manuscript claims",
-                    "My Notes": "personal hypotheses",
-                    "Concepts": "reviewed concepts",
-                },
+        self.save(state, changes)
+        graph_error = None
+        if graph_needed and notes and not startup:
+            prior = state.get("graph_notes", {})
+            changed = {n for n, t in notes.items() if full or prior.get(n) != digest(t)}
+            changed.update(
+                f"Literature/{k}.md" for k in changed_papers if f"Literature/{k}.md" in notes
+            )
+            changed.update(f"My Work/{k}.md" for k in changed_works if f"My Work/{k}.md" in notes)
+            if (
+                state.get("graph_recipe") != recipe
+                or removed
+                or state.get("graph_error")
+                or set(prior) - set(notes)
+                or state.get("graph_membership") != sorted(snapshot)
+            ):
+                changed = set(notes)
+            passages = {}
+            for record in [*state["papers"].values(), *state["works"].values()]:
+                if record.get("passages") and record.get("note") in notes:
+                    passages[record["note"]] = read_json(inside(self.root, record["passages"]), [])
+            statuses = {
+                r["note"]: {
+                    "processing": r.get("status", "successful"),
+                    "collection": r.get("disposition", "registered"),
+                    "completeness": r.get("completeness", "complete"),
+                    "source_fingerprint": r.get("fingerprint"),
+                }
+                for r in [*state["papers"].values(), *state["works"].values()]
+                if r.get("note")
             }
-            links = self.run_agent("linking", payload)
-            for link in links["links"]:
-                link_proposal(link, state["proposals"], notes, changes)
-            for role in ("synthesis", "maintenance"):
-                result = self.run_agent(role, payload)
-                for revision in result["revisions"]:
-                    if revision["note"] not in notes:
-                        raise VaultError("Revision targets an absent note")
-                    validate_note_evidence(revision["evidence"], notes)
-                    proposal("revision", revision, state["proposals"], notes, changes)
+            concept_registry = Registry(state.get("concept_registry"))
+            state["concept_registry"] = concept_registry.data
+            try:
+                for name in set(concept_registry.data["documents"]) - notes.keys():
+                    concept_registry.remove(name)
+                indexed = 0
+                for name, text in notes.items():
+                    self.progress("concepts", current=name)
+                    provenance = {"note_fingerprint": digest(text), **statuses.get(name, {})}
+                    if concept_registry.update(self.config, name, text, provenance, processor):
+                        indexed += 1
+                        if indexed % 20 == 0:
+                            self.save(state)
+                concept_registry.reviewed(state["proposals"])
+                batches = concept_registry.batches(
+                    self.config, notes, changed, sorted(snapshot), passages, statuses
+                )
+                for number, payload in enumerate(batches, 1):
+                    self.progress("reasoning", batch=number, focus_notes=len(changed))
+                    for role in ("linking", "synthesis", "maintenance"):
+                        result = processor.run(
+                            role,
+                            payload,
+                            lambda result: self.reasoning_changes(result, payload, state, notes),
+                        )
+                        registry, changes = self.reasoning_changes(result, payload, state, notes)
+                        state["proposals"] = registry
+                        if changes:
+                            self.save(state, changes)
+            except (AuthenticationError, IntegrationError):
+                raise
+            except (VaultError, OSError) as exc:
+                # A failed commit or conflict must never be treated as a recoverable inference failure.
+                if (
+                    read_notes(self.root) != self._baseline_notes
+                    or inside(self.root, ".pipeline/transaction.json").exists()
+                ):
+                    raise
+                graph_error = str(exc)
+                warnings.append(f"Conceptual reasoning incomplete: {exc}")
+            if not graph_error:
+                state.update(
+                    graph_digest=digest([notes, sorted(snapshot), recipe]),
+                    graph_notes={n: digest(t) for n, t in notes.items()},
+                    graph_recipe=recipe,
+                    graph_membership=sorted(snapshot),
+                )
+            changes = {}
             for revision in diagnostics(notes):
                 proposal("revision", revision, state["proposals"], notes, changes)
-        # Refresh only existing reviews explicitly left pending by the user.
+            self.save(state, changes)
+        elif not graph_needed or not notes:
+            state["graph_digest"] = digest([notes, sorted(snapshot), recipe])
         refresh_pending(
             self.root, {p: v for p, v in state["proposals"].items() if p in reviews}, notes, reviews
         )
-        state.update(
-            identity=self.config.identity,
-            server=self.zotero.server,
-            membership=sorted(snapshot),
-            personal=personal,
-            graph_digest=digest([notes, sorted(snapshot), recipe]),
-            last_success=now(),
-            warnings=warnings,
+        state["graph_error"] = graph_error
+        complete = not (
+            skipped
+            or work_errors
+            or failed
+            or partial
+            or graph_error
+            or deferred
+            or (startup and graph_needed)
         )
-        updated_reviews = self.merged_reviews(state, changes)
-        changes["Home.md"] = self.dashboard(state, updated_reviews)
-        changes[STATE] = json.dumps(state, ensure_ascii=False, indent=2)
-        self._commit_checked(changes)
-        self.log("sync", {**plan, "completed_at": state["last_success"]})
+        state["warnings"] = warnings
+        if complete:
+            state["last_success"] = now()
+        self.save(state)
+        plan.update(
+            failed=failed,
+            partial=partial,
+            deferred_documents=deferred,
+            reasoning_deferred=bool(startup and graph_needed),
+            graph_error=graph_error,
+            complete=complete,
+            cache_hits=processor.hits,
+            inference_operations=processor.calls,
+        )
+        self.progress(
+            "complete" if complete else "incomplete",
+            processed=completed,
+            remaining=0,
+            skipped=len(skipped) + len(work_errors),
+            failed=len(failed),
+            cache_hits=processor.hits,
+        )
+        state["last_report"] = {**plan, "completed_at": now()}
+        self.save(state)
+        self.log("sync", state["last_report"])
         return plan
+
+    def process_paper(self, key, item, old, processor, state):
+        """Checkpoint each attachment independently, then consolidate only available evidence."""
+        attachment_states = old.setdefault("attachment_processing", {})
+        pages, summaries, errors, unavailable = [], [], {}, {}
+        for attachment in item["attachments"]:
+            attachment_key = attachment["key"]
+            if attachment["classification"] == "ignore":
+                attachment_states[attachment_key] = {
+                    "completeness": "metadata_only",
+                    "ignored": True,
+                    "reason": attachment.get("reason", "unsupported format or configured ignore"),
+                }
+                if (
+                    self.config.data.get("attachments", {}).get("overrides", {}).get(attachment_key)
+                    != "ignore"
+                ):
+                    unavailable[attachment_key] = attachment.get(
+                        "reason", "unsupported attachment format"
+                    )
+                continue
+            entry = {
+                "source_fingerprint": attachment.get("sha256"),
+                "classification": attachment["classification"],
+                "completeness": "metadata_only",
+                "recipe": stage_recipe(self.config, "literature"),
+            }
+            attachment_states[attachment_key] = entry
+            if attachment.get("error"):
+                unavailable[attachment_key] = attachment["error"]
+                entry["error"] = attachment["error"]
+                self.save(state)
+                continue
+            try:
+                path = Path(attachment["path"])
+                extracted = [
+                    {**p, "classification": attachment["classification"]}
+                    for p in processor.extract(path, attachment_key, attachment["sha256"])
+                ]
+                if file_hash(path) != attachment["sha256"]:
+                    raise VaultError("PDF changed while extracting; retry sync")
+                entry.update(completeness="partial", extraction="complete", summary="pending")
+                result = processor.summarize(
+                    "literature",
+                    {
+                        "item_key": key,
+                        "metadata": item["metadata"],
+                        "pages": extracted,
+                        "attachments": [attachment],
+                        "annotations": item.get("annotations", []),
+                    },
+                )
+                if file_hash(path) != attachment["sha256"]:
+                    raise VaultError("PDF changed while summarizing; retry sync")
+                summaries.append(result)
+                pages.extend(extracted)
+                entry.update(
+                    completeness="complete",
+                    summary="complete",
+                    error=None,
+                    pages=[p["locator"] for p in extracted],
+                )
+            except (AuthenticationError, IntegrationError):
+                raise
+            except (VaultError, OSError) as exc:
+                errors[attachment_key] = str(exc)
+                entry.update(completeness="failed", error=str(exc))
+            self.save(state)
+        # Attachment keys absent from the latest verified parent are retained as historical records.
+        current = {a["key"] for a in item["attachments"]}
+        for attachment_key, record in attachment_states.items():
+            record["present"] = attachment_key in current
+        if not summaries:
+            old["completeness"] = "failed" if errors else "metadata_only"
+            return None, [], errors, unavailable
+        try:
+            result = processor.combine("literature", summaries)
+        except AuthenticationError:
+            raise
+        except (VaultError, OSError) as exc:
+            errors["consolidation"] = str(exc)
+            # Detailed validated attachment results remain usable without claiming a full overview.
+            result = {
+                "title": summaries[0]["title"],
+                "summary": "Parent consolidation incomplete; validated attachment summaries follow.\n\n"
+                + "\n\n".join(s["summary"] for s in summaries),
+                "evidence": [e for s in summaries for e in s["evidence"]],
+                "claims": [c for s in summaries for c in s["claims"]],
+            }
+        complete = not errors and not unavailable
+        old["completeness"] = "complete" if complete else "partial"
+        if not complete:
+            result = deepcopy(result)
+            result["summary"] = (
+                "Processing coverage: partial. Scientific statements below concern only the processed "
+                "attachments. Missing or failed supplements were not interpreted.\n\n"
+                + result["summary"]
+                + "\n\nUnavailable/failed attachments: "
+                + "; ".join(sorted({**errors, **unavailable}))
+            )
+        return result, pages, errors, unavailable
+
+    def reasoning_changes(self, result, payload, state, notes):
+        """Validate against both the retrieved context and current full notes before caching."""
+        registry, changes = deepcopy(state["proposals"]), {}
+        for candidate in result.get("links", []):
+            validate_note_evidence(candidate["evidence"], payload["notes"])
+            link_proposal(candidate, registry, notes, changes)
+        for revision in result.get("revisions", []):
+            if revision["note"] not in payload["notes"]:
+                raise VaultError("Revision targets a note outside retrieved context")
+            validate_note_evidence(revision["evidence"], payload["notes"])
+            validate_note_evidence(revision["evidence"], notes)
+            proposal("revision", revision, registry, notes, changes)
+        return registry, changes
+
+    def store_passages(self, key, fingerprint, pages):
+        name = f".pipeline/cache/documents/{digest([key, fingerprint])}.json"
+        atomic(inside(self.root, name), json.dumps(pages, ensure_ascii=False))
+        return name
 
     def _commit_checked(self, changes: dict) -> None:
         if read_notes(self.root) != self._baseline_notes:
@@ -384,6 +857,11 @@ class Pipeline:
         }
         if dry_run:
             return result
+        if state.get("concept_registry"):
+            concept_registry = Registry(state["concept_registry"])
+            for name in set(concept_registry.data["documents"]) - notes.keys():
+                concept_registry.remove(name)
+            concept_registry.reviewed(state["proposals"])
         updated = self.merged_reviews(state, changes)
         changes["Home.md"] = self.dashboard(state, updated)
         changes[STATE] = json.dumps(state, ensure_ascii=False, indent=2)
@@ -398,11 +876,63 @@ class Pipeline:
     def status(self) -> dict:
         state = self.state()
         reviews = read_reviews(self.root, state["proposals"])
+        documents = {}
+        for category, records in (("papers", state["papers"]), ("works", state["works"])):
+            documents[category] = {
+                status: sorted(
+                    k
+                    for k, record in records.items()
+                    if record.get("status", "successful") == status
+                )
+                for status in ("successful", "pending", "skipped", "failed")
+            }
         return {
             "last_success": state["last_success"],
+            "last_attempt": state.get("last_attempt"),
             "active_papers": len(state["membership"]),
-            "processed_papers": len(state["papers"]),
+            "processed_papers": sum(p.get("processed", False) for p in state["papers"].values()),
             "works": len(state["works"]),
+            "documents": documents,
+            "completeness": {
+                coverage: sorted(
+                    k
+                    for k, record in state["papers"].items()
+                    if record.get(
+                        "completeness", "complete" if record.get("processed") else "metadata_only"
+                    )
+                    == coverage
+                )
+                for coverage in ("metadata_only", "partial", "complete", "failed")
+            },
+            "attachments": {
+                k: r.get("attachment_processing", {}) for k, r in state["papers"].items()
+            },
+            "concept_registry": {
+                k: len(state.get("concept_registry", {}).get(k, {}))
+                for k in ("documents", "concepts", "reviewed_relationships")
+            },
+            "progress": read_json(inside(self.root, ".pipeline/progress.json")),
+            "last_report": state.get("last_report"),
+            "background_runs": [
+                read_json(inside(self.root, path.relative_to(self.root).as_posix()))
+                for path in sorted(
+                    inside(self.root, ".pipeline/runs").glob("*.json"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )[:5]
+            ],
+            "document_errors": {
+                k: p["error"]
+                for records in (state["papers"], state["works"])
+                for k, p in records.items()
+                if p.get("error")
+            },
+            "reasoning_pending": bool(state.get("graph_error"))
+            or state.get("graph_digest")
+            != digest(
+                [read_notes(self.root), sorted(state["membership"]), reasoning_recipe(self.config)]
+            ),
+            "reasoning_error": state.get("graph_error"),
             "pending": counts(reviews, state["proposals"]),
             "warnings": state["warnings"],
             "transaction_requires_recovery": inside(
@@ -411,36 +941,92 @@ class Pipeline:
         }
 
     def doctor(self) -> dict:
-        checks = {}
-        for package in ("yaml", "fitz", "jsonschema"):
+        checks = {
+            "environment": environment(),
+            "python": __import__("sys").executable,
+            "blocking_errors": [],
+            "warnings": [],
+        }
+        for package in ("yaml", "pymupdf", "jsonschema"):
             checks[package] = "ok" if importlib.util.find_spec(package) else "missing"
-        for name, operation in [
-            (
-                "manuscripts",
-                lambda: [manuscript(self.config, work) for work in self.config.works()],
-            ),
-            ("codex", self.agent.available),
-            ("zotero", self.zotero.snapshot),
-        ]:
+            if checks[package] != "ok":
+                checks["blocking_errors"].append(f"Missing Python dependency: {package}")
+        try:
+            snapshot = self.zotero.snapshot()
+            checks["zotero"] = "ok"
+            checks["attachments"] = getattr(self.zotero, "attachment_diagnostics", [])
+            for key, item in snapshot.items():
+                for attachment in item["attachments"]:
+                    if attachment.get("error"):
+                        checks["warnings"].append(
+                            f"Paper {key}, attachment {attachment['key']}: {attachment['error']}"
+                        )
+                    elif attachment["classification"] == "ignore":
+                        checks["warnings"].append(
+                            f"Attachment {attachment['key']}: ignored or unsupported format"
+                        )
+                if not any(a["classification"] != "ignore" for a in item["attachments"]):
+                    checks["warnings"].append(f"Paper {key}: no processable PDF")
+        except (VaultError, OSError) as exc:
+            checks["zotero"] = str(exc)
+            checks["blocking_errors"].append(str(exc))
+        try:
+            registered = self.config.works()
+        except VaultError as exc:
+            checks["blocking_errors"].append(str(exc))
+            registered = []
+        checks["manuscripts"] = []
+        for work in registered:
             try:
-                operation()
-                checks[name] = "ok"
+                path = self.config.authorized(work["source_path"])
+                manuscript(self.config, work)
+                checks["manuscripts"].append(
+                    {
+                        "id": work["id"],
+                        "original": work["source_path"],
+                        "resolved_path": str(path),
+                        "status": "ok",
+                    }
+                )
             except (VaultError, OSError) as exc:
-                checks[name] = str(exc)
+                checks["warnings"].append(f"Manuscript {work['id']}: {exc}")
         try:
             prefix = self.agent.command_prefix()
             help_result = subprocess.run(
-                [*prefix, "exec", "--help"], capture_output=True, text=True, timeout=15
+                [*prefix, "exec", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=self.root,
             )
             required = ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--output-schema"]
-            missing = [f for f in required if f not in help_result.stdout]
-            checks["codex_flags"] = ("missing: " + ", ".join(missing)) if missing else "ok"
-            auth = subprocess.run(
-                [*prefix, "login", "status"], capture_output=True, text=True, timeout=15
-            )
-            checks["codex_auth"] = "ok" if auth.returncode == 0 else "Run codex login in a terminal"
+            missing = [flag for flag in required if flag not in help_result.stdout]
+            if help_result.returncode or missing:
+                raise VaultError("Codex CLI lacks required flags: " + ", ".join(missing))
+            checks["codex"] = prefix
+            checks["codex_flags"] = "ok"
+            self.agent.authenticate()
+            checks["codex_auth"] = "ok"
         except (VaultError, OSError, subprocess.TimeoutExpired) as exc:
             checks["codex_auth"] = str(exc)
+            checks["blocking_errors"].append(str(exc))
+        for role in ("literature", "manuscript", "concepts", "linking", "synthesis", "maintenance"):
+            if payload_budget(self.config, role) < 1500:
+                checks["blocking_errors"].append(
+                    f"{role}: input limit cannot fit instructions/schema/output reserve plus source context"
+                )
+        checks["path_translation"] = (
+            "wslpath -u for Windows paths" if environment() == "WSL" else "native"
+        )
+        if environment() == "WSL":
+            checks["wsl_validation"] = {
+                "local_api": "reachable" if checks.get("zotero") == "ok" else "unreachable",
+                "vault_filesystem": "readable"
+                if inside(self.root, "config.yaml").is_file()
+                else "unavailable",
+                "attachment_access": "validated by opening and hashing accessible files; failures listed individually",
+                "networking_mode": "not assumed; loopback API reachability was tested",
+            }
         return checks
 
     def log(self, command: str, details: dict) -> None:

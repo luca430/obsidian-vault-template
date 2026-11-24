@@ -57,14 +57,18 @@ def test_multiple_pdfs_and_supplementary_byte_change(vault):
     supplement = write_pdf(sources / "supplement.pdf", "Supplementary measurements.")
     z.paper("PAPER001", [("PDF00001", main, "main"), ("PDF00002", supplement, "supplementary")])
     pipeline.sync()
-    payload = next(p for r, p in agent.calls if r == "literature")
-    assert {p["source"] for p in payload["pages"]} == {"PDF00001", "PDF00002"}
-    assert {p["classification"] for p in payload["pages"]} == {"main", "supplementary"}
+    payloads = [p for r, p in agent.calls if r == "literature" and p.get("item_key")]
+    assert {page["source"] for p in payloads for page in p["pages"]} == {"PDF00001", "PDF00002"}
+    assert {page["classification"] for p in payloads for page in p["pages"]} == {
+        "main",
+        "supplementary",
+    }
+    before = len(payloads)
     supplement.unlink()
     write_pdf(supplement, "Updated supplementary measurements.")
     z.paper("PAPER001", [("PDF00001", main, "main"), ("PDF00002", supplement, "supplementary")])
     pipeline.sync()
-    assert sum(r == "literature" for r, _ in agent.calls) == 2
+    assert sum(r == "literature" and bool(p.get("item_key")) for r, p in agent.calls) == before + 1
     assert len(list((root / "Literature").glob("*.md"))) == 1
 
 
@@ -195,17 +199,20 @@ def test_manuscript_incremental_includes_math_and_missing_source(vault):
     assert any("disappeared" in w for w in pipeline.state()["warnings"])
 
 
-def test_failed_agent_keeps_whole_run_retryable(vault):
+def test_failed_reasoning_preserves_documents_and_retries(vault):
     root, _, _, agent, pipeline = vault
     add_paper(vault)
     agent.fail_role = "linking"
-    with pytest.raises(VaultError, match="agent failure"):
-        pipeline.sync()
-    assert pipeline.state()["membership"] == []
-    assert not list((root / "Literature").glob("*.md"))
+    result = pipeline.sync()
+    assert not result["complete"]
+    assert "agent failure" in result["graph_error"]
+    assert pipeline.state()["membership"] == ["PAPER001"]
+    assert (root / "Literature/PAPER001.md").exists()
+    assert pipeline.state()["last_success"] is None
     agent.fail_role = None
     pipeline.sync()
-    assert pipeline.state()["membership"] == ["PAPER001"]
+    assert sum(r == "literature" for r, _ in agent.calls) == 1
+    assert pipeline.state()["last_success"]
 
 
 def test_no_citation_based_links(vault):
@@ -253,7 +260,8 @@ def test_user_edit_during_agent_run_aborts_integration(vault):
     with pytest.raises(VaultError, match="Notes changed during processing"):
         pipeline.sync()
     assert personal.read_text() == "User edited during inference."
-    assert pipeline.state()["membership"] == []
+    assert pipeline.state()["membership"] == ["PAPER001"]
+    assert pipeline.state()["papers"]["PAPER001"]["status"] == "successful"
 
 
 def git_init(root):
@@ -357,9 +365,11 @@ def test_invalid_llm_cannot_self_approve_or_create_links(vault):
         return result
 
     agent.run = invalid
-    with pytest.raises(VaultError, match="contains links"):
-        pipeline.sync()
-    assert pipeline.state()["membership"] == []
+    result = pipeline.sync()
+    assert "contains links" in result["failed"]["PAPER001"]
+    assert pipeline.state()["membership"] == ["PAPER001"]
+    assert not pipeline.state()["papers"]["PAPER001"]["processed"]
+    assert not pipeline.state()["proposals"]
 
 
 def test_pdf_only_manuscript_and_registered_metadata_change(vault):
@@ -469,11 +479,13 @@ def test_missing_pdf_no_fabricated_summary(vault):
     root, _, z, agent, pipeline = vault
     z.paper("PAPER001")
     assert any("no processable PDF" in w for w in pipeline.sync(dry_run=True)["warnings"])
-    with pytest.raises(VaultError, match="no readable"):
-        pipeline.sync()
+    result = pipeline.sync()
+    assert not result["complete"]
+    assert "no readable" in result["skipped"]["PAPER001"]
     assert not agent.calls
     assert not (root / "Literature/PAPER001.md").exists()
-    assert pipeline.state()["membership"] == []
+    assert pipeline.state()["membership"] == ["PAPER001"]
+    assert pipeline.state()["papers"]["PAPER001"]["status"] == "skipped"
 
 
 def test_revised_summary_title_is_managed_and_user_area_preserved(vault):

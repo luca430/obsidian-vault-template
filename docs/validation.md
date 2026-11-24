@@ -2,9 +2,10 @@
 
 ## Verified in this workspace
 
-Validated on Linux with Python 3.12.8 using synthetic sources and mock services:
+Validated on Linux under a WSL2 kernel with Python 3.12.8 using synthetic sources
+and mocked services (2026-11-24):
 
-- `python -m pytest -q`: **53 passed**.
+- `.venv/bin/python -m pytest -q`: **108 passed** in 163.88 seconds.
 - `ruff check src scripts tests`: passed.
 - `ruff format --check src scripts tests`: passed.
 - `python -m compileall -q src scripts tests`: passed.
@@ -21,10 +22,28 @@ idempotence; unavailable/invalid agent output; manuscript PDF/LaTeX/include chan
 missing originals and revoked source authorization; unchanged projects and dry
 runs avoiding inference; source evidence validation; citation records not creating
 links; internal Markdown-link impacts; OS locks, interrupted transactions and
-concurrent user edits. Every service response is synthetic or mocked.
+concurrent user edits. Additional regression tests cover native/WSL path modes,
+UTF-8 URLs, spaces, Unicode, UNC/drive translation, managed/linked attachments,
+missing/offline files, oversized individual documents with complete input coverage,
+200-paper collections above the former global input limit, bounded graph context,
+old/new discovery with original passage retrieval, cache reuse/invalidation,
+interrupted chunks/documents/reasoning, later-document transaction rollback,
+partial model failures, untrusted metadata isolation, diagnostic severity, old state
+records and preserved reviews. Architectural regressions additionally cover partial
+main/supplement processing and independent attachment states, stage-specific cache
+isolation, persistent provisional concept provenance, old personal/manuscript
+retrieval, bounded postings/candidate pools, section/math-aware input coverage,
+structured claim provenance, failed consolidation retention, detached launch options,
+child reports/progress, bounded startup scheduling, readable-main dry-run coverage,
+non-starving startup queues and query ranking that excludes self-only identifiers.
+Every service response is synthetic or mocked.
 
 CI is configured for Linux and Windows on Python 3.11 and 3.13, but that matrix has
-not been executed by this local run. Actual Codex CLI execution was not invoked
+not been executed by this local run. Path modes are mocked cross-platform;
+real WSL `wslpath` also translated a synthetic encoded Windows path to `/mnt/c/`
+with spaces and Unicode. An unmounted synthetic drive produced a translation error,
+as intended, rather than a missing-file claim. This does not establish real Windows
+Zotero, OneDrive or Obsidian integration. Actual Codex CLI execution was not invoked
 for research processing and no inference success is claimed. No real Zotero
 collection, manuscript or personal research note was added to this template.
 
@@ -47,6 +66,13 @@ collection, manuscript or personal research note was added to this template.
 5. In Obsidian explicitly install Shell Commands, use the documented OS-specific
    command and inspect stdout/stderr. Verify the virtual-environment executable,
    Node/npm/native Codex resolution, PATH and native sandbox setup on Windows.
+   For split WSL mode, use the same distribution for setup/login and Obsidian
+   invocation, check mirrored loopback connectivity from WSL, and verify actual
+   Windows URLs for managed, linked/ZotMoov and locally available OneDrive PDFs.
+   Temporarily make a supplement unavailable: its parent must remain in membership,
+   its main summary must remain usable with partial coverage, and the next sync must
+   retry the supplement without repeating unchanged main inference. With no usable
+   attachment at all, the previous note must survive unchanged.
 6. Enable only the incremental command's Obsidian-start event. Close/reopen the
    vault with Zotero open, then closed; the latter must report an error without
    removing membership. Trigger a second run concurrently and verify locking.
@@ -67,7 +93,7 @@ collection, manuscript or personal research note was added to this template.
 
 - PDF processing is text extraction only. No OCR, image/figure interpretation,
   decryption or non-PDF supplement parsers are included. A configured unreadable
-  source fails explicitly; metadata-only bibliographic summaries are not fabricated.
+  source is skipped/failed per document; metadata-only summaries are not fabricated.
 - LaTeX support resolves literal local input/include directives and preserves math
   source. It is not a TeX engine, macro evaluator or document build system.
 - Synthesis and prose revisions are advisory. Users edit scientific prose and
@@ -75,9 +101,18 @@ collection, manuscript or personal research note was added to this template.
 - Concept-title collision checks are structural. Broader scientific equivalence,
   contradictory findings and unsupported claims need agent suggestions and human
   judgment. Evidence excerpts prove provenance, not the validity of an inference.
-- Whole changed papers are reprocessed. Graph roles see the current vault context;
-  max_input_chars is an explicit fail-fast limit, with no silent truncation. There
-  is no retrieval index, large-vault batching or page-level incremental reasoning.
+- Changed parents use bounded chunks and hierarchical consolidation; successful
+  chunks are cached. All detailed chunk summaries are retained, but a generated
+  summary cannot guarantee preservation of every scientific nuance. There is no
+  changed-page semantic diff; modified parents are reconsidered as whole jobs.
+- The persistent concept registry uses an inverted lexical index and provisional
+  annotations. Candidate terms, postings and the scored pool are capped. Each call
+  sees selected summaries/concepts/source excerpts. Retrieval can miss distant,
+  common-term-capped or vocabulary-disjoint concepts; absence of retrieval proves
+  nothing about scientific relatedness. This is not exhaustive scientific review.
+- Character budgets include instructions/schema/output reserve, not exact model
+  tokens. Consolidation failure is explicit; it leaves validated chunks cached.
+  No runtime garbage collector is included for caches/staging.
 - Rejected relationships deduplicate by endpoints/type/normalized supporting quotes.
   Materially different quoted evidence permits reconsideration. There is no
   automated semantic test for whether two different excerpts mean the same thing.
@@ -86,3 +121,14 @@ collection, manuscript or personal research note was added to this template.
   do not coordinate multiple computers or cloud-synchronized replicas.
 - The wheel contains the Python implementation; use the complete GitHub template
   (or source distribution) for vault folders, scripts, saved roles and configuration.
+
+## Additional live execution checks
+
+Verify the documented background commands in each actual desktop environment:
+Obsidian should return immediately, status/Home should advance, and the child JSON
+report should finish with the correct exit code. Launch a second run while the first
+holds the lock and confirm rejection. Test WSL Obsidian launching the same Linux
+interpreter/Codex installation after the launcher exits. Check actual Windows API
+reachability and locally accessible managed/linked/OneDrive files with doctor;
+mirrored configuration alone is not evidence of successful connectivity. These
+GUI/cloud/service checks are not replaced by synthetic tests.

@@ -6,10 +6,11 @@ import json
 import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode, urlparse
+from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .config import KEY, Config
+from .paths import PathError, accessible, local_path
 from .storage import VaultError, digest, file_hash
 
 
@@ -26,6 +27,7 @@ class Zotero:
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
         self.version: str | None = None
         self.server: str | None = None
+        self.attachment_diagnostics: list[dict] = []
 
     def request(self, route: str, params: dict | None = None) -> tuple[object, dict]:
         url = self.base + self.prefix + "/" + route
@@ -56,7 +58,11 @@ class Zotero:
                         raise VaultError("Zotero library changed during retrieval; retry sync")
                     self.version = version
                 return data, h
-        except (URLError, HTTPError, OSError, ValueError) as exc:
+        except HTTPError as exc:
+            if route.endswith("/file/view/url") and exc.code in {404, 409}:
+                raise PathError(f"attachment unavailable (HTTP {exc.code})", url) from exc
+            raise VaultError(f"Zotero GET {route} failed: {exc}") from exc
+        except (URLError, OSError, ValueError) as exc:
             raise VaultError(
                 f"Zotero GET {route} failed: {exc}. Keep Zotero open and enable its local API."
             ) from exc
@@ -108,22 +114,32 @@ class Zotero:
         return item
 
     def attachment_path(self, key: str) -> Path:
-        value, _ = self.request(f"items/{key}/file/view/url")
-        if not isinstance(value, str):
-            raise VaultError(f"No local file URL for attachment {key}")
-        url = urlparse(value.strip())
-        if url.scheme != "file" or url.netloc not in {"", "localhost"}:
-            raise VaultError(f"Attachment {key} is not a local file")
-        raw = unquote(url.path)
-        if re.match(r"^/[A-Za-z]:/", raw):
-            raw = raw[1:]
-        path = Path(raw)
-        if not path.is_file():
-            raise VaultError(f"Missing local attachment {key}: download it in Zotero")
+        diagnostic = {"key": key, "original_url": None, "resolved_path": None}
+        try:
+            value, _ = self.request(f"items/{key}/file/view/url")
+            if not isinstance(value, str):
+                raise PathError(f"No local file URL for attachment {key}", repr(value))
+            diagnostic["original_url"] = value.strip()
+            if not value.strip().lower().startswith("file:"):
+                raise PathError("not a local file URL", value)
+            path = local_path(value.strip())
+            diagnostic["resolved_path"] = str(path)
+            accessible(path, value.strip())
+        except (PathError, UnicodeError) as exc:
+            diagnostic.update(status="warning", reason=str(exc))
+            self.attachment_diagnostics.append(diagnostic)
+            raise PathError(
+                f"Attachment {key}: {exc}",
+                str(diagnostic["original_url"]),
+                diagnostic["resolved_path"],
+            ) from exc
+        diagnostic.update(status="ok", reason=None)
+        self.attachment_diagnostics.append(diagnostic)
         return path
 
     def snapshot(self) -> dict[str, dict]:
         self.version = None
+        self.attachment_diagnostics = []
         collection = self.config.zotero["collection_key"]
         meta, _ = self.request(f"collections/{collection}")
         if not isinstance(meta, dict) or meta.get("key") != collection:
@@ -168,8 +184,32 @@ class Zotero:
                     "metadata": child,
                 }
                 if classification != "ignore":
-                    path = self.attachment_path(child["key"])
-                    attachment.update(path=str(path), sha256=file_hash(path))
+                    try:
+                        path = self.attachment_path(child["key"])
+                        attachment.update(path=str(path), sha256=file_hash(path))
+                    except (PathError, OSError) as exc:
+                        diagnostic = (
+                            self.attachment_diagnostics[-1]
+                            if self.attachment_diagnostics
+                            and self.attachment_diagnostics[-1]["key"] == child["key"]
+                            else {}
+                        )
+                        error = (
+                            PathError(
+                                f"file accessibility error while hashing: {exc}",
+                                str(diagnostic.get("original_url")),
+                                diagnostic.get("resolved_path"),
+                            )
+                            if isinstance(exc, OSError)
+                            else exc
+                        )
+                        attachment["error"] = str(error)
+                        diagnostic.update(status="warning", reason=str(error))
+                    if (
+                        self.attachment_diagnostics
+                        and self.attachment_diagnostics[-1]["key"] == child["key"]
+                    ):
+                        attachment["resolution"] = self.attachment_diagnostics[-1]
                     # Annotations are children of PDF attachments, not bibliographic items.
                     annotations.extend(self.listing(f"items/{child['key']}/children"))
                 else:
@@ -196,8 +236,6 @@ class Zotero:
         if override == "ignore":
             return "ignore"
         if not is_pdf:
-            if override:
-                raise VaultError(f"Attachment {key} is configured as PDF but has unsupported type")
             return "ignore"
         if override:
             return override

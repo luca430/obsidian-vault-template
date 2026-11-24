@@ -24,9 +24,9 @@ def test_pdf_page_provenance_and_blank_page_failure(tmp_path):
     pages = pdf(source, "PDF00001")
     assert pages[0]["source"] == "PDF00001"
     assert pages[0]["locator"] == "page 1"
-    import fitz
+    import pymupdf
 
-    doc = fitz.open()
+    doc = pymupdf.open()
     doc.new_page()
     empty = tmp_path / "blank.pdf"
     doc.save(empty)
@@ -177,6 +177,7 @@ def test_input_limit_fails_without_truncation(vault):
 
 
 def test_standard_npm_batch_shim_uses_node_without_shell(vault, monkeypatch, tmp_path):
+    monkeypatch.setattr("research_vault.agents.is_wsl", lambda: False)
     prefix = tmp_path / "npm"
     entry = prefix / "node_modules/@openai/codex/bin/codex.js"
     entry.parent.mkdir(parents=True)

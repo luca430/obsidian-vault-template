@@ -1,5 +1,7 @@
 # Copy to works.yaml (ignored). An empty registry is fully supported.
 works: []
+# source_path and bibliography_path accept relative/native paths or local file URLs.
+# On WSL, Windows drive/UNC paths are translated using wslpath, just like source_roots.
 # Example registration (uncomment only after setting paths and source_roots):
 # works:
 #   - id: draft-001

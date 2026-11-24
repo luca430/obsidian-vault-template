@@ -11,13 +11,20 @@ from .storage import VaultError, digest, file_hash
 
 def pdf(path: Path, source: str) -> list[dict]:
     try:
-        import fitz
+        import pymupdf
 
-        with fitz.open(path) as document:
+        with pymupdf.open(path) as document:
             if document.needs_pass:
                 raise VaultError(f"Encrypted PDF: {path.name}")
             pages = [
-                {"source": source, "locator": f"page {i + 1}", "text": page.get_text()}
+                {
+                    "source": source,
+                    "locator": f"page {i + 1}",
+                    "text": page.get_text(),
+                    "extraction_warnings": [
+                        "PDF text order, equations, table structure and figure content are unverified; no OCR or image understanding was performed."
+                    ],
+                }
                 for i, page in enumerate(document)
             ]
     except Exception as exc:
@@ -67,12 +74,15 @@ def latex(config: Config, path: Path) -> tuple[list[dict], dict[str, str]]:
     return pages, hashes
 
 
-def manuscript(config: Config, work: dict) -> dict:
+def manuscript(config: Config, work: dict, pdf_reader=None) -> dict:
     path = config.authorized(work["source_path"])
     if work["source_type"] == "latex":
         pages, hashes = latex(config, path)
     else:
-        pages, hashes = pdf(path, str(path)), {str(path): file_hash(path)}
+        hashes = {str(path): file_hash(path)}
+        pages = (
+            pdf_reader(path, str(path), hashes[str(path)]) if pdf_reader else pdf(path, str(path))
+        )
     if work.get("bibliography_path"):
         bibliography = config.authorized(work["bibliography_path"])
         hashes[str(bibliography)] = file_hash(bibliography)

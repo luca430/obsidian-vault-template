@@ -9,7 +9,20 @@ from urllib.parse import urlparse
 
 import yaml
 
+from .paths import local_path
 from .storage import VaultError, digest, inside
+
+PROCESSING_DEFAULTS = {
+    "chunk_chars": 60000,
+    "graph_neighbors": 8,
+    "graph_fragment_chars": 12000,
+    "retrieval_passages": 4,
+    "passage_chars": 2000,
+    "chunk_context_chars": 600,
+    "candidate_terms": 32,
+    "candidate_pool": 128,
+    "startup_max_documents": 5,
+}
 
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
@@ -34,7 +47,7 @@ class Config:
     def load(cls, root: Path) -> Config:
         root = root.resolve()
         data = load_yaml(inside(root, "config.yaml"))
-        for field in ("zotero", "codex", "attachments"):
+        for field in ("zotero", "codex", "attachments", "processing"):
             if not isinstance(data.get(field, {}), dict):
                 raise VaultError(f"{field} must be a mapping")
         z = data.get("zotero", {})
@@ -81,7 +94,19 @@ class Config:
             or c.get("max_input_chars", 500000) < 1000
         ):
             raise VaultError("max_input_chars must be at least 1000")
+        for field, default in {"output_reserve_chars": 16000}.items():
+            if type(c.get(field, default)) is not int or c.get(field, default) < 0:
+                raise VaultError(f"codex.{field} must be a nonnegative integer")
+        for field, default in PROCESSING_DEFAULTS.items():
+            if (
+                type(data.get("processing", {}).get(field, default)) is not int
+                or data.get("processing", {}).get(field, default) <= 0
+            ):
+                raise VaultError(f"processing.{field} must be a positive integer")
         return cls(root, data)
+
+    def processing(self, key: str) -> int:
+        return self.data.get("processing", {}).get(key, PROCESSING_DEFAULTS[key])
 
     @property
     def zotero(self) -> dict:
@@ -102,11 +127,9 @@ class Config:
         )
 
     def authorized(self, raw: str) -> Path:
-        path = Path(raw).expanduser()
+        path = local_path(raw)
         path = (self.root / path).resolve() if not path.is_absolute() else path.resolve()
-        roots = [
-            (self.root / Path(p).expanduser()).resolve() for p in self.data.get("source_roots", [])
-        ]
+        roots = [(self.root / local_path(p)).resolve() for p in self.data.get("source_roots", [])]
         if not any(path.is_relative_to(p) for p in roots):
             raise VaultError(f"Source outside configured source_roots: {raw}")
         return path

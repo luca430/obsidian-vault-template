@@ -19,8 +19,8 @@ managed and user-editable sections.
 ## Quick start
 
 Install desktop Obsidian, Zotero with its local API, Python 3.11+, Git and a recent
-Codex CLI. Install Node.js LTS if using the npm distribution of Codex. Linux and
-Windows PowerShell are the target platforms; CI runs both. macOS is expected to
+Codex CLI. Install Node.js LTS if using the npm distribution of Codex. Native Linux, native Windows and WSL2 with Windows desktop apps are supported
+installation modes. CI is configured for Linux and Windows. macOS is expected to
 work with the Linux-style commands but has not been integration-tested here.
 Obsidian mobile is unsupported because this workflow executes local programs.
 
@@ -55,8 +55,8 @@ Zotero local API as described below. Keep Zotero running. Then:
 
 ### Windows / PowerShell
 
-Use native Windows Python, Git, Zotero, Obsidian and Codex together. Keeping all
-components in the same OS avoids WSL/Windows localhost and path translation.
+For the native Windows installation, use Windows Python, Git, Zotero, Obsidian
+and Codex together. For the split desktop/WSL configuration, use the next section.
 Install Python with the Python launcher and Node.js LTS first.
 
 ```powershell
@@ -87,6 +87,70 @@ and invokes its JavaScript entry with Node directly, without a command shell.
 A native Codex executable also works. Nonstandard batch wrappers fail explicitly;
 set `codex.executable` to a native executable or use the standard npm layout.
 
+### WSL2 / Windows desktop apps
+
+Supported split installation: **Windows Obsidian and Zotero**, **WSL2 Python, Git,
+Node/Codex**, and one vault on the Windows filesystem (visible inside WSL under
+`/mnt/c/`, or your configured mount). Do not run native Windows Python against the
+Linux virtual environment. Choose a WSL distribution and use it consistently.
+
+1. Install/update WSL2 using [Microsoft's WSL installation guide](https://learn.microsoft.com/windows/wsl/install).
+   Keep Obsidian and Zotero installed on Windows. Clone your new project with Git
+   inside WSL into a Windows directory; open that same directory as a Windows
+   Obsidian vault. Use `wslpath -u 'YOUR_WINDOWS_VAULT_DIRECTORY'` to find its Linux
+   path, then `cd` there. This setup intentionally keeps the vault on Windows for
+   the desktop apps; filesystem operations can be slower than Linux-local storage.
+2. Inside that directory in WSL, run the Linux quick-start commands from
+   `python3 -m venv .venv` onward. Install Linux Node/Codex, then run `codex login`
+   **inside that distribution**. A Windows Codex login or npm shim is insufficient.
+   Check `command -v python3`, `command -v node` and `command -v codex`; Node/Codex
+   must be Linux executables. The adapter rejects Windows `.exe`/`.cmd`/`.bat`
+   Codex launchers in WSL and stages Codex in a Linux-visible vault directory.
+3. Enable Zotero's local API on Windows. On Windows 11 22H2 or later with current
+   WSL, set this in `%UserProfile%\.wslconfig` (merge with existing settings):
+
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+   ```
+
+   Restart WSL from PowerShell with `wsl --shutdown` after saving other WSL work;
+   this stops all distributions. Mirrored mode permits WSL to reach Windows
+   servers through loopback. See [Microsoft's networking documentation](https://learn.microsoft.com/windows/wsl/networking#mirrored-mode-networking).
+   This pipeline deliberately retains its loopback-only API policy; it does not
+   expose Zotero to the LAN or add firewall rules. NAT host-IP workarounds are
+   outside this supported split configuration.
+4. With Windows Zotero open, check connectivity **from WSL**:
+
+   ```bash
+   curl --fail http://127.0.0.1:23119/api/users/0/collections
+   .venv/bin/python scripts/research.py doctor
+   .venv/bin/python scripts/research.py sync --dry-run
+   ```
+
+   Set `zotero.base_url: http://127.0.0.1:23119/api/` if localhost resolves to an
+   unsuitable address. Connection refusal/403 remains blocking: check mirrored
+   mode, Windows Zotero's API setting and firewall policy. No API key is needed.
+5. Select **PowerShell** in Windows Obsidian's Shell Commands settings. Use the
+   WSL commands below, not the native Windows Python commands. Check `doctor` from
+   that same launch environment before enabling a startup event.
+
+Windows file URLs are UTF-8 decoded and translated with `wslpath -u`, without a
+shell or a hardcoded drive/mount/user. This covers Zotero-managed PDFs and linked
+PDFs, including ZotMoov-managed locations. OneDrive files must be downloaded and
+readable locally; use Windows **Always keep on this device** when needed. Cloud
+placeholders may still fail at open/hash/extraction time: the parent is skipped or
+retried independently; existing summaries stay intact when no text is available.
+A missing supplement does not block an available main article: its note is marked
+partial, and the missing attachment is retried on the next synchronization.
+
+`source_roots`, manuscript `source_path` and `bibliography_path` accept Linux
+paths, Windows paths or local file URLs using the same resolver. Prefer YAML
+single quotes for Windows backslashes. Authorization is checked **after** translation
+and symlink resolution. UNC paths require a working Windows share/mount; translation
+does not mount a share or download a cloud file. Doctor includes the original URL,
+resolved path and reason for attachment access failures.
+
 Codex may consume account usage allowances or incur charges depending on your
 account and authentication. The first synchronization extracts every configured
 PDF and may make many inference requests. Extracted document text, manuscript
@@ -115,7 +179,7 @@ research-vault-template/
 ├── AGENTS.md                 Common scientific integrity and permission rules
 ├── config.example.yaml       Copy to ignored config.yaml
 ├── works.example.yaml        Copy to ignored works.yaml
-├── agents/                   Five persistent role instruction files
+├── agents/                   Six persistent role instruction files
 ├── Literature/               One note per Zotero parent key
 ├── Concepts/                 Concepts created through approved link proposals
 ├── My Work/                  Summaries of registered external documents
@@ -133,12 +197,96 @@ research-vault-template/
 └── .obsidian/                Portable core settings only
 ```
 
-Python retrieves a complete Zotero snapshot before comparing membership, hashes
-attachment bytes, follows registered manuscript includes, and detects personal-note
-changes. Changed sources go to the appropriate summary agent. A changed graph
-context runs linking, synthesis and maintenance roles. Python explicitly reads
-`AGENTS.md` and the relevant `agents/<role>.md` on every invocation; it does not
-assume arbitrary role files are automatically discovered by Codex.
+Python accepts a complete Zotero membership snapshot before comparing removals,
+hashes attachment bytes, follows registered manuscript includes and detects
+personal-note changes. File accessibility is separate from collection membership.
+Each processing stage has its own versioned cache contract, relevant role/global
+instruction hashes, source fingerprints and model settings. Upstream extraction
+changes propagate to summaries; editing synthesis instructions does not invalidate
+PDF extraction, document summaries or concept extraction.
+
+### Stage A: independent document processing
+
+Each new/changed Zotero **parent key** produces one literature note. Its main and
+supplementary attachments are extracted and summarized independently, then their
+validated summaries are consolidated. A missing supplement permits a usable main
+summary with partial coverage; retries reuse unchanged attachment summaries. Each registered manuscript
+is another job. Unchanged documents reuse their successful notes. Text extraction,
+validated inference results and original page records are cached privately under
+`.pipeline/cache/`. SHA256 content fingerprints include metadata, attachments and
+annotations; filenames alone never establish identity. Bytes are rechecked around
+processing. Cache entries are reused only with matching inputs and recipe.
+
+Oversized documents use section/paragraph-aware chunks where text headings permit,
+preserving every input character and page/file locator. Bounded neighboring text
+retains definitions, assumptions and explanatory context. Recognized LaTeX/display
+math spans stay together when they fit; over-budget expressions are split only
+with an explicit uncertainty warning. Validated partial summaries are consolidated hierarchically.
+The resulting note keeps **all detailed chunk summaries and source evidence**
+alongside the overview. A failed chunk leaves its attachment incomplete; successful chunks remain cached.
+If parent consolidation fails, validated attachment claims remain available in a
+partial note, and consolidation is retried. Summarization is still interpretive: complete text
+coverage is not proof that an LLM preserved every scientific detail. Inspect the
+sources and limitations, especially mathematical derivations.
+
+Successful document notes/state commit individually using the existing write-ahead
+journal. An interruption resumes pending jobs without repeating completed inference.
+One missing PDF, offline cloud file, extraction error or invalid LLM response does
+not discard other completed papers. Parents with no successfully summarized attachment retain their older note.
+Partial parents keep successful attachment findings and retry unavailable/failed
+sources. No full-text scientific claims are generated from metadata alone.
+
+Coverage is separate from job status, at both parent and attachment levels:
+
+| Coverage | Meaning |
+| --- | --- |
+| `metadata_only` | Metadata available; no usable full-text summary for this source |
+| `partial` | Some usable evidence exists; attachments or consolidation remain incomplete |
+| `complete` | All selected supported sources and required consolidation succeeded |
+| `failed` | Processing failed without a usable current document result |
+
+Explicitly ignored attachments are outside the selected processing scope.
+Unsupported attachments stay metadata-only and make an otherwise usable parent
+partial. Structured claim/evidence/uncertainty records retain exact attachment/page
+or filename/section references. PDF equations, table layout and figures remain
+unverified text extraction; plausible reconstructions never become verified facts
+through formatting or a successful schema check.
+
+### Stage B: bounded conceptual reasoning
+
+A persistent private **concept registry** in `.pipeline/state.json` records
+provisional LLM concept definitions, exact supporting note excerpts, source
+fingerprints and document associations. It updates only changed records. These
+annotations do not create public Concepts pages or Obsidian graph edges. Reviewed
+relationships are recorded separately only after the user-approved `apply` action.
+
+A persistent inverted lexical index covers existing summaries, manuscripts,
+personal notes and reviewed concepts. Changed fragments query at most
+`candidate_terms` rare terms and score at most `candidate_pool` candidate fragments;
+`graph_neighbors` bounds the distinct source documents selected. There is no
+exhaustive document-pair comparison. Concept annotations enrich the index, and
+ranked original cached source excerpts supply additional evidence within each
+request budget. New documents can retrieve older literature, manuscripts and
+personal notes. Availability/completeness labels distinguish retained historical
+findings from currently accessible evidence.
+
+Linking, synthesis and maintenance use the same bounded context. Retrieval proposes
+candidates; shared words and citations never authorize links. Outputs need exact
+quotes from supplied notes and validation against the full current notes. Only
+Python creates pending reviews. The separate `apply` command retains all existing
+approval, stale-evidence, backup and removal checks. No automatic graph links are
+introduced, and the literature/personal research/personal notes graph groups remain.
+
+Retrieval is deliberately dependency-free and approximate. Common-term postings
+and the candidate pool are capped; lexical synonyms and vocabulary-disjoint
+relationships can be missed. **Failure to retrieve is not proof of no relationship.** It may miss relationships
+with disjoint vocabulary or distant passages; increasing `graph_neighbors` or using
+`--full` broadens reconsideration but cannot guarantee exhaustive scientific discovery.
+All fragments are indexed, but each reasoning call sees only its selected excerpts.
+Validated reasoning calls are cached, so interrupted Stage B work can resume too.
+
+Python explicitly reads `AGENTS.md` and `agents/<role>.md` on every invocation; it
+does not assume arbitrary saved role files are automatically discovered by Codex.
 
 Codex runs non-interactively with `codex exec`, staged JSON schemas, a read-only
 sandbox, no approval prompts, disabled shell tools and disabled web search. User
@@ -154,8 +302,9 @@ checked for prohibited link/managed syntax and checked against exact source exce
 Literature evidence must cover every processed PDF, including supplements. Python
 integrates only permitted changes. An atomic write-ahead journal covers notes,
 review registrations, the dashboard and state; an interrupted batch is rolled back
-on the next normal `sync` or `apply`. The collection snapshot advances only when
-the complete run succeeds. Unsuccessful reasoning is retried on the next run.
+on the next normal `sync` or `apply`. Complete membership snapshots are saved
+independently from document success. `last_success` advances only when all document
+jobs and reasoning complete; unfinished work is retried on the next run.
 
 ## Configure Zotero
 
@@ -213,15 +362,18 @@ attachments:
 Alternatively set the attachment tag `research-vault:main` or
 `research-vault:supplementary` in Zotero yourself. Config overrides win. The pipeline
 never writes these tags. Non-PDF files are reported as ignored; explicitly marking
-a non-PDF as main/supplementary raises an unsupported-format error. Supplementary
+a non-PDF as main/supplementary still reports an unsupported format and ignores it. Supplementary
 spreadsheets, videos and archives are not parsed in this baseline.
 
+The dependency floor is PyMuPDF 1.24.3, which supplies the current `pymupdf` import
+([upstream change log](https://pymupdf.readthedocs.io/en/latest/changes.html#changes-in-version-1-24-3)).
 PyMuPDF extracts text from every PDF page and records attachment keys and page
-numbers. Encrypted, missing, invalid or textless-page PDFs fail explicitly; there
-is no OCR or figure-image understanding. A metadata-only item without a readable
-PDF also fails explicitly rather than receiving a fabricated summary. Attach or
-download its PDF, or move it outside the configured processing collection. Unchanged
-PDFs are hashed but not re-extracted for literature processing.
+numbers. Encrypted, missing, invalid or textless-page PDFs are reported per parent;
+there is no OCR or figure-image understanding. Unavailable or failed attachments are retried independently. Available main text
+can produce a partial parent summary; with no usable summary the existing note is
+retained.
+Unsupported non-PDF supplements are reported as ignored; notes cannot claim they
+were read. Unchanged PDFs are hashed but reuse extraction and summary caches.
 
 ## Register personal manuscripts
 
@@ -299,13 +451,13 @@ and [plugin guide](https://publish.obsidian.md/shellcommands).
 **Research: Update knowledge base**
 
 ```bash
-"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" sync
+"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" sync --background
 ```
 
 **Research: Full synchronization**
 
 ```bash
-"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" sync --full
+"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" sync --full --background
 ```
 
 **Research: Apply reviewed changes**
@@ -325,13 +477,13 @@ and [plugin guide](https://publish.obsidian.md/shellcommands).
 **Research: Update knowledge base**
 
 ```powershell
-& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" sync
+& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" sync --background
 ```
 
 **Research: Full synchronization**
 
 ```powershell
-& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" sync --full
+& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" sync --full --background
 ```
 
 **Research: Apply reviewed changes**
@@ -350,16 +502,72 @@ Press Ctrl+P to open the command palette and select the alias (some plugin versi
 prefix aliases with “Shell commands:”). These are the same one-shot Python calls
 used in a terminal. You may assign Obsidian hotkeys to them.
 
-### Optional update on vault startup
+### Windows Obsidian → WSL commands (PowerShell)
 
-First verify the incremental command manually. Open that command's settings in
-Shell Commands, open its **Events** settings and enable **Obsidian starts**. Keep
-it visible in the command palette as well. Leave the global event-disable switch
-off. Enable this event only for the incremental command, never the full or apply
-commands. Each vault-open event starts one update and exits; the OS lock rejects
-concurrent invocations. Zotero must already be open; a failed startup sync is
-reported and does not mark papers removed. Run the palette command again after
-opening Zotero. See [Shell Commands events](https://publish.obsidian.md/shellcommands/Events/Events%20-%20general%20principles).
+Select your distribution as WSL's default, or add `--distribution YOUR_DISTRO`
+before `--cd` in **every** command. `--cd` accepts the absolute Windows vault path,
+and `--exec` runs the Linux virtual-environment Python directly in that directory.
+These semantics are documented in [WSL's command help](https://github.com/microsoft/WSL/blob/master/localization/strings/en-US/Resources.resw).
+No Windows username, drive or Linux home is embedded in these commands.
+
+**Research: Update knowledge base**
+
+```powershell
+wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py sync --background
+```
+
+**Research: Full synchronization**
+
+```powershell
+wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py sync --full --background
+```
+
+**Research: Apply reviewed changes**
+
+```powershell
+wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py apply
+```
+
+**Research: Check status**
+
+```powershell
+wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py status
+```
+
+For diagnosis, replace the final command with `doctor` or `sync --dry-run`.
+WSL `--exec` does not initialize an interactive shell: if you use nvm or a custom
+npm prefix, ensure Linux Node and Codex are on the inherited PATH or configure
+`codex.executable` to a Linux executable available in that environment. Restart
+Obsidian after changes. Codex's subprocess working directory is its private staging
+directory inside this vault, matching its `--cd` sandbox boundary.
+
+### Optional lightweight startup synchronization
+
+Create a separate **Research: Startup update** alias using the appropriate sync
+command above with `sync --startup --background`. Enable the Shell Commands
+**Obsidian starts** event only for that alias. `--startup` processes at most
+`processing.startup_max_documents` changed document jobs (default 5), deferring
+concept extraction and cross-document reasoning. A normal manual update resumes
+remaining work; `--full` is explicit and cannot be combined with `--startup`.
+A complete membership/API scan and content hashing still occur, so startup I/O
+cost depends on collection size. This is a finite command, not a daemon or watcher.
+
+`--background` returns immediately after spawning the **same Python environment**
+with detached stdin/stdout/stderr. The child takes the existing OS vault lock, so
+concurrent sync/apply execution is prevented. No community plugin is enabled by
+this repository. Keep plugin output in an output panel, never the active note.
+
+`Home.md` shows checkpointed progress and completeness; **Research: Check status**
+shows live `.pipeline/progress.json`, the last result and recent background runs.
+The launch result identifies `.pipeline/runs/<id>.log` and `<id>.json`; the JSON
+record stores the final exit code and full execution report. Background launch
+exit 0 confirms launch only; inspect the child report for completion. Abrupt kills
+can leave a last-reported running/launching record; they never imply success.
+The OS releases the lock when the process exits. Retry ordinary sync for recovery.
+Zotero must be open. On WSL, doctor and every sync actually contact the loopback
+API and resolve/open/hash attachments; mirrored networking is never presumed to
+be working merely because Python runs in WSL. Check the completed report from the
+actual Windows Obsidian launch environment before enabling unattended startup.
 
 ## Graph colors
 
@@ -480,6 +688,57 @@ rewritten. If the paper returns to the collection, the same parent key reactivat
 its existing note or regenerates the deleted note without creating a new identity.
 See [recovery instructions](docs/operations.md) before restoring a backup.
 
+## Initial sync, incremental work and request budgets
+
+The first `sync` processes parents progressively, then reasons across their summaries.
+Later runs hash source bytes, process only new/modified/unfinished documents, and
+retrieve context for changed knowledge. Successful earlier jobs survive interruptions.
+`--full` deliberately bypasses extraction/inference reuse and reprocesses current
+sources; it preserves IDs, user additions, approvals and rejection history. Ordinary
+retry usually needs only `sync`, not `--full`.
+
+All parameters are optional in existing `config.yaml` files:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `codex.max_input_chars` | 500000 | Total per-request safety budget: instructions, schema, serialized data and expected output reserve |
+| `codex.output_reserve_chars` | 16000 | Expected output allowance subtracted before packing input |
+| `processing.chunk_chars` | 60000 | Target serialized source size per chunk; request overhead can lower it |
+| `processing.graph_neighbors` | 8 | Maximum other candidate notes per changed fragment |
+| `processing.graph_fragment_chars` | 12000 | Maximum indexed note-fragment size; request budget can lower it |
+| `processing.retrieval_passages` | 4 | Maximum original excerpts added to one reasoning request |
+| `processing.passage_chars` | 2000 | Maximum retrieved excerpt length |
+| `processing.chunk_context_chars` | 600 | Adjacent source context supplied with a section/math-aware chunk |
+| `processing.candidate_terms` | 32 | Maximum rare query terms per registry fragment |
+| `processing.candidate_pool` | 128 | Maximum candidate fragments scored per query |
+| `processing.startup_max_documents` | 5 | Changed document jobs attempted by lightweight startup |
+
+Character budgets are not token measurements or a guarantee of the model's context
+capacity. Set them conservatively for your selected model. Large instruction files
+and JSON escaping consume budget too. Too little room for instructions/schema and
+source context is blocking; no source text is silently discarded. Each chunk is
+validated separately; a consolidation that cannot reduce within the budget fails
+explicitly rather than labeling an incomplete summary successful. Output reserve
+is an estimate, not a Codex output-token cap. Chunk summaries and exact evidence
+are retained so you can audit what the overview consolidated.
+
+A fully completed sync exits **0**. A completed attempt with skipped/failed documents
+or incomplete reasoning exits **2**, with details in JSON. Blocking configuration,
+API, authentication, ownership, concurrent-edit or transaction errors exit **1**;
+keyboard interruption exits **130**. Progress events are JSON on stderr; the final
+result stays on stdout. `doctor` exits 1 only for blocking errors; attachment and
+manuscript warnings do not make it fail. Dry run reports new/modified/unchanged,
+removed/processable/skipped parents, blockers and estimated operations without
+writing caches or calling inference. Estimates are approximate: consolidation and
+future summary fragment counts depend on generated results.
+
+`status` distinguishes successful, pending, skipped and failed document IDs, retained
+errors, pending human approvals, incomplete reasoning and transaction recovery.
+The successful-document status is separate from whether an older note exists.
+An inaccessible supplement leaves parent coverage partial while allowing current
+main-article findings. If no attachment can be summarized, the old note is retained. Removing a parent from a verified collection snapshot
+continues to create a removal review rather than deleting a note.
+
 ## Commands, status and troubleshooting
 
 All commands accept `--vault PATH` before the command when invoked as a module:
@@ -493,8 +752,10 @@ The wrapper script selects its own vault directory, even when called from elsewh
 | Command | Behavior |
 | --- | --- |
 | `sync` | Incremental summaries and pending proposals; no approvals applied |
+| `sync --background` | Launch a detached finite incremental run; inspect its final report |
+| `sync --startup --background` | Bounded startup document jobs; defer concept extraction and reasoning |
 | `sync --full` | Reprocess all active papers/available works and reconsider graph context |
-| `sync --dry-run` | Read source metadata/fingerprints and show plan; no writes or inference |
+| `sync --dry-run` | Inspect metadata, fingerprints and text availability; show operations/skip reasons; no writes or inference |
 | `apply --dry-run` | Validate approvals and print affected paths/removal impact; no writes |
 | `apply` | Deterministically apply validated user decisions |
 | `status` | Report counts, last success, warnings and pending transaction status |
@@ -519,14 +780,15 @@ the cause. The next normal mutation recovers an interrupted file transaction fir
 | Zotero HTTP 403 | Enable the Advanced local API preference; no local API key is needed for reads |
 | Wrong collection or library | Verify key/library through Zotero; do not switch an initialized project to another collection |
 | Truncated/inconsistent API result | Wait for Zotero synchronization to finish; retry; no removal snapshot is accepted |
-| Missing PDF | Download it from Zotero, check linked-file paths, retry; notes/snapshot stay unchanged |
+| Missing PDF / OneDrive placeholder | Download/keep locally, check linked paths and retry; existing notes remain, membership is still recorded |
 | Scanned or encrypted PDF | Supply an accessible text PDF; OCR/decryption is outside this baseline |
 | Inaccessible manuscript/include | Check source_roots, path spelling, permissions and recursive includes |
 | Codex not found from Obsidian | Restart Obsidian to refresh PATH or set codex.executable to its local absolute path |
 | Login/model/usage error | Run codex login/status in a terminal, select an available model and inspect limits |
 | Missing Codex flags | Update Codex; no insecure compatibility fallback is used |
-| Invalid agent JSON/evidence | Inspect staging response; retry; prior notes and successful snapshot are retained |
-| Input too large | Narrow the collection or explicitly raise max_input_chars within your model's context capacity; no text is silently dropped |
+| Invalid agent JSON/evidence | Inspect staging response; retry the failed job; completed papers and approvals are retained |
+| Input budget / consolidation failure | Check instructions and output reserve fit the configured budget; chunks remain cached. Adjust chunk sizing or model capacity; no scientific text is silently dropped |
+| Windows URL under WSL | Doctor shows the original URL and translated path; check wslpath, Windows mounts and file availability |
 | Plugin command does not run | Confirm plugin enabled, alias visible, correct Bash/PowerShell shell, quoted vault variable, output panel and venv path |
 | Another run holds lock | Wait for that process or stop it; the lock releases when the process exits, regardless of the lock file's presence |
 | Malformed/missing review | Restore the file from your backup, correct only status/decision; apply refuses the batch |
@@ -547,11 +809,40 @@ ignored files and local state, and commit your tracked changes. Add the template
 repository as a read-only upstream remote and inspect a diff on an update branch.
 Selectively merge/cherry-pick code, tests, agent rules and documentation; preserve
 local configuration, state, research folders, Home's user section and review history.
-Run the synthetic tests, doctor and a dry run before normal sync. Instruction/code
-changes deliberately invalidate processing recipes and may reprocess documents.
+Run the synthetic tests, doctor and a dry run before normal sync. Relevant instruction/algorithm changes invalidate their own stage contracts; changed
+downstream scientific inputs are reconsidered.
 State-schema changes must have an explicit migration; incompatible schemas fail.
 Avoid a blind reset, copying an upstream Home.md over your dashboard or force-adding
 ignored research/configuration files.
+
+### Updating an existing vault to the incremental pipeline
+
+1. Stop pipeline processes and back up the **entire vault including ignored**
+   `.pipeline`, notes, review files and local configuration. Complete an old pending
+   transaction with the old code before changing versions when possible.
+2. Update `src/`, `scripts/`, `agents/`, examples, tests and documentation. Preserve
+   your `config.yaml`, `works.yaml`, `.pipeline/state.json`, generated notes, user
+   additions, review files and Home dashboard markers. Reinstall the editable
+   package with the same platform's Python (`python -m pip install -e '.[dev]'`).
+3. Merge desired optional limits from `config.example.yaml`; defaults work with old
+   configurations. State schema **1** remains readable: attachment coverage and the persistent
+   concept registry are added during normal sync. Include the new
+   `agents/concepts.md` and all stage/version modules when updating. No notes or reviews are deleted or renamed.
+4. Run synthetic tests, `doctor`, `sync --dry-run`, then ordinary `sync`. The new stage contracts/schema intentionally require a one-time managed-summary
+   regeneration and concept registry build. Later instruction changes invalidate
+   only their relevant stages and changed downstream inputs. Each completed parent is
+   durable, and rerunning ordinary sync resumes interruptions. Do not delete state
+   to force migration and do not use `--full` merely to retry.
+5. Re-review approvals whose source notes changed. Approved/rejected review files
+   remain intact; pending reviews can refresh expected hashes. Apply continues to
+   refuse stale approvals; reset them to pending and sync before approving again.
+
+For a native Windows → WSL move, replace the Windows virtual environment with a
+new Linux environment after backing it up, sign into Linux Codex, and use the WSL
+Shell Commands configuration. Translate/update manuscript roots and include paths
+in local configuration as necessary. Old absolute manuscript include paths are
+reauthorized before reuse; doctor identifies path problems. Never share one venv
+between Windows and Linux. Do not change the Zotero collection/library identity.
 
 Git does not back up ignored content. Use an encrypted local backup for the full
 vault, manuscripts and `.pipeline`. If you intentionally want private research
@@ -593,14 +884,14 @@ inference bill is required. A temporary local Git repository tests deletion and
 backup behavior. CI covers Python 3.11/3.13 on Linux and Windows. Local validation
 and remaining live checks are recorded in [docs/validation.md](docs/validation.md).
 
-This is a working baseline with explicit limits: no OCR/figure understanding,
-non-PDF supplement parser, full TeX engine, automatic prose revision/merge, semantic
-proof checker, source-level changed-page batching or large-library retrieval index.
-Whole changed parent papers are reprocessed; graph reasoning receives the current
-vault context and stops explicitly at the configured input limit. Exact duplicate
-concept titles and structural graph issues get deterministic checks; broader
-near-duplicates and obsolete scientific claims require agent suggestions and human
-review. Initial processing fails safely on an unsupported configured source.
+The remaining limits include no OCR/figure understanding, non-PDF supplement
+parser, full TeX engine, automatic prose merge or semantic proof checker. Changed
+parent papers are processed with bounded chunks and cached operations; unchanged
+papers reuse successful results. Retrieval is approximate and does not guarantee
+all conceptual relationships. Scientific accuracy still requires source review.
+Caches and staging currently accumulate; back them up privately and monitor disk
+usage. Removing only cache/staging files when no run is active is safe but forces
+more extraction/inference; never remove state, reviews or a transaction journal.
 
 Live Zotero version behavior, actual Codex structured responses and native Windows
 sandbox/npm setup, Obsidian plugin events and graph UI need real-world integration
