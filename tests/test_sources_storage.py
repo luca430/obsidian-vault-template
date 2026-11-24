@@ -19,7 +19,7 @@ from research_vault.storage import (
 )
 
 
-def test_pdf_page_provenance_and_blank_page_failure(tmp_path):
+def test_pdf_page_provenance_and_blank_page_coverage(tmp_path):
     source = write_pdf(tmp_path / "test.pdf", "Page with scientific content.")
     pages = pdf(source, "PDF00001")
     assert pages[0]["source"] == "PDF00001"
@@ -31,8 +31,10 @@ def test_pdf_page_provenance_and_blank_page_failure(tmp_path):
     empty = tmp_path / "blank.pdf"
     doc.save(empty)
     doc.close()
-    with pytest.raises(VaultError, match="OCR"):
-        pdf(empty, "EMPTY001")
+    blank = pdf(empty, "EMPTY001")
+    assert blank[0]["extraction_status"] == "unprocessed"
+    assert blank[0]["incomplete"] and not blank[0]["text"]
+    assert "OCR disabled" in blank[0]["reason"]
     with pytest.raises(VaultError, match="Unreadable PDF"):
         pdf(tmp_path / "missing.pdf", "MISSING1")
 

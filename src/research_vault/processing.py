@@ -9,7 +9,7 @@ from collections import Counter
 from .agents import fits, payload_budget, validate_output, validate_summary
 from .chunking import section_chunks
 from .recipes import NAMESPACES, stage_recipe
-from .sources import pdf
+from .sources import extraction_complete, page_coverage, pdf, usable_pages
 from .storage import VaultError, atomic, digest, inside, read_json
 
 
@@ -33,7 +33,7 @@ class Processor:
         self.calls = 0
         self.extraction_recipe = stage_recipe(config, "extraction")
 
-    def cached(self, namespace, key, operation):
+    def cached(self, namespace, key, operation, reusable=None):
         path = inside(self.config.root, f".pipeline/cache/{namespace}/{digest(key)}.json")
         cached = read_json(path) if path.exists() and not self.full else None
         if cached is not None:
@@ -46,9 +46,10 @@ class Processor:
                 raise VaultError(
                     "Processing cache is damaged; restore or remove the affected cache file"
                 )
-            self.hits += 1
-            self.progress("cache", namespace=namespace, reused=self.hits)
-            return cached["value"]
+            if reusable is None or reusable(cached["value"]):
+                self.hits += 1
+                self.progress("cache", namespace=namespace, reused=self.hits)
+                return cached["value"]
         result = operation()
         atomic(
             path,
@@ -92,8 +93,21 @@ class Processor:
         return result
 
     def extract(self, path, source, sha256):
+        key = [self.extraction_recipe, source, sha256]
+
+        def page_cache(index, operation):
+            return self.cached(
+                "extractions",
+                key + ["page", index + 1],
+                operation,
+                reusable=lambda page: extraction_complete([page]),
+            )
+
         return self.cached(
-            "extractions", [self.extraction_recipe, source, sha256], lambda: pdf(path, source)
+            "extractions",
+            key,
+            lambda: pdf(path, source, self.config.ocr, page_cache),
+            reusable=extraction_complete,
         )
 
     def batches(self, role, header, pages):
@@ -121,7 +135,19 @@ class Processor:
             yield {**header, "pages": batch}
 
     def summarize(self, role, payload):
+        pdf_pages = [p for p in payload["pages"] if "extraction_status" in p]
+        if pdf_pages:
+            if not usable_pages(pdf_pages):
+                raise VaultError("No processable PDF text; unprocessed pages were not read")
+            payload = {
+                **payload,
+                "page_processing": page_coverage(payload["pages"]),
+                "coverage": "complete" if extraction_complete(payload["pages"]) else "partial",
+                "pages": usable_pages(payload["pages"]),
+            }
         pages = payload["pages"]
+        if not pages:
+            raise VaultError("No processable document text; unprocessed pages were not read")
         if fits(self.config, role, payload) and size(pages) <= self.config.processing(
             "chunk_chars"
         ):

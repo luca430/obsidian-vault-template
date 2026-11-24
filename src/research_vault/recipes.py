@@ -10,7 +10,7 @@ from .storage import digest, file_hash, inside
 
 # These explicit versions cover implementation changes, independently of role instructions.
 VERSIONS = {
-    "extraction": 3,
+    "extraction": 4,
     "literature": 3,
     "manuscript": 3,
     "concepts": 1,
@@ -33,7 +33,7 @@ def stage_recipe(config, stage):
     if stage == "extraction":
         from .sources import pdf
 
-        return digest([VERSIONS[stage], getsource(pdf), version("PyMuPDF")])
+        return digest([VERSIONS[stage], getsource(pdf), version("PyMuPDF"), config.ocr])
     if stage == "retrieval":
         return digest(
             [

@@ -12,6 +12,17 @@ attachments:
   overrides: {}              # {ABCDEFGH: main, IJKLMNPQ: supplementary, RSTUVWXY: ignore}
   # Alternatively tag attachments research-vault:main or research-vault:supplementary.
 
+# Optional local page-level fallback. No sources are uploaded to an OCR service.
+# Install Tesseract and the chosen language data in the same OS as Python (WSL:
+# Linux Tesseract). Diagnostics inspect native text only and never run OCR.
+ocr:
+  enabled: false
+  executable: tesseract       # PATH command or local executable path; no shell arguments.
+  language: eng              # Installed Tesseract languages, e.g. eng+ita.
+  dpi: 150                   # Render only deficient pages (maximum 600).
+  timeout_seconds: 60        # Per-page Tesseract timeout.
+  min_text_chars: 10         # Minimum non-whitespace characters; a heuristic, not quality assurance.
+
 # Explicit authorized directories for works.yaml sources and recursive includes.
 # Relative paths resolve from the vault; local absolute paths and file URLs work too.
 # WSL accepts Windows paths here and in works.yaml; wslpath translates them.

@@ -5,6 +5,10 @@ Use sections for research objectives, essential concepts, methodology, mathemati
 Prefer registered LaTeX over a compiled PDF when both exist (the registry selects the source). Local includes have already been resolved by Python. Cite actual filenames/sections or processed PDF pages. Evidence quotes must match supplied page records exactly. Bibliography records are for attribution, never a reason to create a graph edge. PDF images and non-text mathematics were not interpreted.
 Never modify originals or suggest replacing user additions. Return JSON only.
 
+Consult page_processing and coverage for PDFs. Unprocessed pages were not read;
+incomplete native text does not establish full-page coverage. Identify supplied OCR
+text as uncertain recognition, not verified mathematics or figure interpretation.
+
 When processing_stage describes a chunk, only a PART of this parent document is
 provided. Do not claim whole-document coverage. Preserve mathematical expressions,
 scientific results, assumptions, uncertainty and limitations in this part, with

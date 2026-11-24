@@ -19,7 +19,7 @@ Validated results use distinct content-addressed cache namespaces under
 
 | Stage | Namespace | Validity |
 | --- | --- | --- |
-| Source attachment extraction | `extractions` | Attachment SHA256, source key, PDF extractor implementation/version and PyMuPDF version |
+| Source attachment/page extraction | `extractions` | Attachment SHA256, source key, page number (page records), PDF extractor implementation/version, PyMuPDF version and OCR settings |
 | Individual document summaries / consolidation | `document_summaries` | Exact source/chunk or summary payload, own role/global instructions, model configuration, summary/chunking contract and upstream extraction version |
 | Concept extraction | `concept_extraction` | Exact note fragment, source provenance/completeness, own role/global instructions, concept schema/contract and model configuration |
 | Relationship proposals | `relationship_proposals` | Exact retrieved notes/concepts/passages/coverage, own role/global instructions, relationship schema/contract and model configuration |
@@ -36,7 +36,25 @@ Source bytes are hashed every snapshot and checked around processing. Invalid
 responses are not cached as successful; validated chunks and attachment summaries
 survive a later failure. Failed parent consolidation retains the detailed claims
 with partial coverage. Original page/file records are cached for bounded retrieval.
-Only text is extracted: no OCR or figure understanding is available.
+PDFs retain per-page `text`/`ocr`/`unprocessed` records with original locators,
+incomplete flags and failure reasons. Native extraction runs first; optional local
+Tesseract processes only pages below the configured non-whitespace threshold.
+Successful pages are reusable; partial document/page cache entries are recorded
+but retried next sync. This allows an engine/language-data repair to recover missing
+pages without repeating successful page OCR. Partial text does not qualify as full
+coverage. Blank pages remain unprocessed rather than being claimed as read.
+Only usable text enters summary evidence or passage retrieval; missing-page
+coverage metadata accompanies summary requests. With no usable source text, no
+summary is fabricated and the previous note survives. Sparse native text is kept
+even if OCR fails. OCR is uncertain text recognition, not figure understanding.
+
+`ocr.enabled` defaults to false. The local executable, language, resolution,
+per-page timeout and sufficiency threshold are configurable (see config.example.yaml).
+Changing OCR settings invalidates extraction and dependent document summaries.
+`doctor` and `sync --dry-run` inspect native text without OCR or cache writes;
+engine availability does not establish installed language data or recognition quality.
+`status` retains actual per-page coverage for attachments and PDF manuscripts.
+Use Linux Tesseract with WSL Python; PNG stdin avoids cross-OS temporary file paths.
 
 The private persistent concept registry lives inside state, with source annotations,
 exact note evidence, coverage/fingerprints, fragment postings and separately reviewed

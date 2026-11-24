@@ -29,7 +29,14 @@ from .reviews import (
     read_reviews,
     refresh_pending,
 )
-from .sources import manuscript, pdf
+from .sources import (
+    coverage_error,
+    manuscript,
+    ocr_diagnostics,
+    page_coverage,
+    pdf,
+    usable_pages,
+)
 from .storage import (
     VaultError,
     atomic,
@@ -247,6 +254,7 @@ class Pipeline:
         ]
         removed = sorted(set(state["membership"]) - set(snapshot))
         works, changed_works, warnings, skipped, partial_candidates = {}, [], [], {}, {}
+        page_diagnostics = {}
         for key, item in snapshot.items():
             attachments = item["attachments"]
             for attachment in attachments:
@@ -284,6 +292,7 @@ class Pipeline:
                     and old.get("metadata") == work
                     and old.get("recipe") == manuscript_recipe
                     and old.get("status", "successful") == "successful"
+                    and old.get("completeness", "complete") == "complete"
                     and old.get("source") == str(self.config.authorized(work["source_path"]))
                     and files
                     and all(file_hash(self.config.authorized(p)) == h for p, h in files.items())
@@ -296,7 +305,22 @@ class Pipeline:
                 ) >= self.config.processing("startup_max_documents"):
                     changed_works.append(key)
                     continue
-                works[key] = manuscript(self.config, work, None if dry_run else processor.extract)
+                works[key] = manuscript(
+                    self.config,
+                    work,
+                    (
+                        lambda path, source, sha: pdf(
+                            path, source, {**self.config.ocr, "enabled": False}
+                        )
+                    )
+                    if dry_run
+                    else processor.extract,
+                )
+                page_diagnostics[f"work:{key}"] = page_coverage(works[key]["pages"])
+                issue = coverage_error(works[key]["pages"])
+                if issue:
+                    partial_candidates[f"work:{key}"] = issue
+                    warnings.append(f"Manuscript {key}: {issue}")
             except (OSError, VaultError) as exc:
                 work_errors[key] = str(exc)
                 warnings.append(
@@ -330,7 +354,16 @@ class Pipeline:
                     if attachment["classification"] == "ignore" or attachment.get("error"):
                         continue
                     try:
-                        pages.extend(pdf(Path(attachment["path"]), attachment["key"]))
+                        extracted = pdf(
+                            Path(attachment["path"]),
+                            attachment["key"],
+                            {**self.config.ocr, "enabled": False},
+                        )
+                        page_diagnostics[attachment["key"]] = page_coverage(extracted)
+                        pages.extend(usable_pages(extracted))
+                        issue = coverage_error(extracted)
+                        if issue:
+                            attachment_errors.append(f"{attachment['key']}: {issue}")
                     except (VaultError, OSError) as exc:
                         attachment_errors.append(f"{attachment['key']}: {exc}")
                 if not pages:
@@ -365,6 +398,9 @@ class Pipeline:
             "processable": [k for k in snapshot if k not in skipped],
             "skipped": skipped,
             "partial_candidates": partial_candidates,
+            "page_processing": page_diagnostics,
+            "ocr": ocr_diagnostics(self.config.ocr),
+            "extraction_diagnostic_note": "Dry runs inspect native text only; OCR is attempted only during synchronization.",
             "estimated_document_operations": len([k for k in changed_papers if k not in skipped])
             + len(works)
             if not dry_run
@@ -481,6 +517,8 @@ class Pipeline:
                 old["completeness"] = "failed"
                 attachment_errors, unavailable = {key: str(exc)}, {}
             if result is None:
+                if old["completeness"] == "partial":
+                    partial[key] = {**attachment_errors, **unavailable}
                 error = (
                     "; ".join([*attachment_errors.values(), *unavailable.values()])
                     or "no processable PDF; no readable main/supplementary PDF"
@@ -527,6 +565,10 @@ class Pipeline:
                 completed += 1
                 continue
             source = works[key]
+            issue = coverage_error(source["pages"])
+            old["page_processing"] = page_coverage(source["pages"])
+            if issue:
+                partial[f"work:{key}"] = {"pages": issue}
             try:
                 result = processor.summarize("manuscript", source)
                 if any(file_hash(Path(p)) != h for p, h in source["files"].items()):
@@ -536,12 +578,16 @@ class Pipeline:
                 raise
             except (OSError, VaultError) as exc:
                 failed[f"work:{key}"] = str(exc)
-                old.update(status="failed", completeness="failed", error=str(exc))
+                old.update(
+                    status="failed", completeness="partial" if issue else "failed", error=str(exc)
+                )
                 warnings.append(f"Manuscript {key} failed: {exc}")
                 self.save(state)
                 completed += 1
                 continue
             path = f"My Work/{key}.md"
+            if issue:
+                warnings.append(f"Manuscript {key} partially processed: {issue}")
             notes[path] = update_note(
                 notes.get(path),
                 f"work:{key}",
@@ -554,11 +600,11 @@ class Pipeline:
                 files=source["files"],
                 metadata=source["metadata"],
                 recipe=manuscript_recipe,
-                completeness="complete",
+                completeness="partial" if issue else "complete",
                 source=str(self.config.authorized(source["metadata"]["source_path"])),
                 note=path,
                 status="successful",
-                error=None,
+                error=issue,
                 passages=self.store_passages(f"work-{key}", source["fingerprint"], source["pages"]),
             )
             self.save(state, {path: notes[path]})
@@ -744,7 +790,21 @@ class Pipeline:
                 ]
                 if file_hash(path) != attachment["sha256"]:
                     raise VaultError("PDF changed while extracting; retry sync")
-                entry.update(completeness="partial", extraction="complete", summary="pending")
+                issue = coverage_error(extracted)
+                entry.update(
+                    completeness="partial",
+                    extraction="partial" if issue else "complete",
+                    summary="pending",
+                    page_processing=page_coverage(extracted),
+                    pages=[p["locator"] for p in usable_pages(extracted)],
+                )
+                pages.extend(extracted)
+                if issue:
+                    unavailable[attachment_key] = issue
+                if not usable_pages(extracted):
+                    entry.update(summary="unavailable", error=issue)
+                    self.save(state)
+                    continue
                 result = processor.summarize(
                     "literature",
                     {
@@ -758,12 +818,10 @@ class Pipeline:
                 if file_hash(path) != attachment["sha256"]:
                     raise VaultError("PDF changed while summarizing; retry sync")
                 summaries.append(result)
-                pages.extend(extracted)
                 entry.update(
-                    completeness="complete",
+                    completeness="partial" if issue else "complete",
                     summary="complete",
-                    error=None,
-                    pages=[p["locator"] for p in extracted],
+                    error=issue,
                 )
             except (AuthenticationError, IntegrationError):
                 raise
@@ -776,8 +834,14 @@ class Pipeline:
         for attachment_key, record in attachment_states.items():
             record["present"] = attachment_key in current
         if not summaries:
-            old["completeness"] = "failed" if errors else "metadata_only"
-            return None, [], errors, unavailable
+            old["completeness"] = (
+                "partial"
+                if any(r.get("incomplete") for r in pages)
+                else "failed"
+                if errors
+                else "metadata_only"
+            )
+            return None, pages, errors, unavailable
         try:
             result = processor.combine("literature", summaries)
         except AuthenticationError:
@@ -798,10 +862,10 @@ class Pipeline:
             result = deepcopy(result)
             result["summary"] = (
                 "Processing coverage: partial. Scientific statements below concern only the processed "
-                "attachments. Missing or failed supplements were not interpreted.\n\n"
+                "pages and attachments. Unprocessed pages and missing or failed supplements were not read.\n\n"
                 + result["summary"]
-                + "\n\nUnavailable/failed attachments: "
-                + "; ".join(sorted({**errors, **unavailable}))
+                + "\n\nIncomplete coverage: "
+                + "; ".join(f"{k}: {v}" for k, v in sorted({**errors, **unavailable}.items()))
             )
         return result, pages, errors, unavailable
 
@@ -821,7 +885,7 @@ class Pipeline:
 
     def store_passages(self, key, fingerprint, pages):
         name = f".pipeline/cache/documents/{digest([key, fingerprint])}.json"
-        atomic(inside(self.root, name), json.dumps(pages, ensure_ascii=False))
+        atomic(inside(self.root, name), json.dumps(usable_pages(pages), ensure_ascii=False))
         return name
 
     def _commit_checked(self, changes: dict) -> None:
@@ -907,6 +971,13 @@ class Pipeline:
             "attachments": {
                 k: r.get("attachment_processing", {}) for k, r in state["papers"].items()
             },
+            "manuscript_processing": {
+                k: {
+                    "completeness": r.get("completeness"),
+                    "page_processing": r.get("page_processing", []),
+                }
+                for k, r in state["works"].items()
+            },
             "concept_registry": {
                 k: len(state.get("concept_registry", {}).get(k, {}))
                 for k in ("documents", "concepts", "reviewed_relationships")
@@ -946,7 +1017,14 @@ class Pipeline:
             "python": __import__("sys").executable,
             "blocking_errors": [],
             "warnings": [],
+            "ocr": ocr_diagnostics(self.config.ocr),
+            "pdf_pages": {},
+            "extraction_diagnostic_note": "Native text inspection only; doctor does not run OCR. Availability does not verify language data or recognition quality.",
         }
+        if checks["ocr"]["status"] == "unavailable":
+            checks["warnings"].append(
+                "OCR is enabled but unavailable; usable native text will be retained with partial coverage"
+            )
         for package in ("yaml", "pymupdf", "jsonschema"):
             checks[package] = "ok" if importlib.util.find_spec(package) else "missing"
             if checks[package] != "ok":
@@ -965,6 +1043,21 @@ class Pipeline:
                         checks["warnings"].append(
                             f"Attachment {attachment['key']}: ignored or unsupported format"
                         )
+                    elif checks["pymupdf"] == "ok":
+                        try:
+                            pages = pdf(
+                                Path(attachment["path"]),
+                                attachment["key"],
+                                {**self.config.ocr, "enabled": False},
+                            )
+                            checks["pdf_pages"][attachment["key"]] = page_coverage(pages)
+                            issue = coverage_error(pages)
+                            if issue:
+                                checks["warnings"].append(
+                                    f"Attachment {attachment['key']}: {issue}"
+                                )
+                        except (VaultError, OSError) as exc:
+                            checks["warnings"].append(f"Attachment {attachment['key']}: {exc}")
                 if not any(a["classification"] != "ignore" for a in item["attachments"]):
                     checks["warnings"].append(f"Paper {key}: no processable PDF")
         except (VaultError, OSError) as exc:
@@ -979,13 +1072,23 @@ class Pipeline:
         for work in registered:
             try:
                 path = self.config.authorized(work["source_path"])
-                manuscript(self.config, work)
+                document = manuscript(
+                    self.config,
+                    work,
+                    lambda path, source, sha: pdf(
+                        path, source, {**self.config.ocr, "enabled": False}
+                    ),
+                )
+                issue = coverage_error(document["pages"])
+                if issue:
+                    checks["warnings"].append(f"Manuscript {work['id']}: {issue}")
                 checks["manuscripts"].append(
                     {
                         "id": work["id"],
                         "original": work["source_path"],
                         "resolved_path": str(path),
-                        "status": "ok",
+                        "status": "partial" if issue else "ok",
+                        "page_processing": page_coverage(document["pages"]),
                     }
                 )
             except (VaultError, OSError) as exc:

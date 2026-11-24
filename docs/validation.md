@@ -2,6 +2,19 @@
 
 ## Verified in this workspace
 
+PDF robustness follow-up (2026-11-24): the full synthetic suite passed **137 tests**
+in 427.43 seconds, including 29 PDF/OCR regression cases. Ruff lint/format checks,
+compilation and wrapper CLI help also passed. Coverage includes fully scanned and
+mixed native/image PDFs, blanks, sparse text, individual page extraction errors,
+missing engines/language data, empty OCR output, timeouts, nonzero exits,
+interrupted page-cache recovery, partial-to-complete retries, unread-page exclusion
+from evidence/retrieval, manuscript coverage and diagnostics without OCR or writes.
+Tesseract is not installed in this workspace; OCR engine responses and executable
+resolution are mocked, while PyMuPDF extraction and rasterization use synthetic PDFs.
+Actual Tesseract recognition and native Windows/WSL engine execution remain live checks.
+
+Earlier baseline validation:
+
 Validated on Linux under a WSL2 kernel with Python 3.12.8 using synthetic sources
 and mocked services (2026-11-24):
 
@@ -91,9 +104,11 @@ collection, manuscript or personal research note was added to this template.
 
 ## Deliberate baseline limits
 
-- PDF processing is text extraction only. No OCR, image/figure interpretation,
-  decryption or non-PDF supplement parsers are included. A configured unreadable
-  source is skipped/failed per document; metadata-only summaries are not fabricated.
+- PDF processing supplies native text and optional local Tesseract recognition.
+  OCR is uncertain, and image/figure interpretation, decryption and non-PDF
+  supplement parsers are not included. Unprocessed pages leave coverage partial;
+  metadata-only summaries are not fabricated. OCR regressions use synthetic raster
+  PDFs and a mocked engine; real Tesseract/language-data integration needs a live check.
 - LaTeX support resolves literal local input/include directives and preserves math
   source. It is not a TeX engine, macro evaluator or document build system.
 - Synthesis and prose revisions are advisory. Users edit scientific prose and

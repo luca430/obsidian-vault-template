@@ -24,6 +24,15 @@ PROCESSING_DEFAULTS = {
     "startup_max_documents": 5,
 }
 
+OCR_DEFAULTS = {
+    "enabled": False,
+    "executable": "tesseract",
+    "language": "eng",
+    "dpi": 150,
+    "timeout_seconds": 60,
+    "min_text_chars": 10,
+}
+
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
 
@@ -47,7 +56,7 @@ class Config:
     def load(cls, root: Path) -> Config:
         root = root.resolve()
         data = load_yaml(inside(root, "config.yaml"))
-        for field in ("zotero", "codex", "attachments", "processing"):
+        for field in ("zotero", "codex", "attachments", "processing", "ocr"):
             if not isinstance(data.get(field, {}), dict):
                 raise VaultError(f"{field} must be a mapping")
         z = data.get("zotero", {})
@@ -103,10 +112,27 @@ class Config:
                 or data.get("processing", {}).get(field, default) <= 0
             ):
                 raise VaultError(f"processing.{field} must be a positive integer")
+        ocr = {**OCR_DEFAULTS, **data.get("ocr", {})}
+        if type(ocr["enabled"]) is not bool:
+            raise VaultError("ocr.enabled must be true or false")
+        for field in ("executable", "language"):
+            if not isinstance(ocr[field], str) or not ocr[field].strip():
+                raise VaultError(f"ocr.{field} must be a nonempty string")
+        if not re.fullmatch(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*", ocr["language"]):
+            raise VaultError("ocr.language must contain Tesseract language names joined by +")
+        for field in ("dpi", "timeout_seconds", "min_text_chars"):
+            if type(ocr[field]) is not int or ocr[field] <= 0:
+                raise VaultError(f"ocr.{field} must be a positive integer")
+        if ocr["dpi"] > 600:
+            raise VaultError("ocr.dpi must be at most 600")
         return cls(root, data)
 
     def processing(self, key: str) -> int:
         return self.data.get("processing", {}).get(key, PROCESSING_DEFAULTS[key])
+
+    @property
+    def ocr(self) -> dict:
+        return {**OCR_DEFAULTS, **self.data.get("ocr", {})}
 
     @property
     def zotero(self) -> dict:

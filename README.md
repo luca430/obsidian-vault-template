@@ -210,7 +210,8 @@ PDF extraction, document summaries or concept extraction.
 Each new/changed Zotero **parent key** produces one literature note. Its main and
 supplementary attachments are extracted and summarized independently, then their
 validated summaries are consolidated. A missing supplement permits a usable main
-summary with partial coverage; retries reuse unchanged attachment summaries. Each registered manuscript
+summary with partial coverage; retries reuse unchanged attachment summaries. Missing
+page text also leaves coverage partial without discarding usable pages. Each registered manuscript
 is another job. Unchanged documents reuse their successful notes. Text extraction,
 validated inference results and original page records are cached privately under
 `.pipeline/cache/`. SHA256 content fingerprints include metadata, attachments and
@@ -241,7 +242,7 @@ Coverage is separate from job status, at both parent and attachment levels:
 | Coverage | Meaning |
 | --- | --- |
 | `metadata_only` | Metadata available; no usable full-text summary for this source |
-| `partial` | Some usable evidence exists; attachments or consolidation remain incomplete |
+| `partial` | Page/source coverage or consolidation is incomplete; usable text, if any, is retained |
 | `complete` | All selected supported sources and required consolidation succeeded |
 | `failed` | Processing failed without a usable current document result |
 
@@ -367,13 +368,56 @@ spreadsheets, videos and archives are not parsed in this baseline.
 
 The dependency floor is PyMuPDF 1.24.3, which supplies the current `pymupdf` import
 ([upstream change log](https://pymupdf.readthedocs.io/en/latest/changes.html#changes-in-version-1-24-3)).
-PyMuPDF extracts text from every PDF page and records attachment keys and page
-numbers. Encrypted, missing, invalid or textless-page PDFs are reported per parent;
-there is no OCR or figure-image understanding. Unavailable or failed attachments are retried independently. Available main text
-can produce a partial parent summary; with no usable summary the existing note is
-retained.
+PyMuPDF extracts each PDF page independently and records attachment keys, original
+page numbers and extraction status: `text`, `ocr` or `unprocessed`. By default,
+pages with fewer than 10 non-whitespace characters are flagged as insufficient.
+This threshold is configurable; it cannot establish text quality or detect every
+image-only region on a page with otherwise sufficient text. Isolated blank,
+image-only or damaged pages leave coverage **partial** while usable text is retained.
+Blank and image-only pages cannot be reliably distinguished by text extraction;
+neither is claimed as read. Sparse native text remains available with an incomplete
+warning even when OCR cannot improve it. Encrypted, missing and invalid PDFs are
+reported independently. With no usable summary, the existing note is retained.
 Unsupported non-PDF supplements are reported as ignored; notes cannot claim they
 were read. Unchanged PDFs are hashed but reuse extraction and summary caches.
+
+### Optional local OCR
+
+To read scanned text, install Tesseract and the required language data in the same
+environment as the pipeline, then configure `config.yaml`:
+
+```yaml
+ocr:
+  enabled: true             # Default false; no OCR dependency needed when disabled.
+  executable: tesseract     # PATH command or executable path, without shell arguments.
+  language: eng            # Installed languages; multiple languages use eng+ita.
+  dpi: 150                 # Render resolution; maximum 600.
+  timeout_seconds: 60       # Timeout per OCR subprocess.
+  min_text_chars: 10        # Native/OCR sufficiency threshold, excluding whitespace.
+```
+
+Only deficient pages are rendered by PyMuPDF and streamed to local Tesseract;
+there is no OCR network service or separate extraction pipeline. If the engine or
+language data is unavailable, times out, fails or returns insufficient text, the
+document stays partial and retains usable text. Original PDF bytes are never modified.
+If no page supplies usable text, the summary job is skipped (or fails validation for
+a manuscript), its page coverage remains partial, and an existing note is retained.
+OCR provides **unverified recognized text**, not figure understanding or verified
+equations/tables. Notes identify OCR pages, recognition uncertainty and unprocessed
+pages separately from processed sources. All evidence retains its original
+attachment/file and PDF page locator.
+
+On WSL use Linux Tesseract in the same distribution as Python; on native Windows
+use a Windows executable on PATH or set its local path (quote YAML paths containing
+backslashes with single quotes). Execution uses argument lists without a shell;
+PNG data passes through stdin, avoiding temporary Windows/WSL filename conversion.
+
+Successful page extractions and validated summaries remain cached. Ordinary `sync`
+retries incomplete pages, including blanks, without repeating successful page OCR;
+unchanged summary payloads reuse inference. Changing OCR settings invalidates the
+extraction contract and dependent document summaries. `--full` bypasses these caches.
+Install/fix an unavailable engine and retry ordinary `sync`; no cache deletion is
+needed. Start with a small collection to choose a suitable threshold/resolution.
 
 ## Register personal manuscripts
 
@@ -732,6 +776,16 @@ removed/processable/skipped parents, blockers and estimated operations without
 writing caches or calling inference. Estimates are approximate: consolidation and
 future summary fragment counts depend on generated results.
 
+`doctor` reports `ocr` availability/settings and `pdf_pages` with native extraction
+coverage; unavailable optional OCR is a warning, not a blocking dependency error.
+`sync --dry-run` reports `page_processing` and `partial_candidates`. Both inspect
+native text only and **never run OCR**; scanned PDFs with no native text may be
+listed as skipped in a dry run even when OCR is configured for the real sync.
+These checks do not verify installed language data or predict OCR quality.
+After `sync`, `status` reports actual per-page methods, incomplete flags and reasons
+under `attachments.<parent>.<attachment>.page_processing` and `manuscript_processing`.
+Generated notes list unprocessed pages as not read; `partial` coverage keeps exit 2.
+
 `status` distinguishes successful, pending, skipped and failed document IDs, retained
 errors, pending human approvals, incomplete reasoning and transaction recovery.
 The successful-document status is separate from whether an older note exists.
@@ -759,7 +813,7 @@ The wrapper script selects its own vault directory, even when called from elsewh
 | `apply --dry-run` | Validate approvals and print affected paths/removal impact; no writes |
 | `apply` | Deterministically apply validated user decisions |
 | `status` | Report counts, last success, warnings and pending transaction status |
-| `doctor` | Check config, packages, Zotero snapshot, source authorization and Codex/login/flags |
+| `doctor` | Check config, packages, Zotero snapshot, native PDF page coverage, optional OCR availability, source authorization and Codex/login/flags |
 
 `Home.md` shows last successful synchronization, processed/active papers, pending
 links/removals/revisions, warnings and errors. Edit only below the generated status
@@ -781,7 +835,8 @@ the cause. The next normal mutation recovers an interrupted file transaction fir
 | Wrong collection or library | Verify key/library through Zotero; do not switch an initialized project to another collection |
 | Truncated/inconsistent API result | Wait for Zotero synchronization to finish; retry; no removal snapshot is accepted |
 | Missing PDF / OneDrive placeholder | Download/keep locally, check linked paths and retry; existing notes remain, membership is still recorded |
-| Scanned or encrypted PDF | Supply an accessible text PDF; OCR/decryption is outside this baseline |
+| Scanned / mixed PDF or insufficient page text | Enable optional local OCR; inspect per-page coverage, engine/language settings and warnings; usable pages remain available |
+| Encrypted PDF | Supply an accessible unencrypted PDF; decryption is outside this pipeline |
 | Inaccessible manuscript/include | Check source_roots, path spelling, permissions and recursive includes |
 | Codex not found from Obsidian | Restart Obsidian to refresh PATH or set codex.executable to its local absolute path |
 | Login/model/usage error | Run codex login/status in a terminal, select an available model and inspect limits |
@@ -884,7 +939,7 @@ inference bill is required. A temporary local Git repository tests deletion and
 backup behavior. CI covers Python 3.11/3.13 on Linux and Windows. Local validation
 and remaining live checks are recorded in [docs/validation.md](docs/validation.md).
 
-The remaining limits include no OCR/figure understanding, non-PDF supplement
+The remaining limits include unverified OCR text and no figure understanding, non-PDF supplement
 parser, full TeX engine, automatic prose merge or semantic proof checker. Changed
 parent papers are processed with bounded chunks and cached operations; unchanged
 papers reuse successful results. Retrieval is approximate and does not guarantee

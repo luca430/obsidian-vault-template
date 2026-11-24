@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from .agents import no_edges
+from .sources import coverage_error, usable_pages
 from .storage import VaultError, frontmatter, inside, markdown, replace_section
 
 FOLDERS = ("Literature", "My Work", "My Notes", "Concepts")
@@ -60,14 +61,36 @@ def update_note(old: str | None, identity: str, kind: str, title: str, content: 
 
 
 def summary_content(result: dict, sources: list[dict], metadata: dict) -> str:
+    issue = coverage_error(sources)
     text = (
-        result["summary"]
-        + "\n\nProcessing limitation: PDF extraction is text only. No OCR or figure/image "
-        "understanding was performed; scanned content and non-text mathematics were not interpreted."
+        (
+            "Processing coverage: partial. Unprocessed pages were not read. " + issue + "\n\n"
+            if issue
+            else ""
+        )
+        + result["summary"]
+        + "\n\nProcessing limitation: PDF processing supplies text only. "
+        + (
+            "OCR was used on the pages listed below; recognition is unverified. "
+            if any(p.get("extraction_status") == "ocr" for p in sources)
+            else "No usable OCR text was obtained. "
+        )
+        + "No figure/image understanding was performed; non-text mathematics was not interpreted."
         + "\n\n### Processed sources\n\n"
     )
-    for source in sources:
-        text += f"- {source['source']} — {source['locator']}\n"
+    for source in usable_pages(sources):
+        method = source.get("extraction_status")
+        detail = (
+            f" ({method}{'; incomplete text' if source.get('incomplete') else ''})"
+            if method
+            else ""
+        )
+        text += f"- {source['source']} — {source['locator']}{detail}\n"
+    unprocessed = [s for s in sources if s.get("extraction_status") == "unprocessed"]
+    if unprocessed:
+        text += "\n### Unprocessed pages (not read)\n\n"
+        for source in unprocessed:
+            text += f"- {source['source']} — {source['locator']}: {source['reason']}\n"
     text += "\n### Evidence\n\n"
     for evidence in result["evidence"]:
         text += f"- {evidence['source']}, {evidence['locator']}: {evidence['quote']}\n"
