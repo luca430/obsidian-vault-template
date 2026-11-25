@@ -14,11 +14,35 @@ Active collection members: 0
 
 Pending links: 0
 
+Pending claim reviews: 0
+
 Pending removals: 0
 
 Pending revisions: 0
 
 Errors: 0
+
+Pending documents: 0
+
+Skipped documents: 0
+
+Failed documents: 0
+
+metadata_only coverage: 0
+
+partial coverage: 0
+
+complete coverage: 0
+
+failed coverage: 0
+
+Current stage: not started
+
+Completed operations: 0
+
+Processing failures: 0
+
+Last attempt: never
 
 Warnings: 0
 <!-- dashboard:end -->
