@@ -2,6 +2,38 @@
 
 ## Verified in this workspace
 
+Multiple-runtime follow-up (2026-11-25): the full synthetic suite passed **205 tests**
+in 180.65 seconds, including 40 new runtime regression cases. Coverage includes
+Codex and Claude Code adapters, mixed-role providers/models, run-only and detached
+provider overrides, shared instructions, structured-output normalization, scientific
+review warnings, approval safeguards, fabricated provenance, legacy cache keys and
+envelopes, provider switches reusing extraction, historical usage metadata, metadata
+integrity, optional isolated evaluation, authentication/errors/timeouts, doctor
+diagnostics, native Windows npm shims and WSL executable rejection. Changed prompt
+budgets also exposed a retrieval deduplication bug: fragment offsets now distinguish
+repeated scientific text, and the existing full-character coverage regression passes.
+Ruff lint/format, compilation, diff checks, example configuration validation, CLI
+help and a wheel build without build isolation passed; the wheel includes runtimes.py.
+
+Provider execution/authentication is mocked. Claude Code is not installed in this
+workspace; no real backend inference or account/model entitlement was verified.
+Native Windows/WSL CLI execution still needs live integration checks. Doctor can
+verify installation/flags/login without proving model access or scientific validity.
+Claude's tool restrictions are not an OS filesystem sandbox; organization-managed
+executable hooks that override local settings are unsupported. Runtime/model
+defaults can change externally; resolved identities/usage unavailable from a CLI
+remain unknown, and legacy cache entries cannot reconstruct historical usage.
+
+Scientific review follow-up (2026-11-25): the full synthetic suite passed **165 tests**
+in 167.16 seconds, including 28 new scientific-review regression cases. These cover
+unverifiable claims and links, isolation from established notes and reasoning,
+consolidation warnings, cached uncertainty, Obsidian revisions, explicit approvals,
+rejections, stale sources, conflicting approvals, malformed outputs and missing
+provenance. A CLI regression confirms pending scientific reviews exit successfully.
+Ruff lint/format checks, compilation, diff checks and wrapper CLI help also passed.
+Sources and inference are synthetic/mocked; live Obsidian and Zotero execution
+remain integration checks.
+
 PDF robustness follow-up (2026-11-24): the full synthetic suite passed **137 tests**
 in 427.43 seconds, including 29 PDF/OCR regression cases. Ruff lint/format checks,
 compilation and wrapper CLI help also passed. Coverage includes fully scanned and

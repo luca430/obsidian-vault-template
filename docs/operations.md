@@ -1,5 +1,43 @@
 # Transactions, backups and recovery
 
+## LLM execution boundary
+
+`runtimes.LLMRuntime` defines the provider-independent execution contract.
+`LLMRunner` selects the configured adapter per role, and both `Codex` and
+`ClaudeCode` return the unchanged scientific output dictionaries. Python owns
+schema validation, provenance checking, review generation and apply decisions.
+Role instructions are shared files, not provider-specific copies.
+
+`llm.default_provider` defaults to Codex; `llm.agents` overrides individual roles.
+`sync --provider` overrides primary providers for that process, including detached
+children. It never edits configuration. Per-role model overrides do not cross
+provider boundaries. Authentication and required safety-flag checks occur before
+work requiring the configured runtimes; failure does not select another provider.
+Optional evaluation is observational and isolated from proposal integration.
+
+Existing Codex stage hashes/cache envelopes remain accepted. New cache envelopes
+include separately hashed metadata with provider, requested model, CLI version,
+instruction versions, validation status, warnings and available usage. Legacy
+entries cannot supply historical CLI versions or usage. Scientific source
+extraction remains independent of provider, model, and inference instructions.
+Changed provider/model invalidates the affected inference stages; returning to an
+earlier provider can reuse its original results. No state schema migration occurs.
+
+`operations.jsonl` records domain validation and cached reuse; `inference.jsonl`
+records transport outcomes. A schema-valid transport result can subsequently fail
+provenance validation, which is recorded as a failed operation rather than cached
+as valid. Cached usage is historical, not additional inference consumption.
+Evaluation responses have their own namespace and never become authoritative
+claims, proposals or approvals.
+
+Claude's tool-less execution is an application restriction, not a portable OS
+sandbox. Native CLI/Node resolution never invokes a command shell. External
+settings, integrations and executable hooks are excluded using the required CLI
+profile; organization-managed hooks that override local settings are unsupported.
+The installed CLI and administrator-managed host policy remain trust boundaries.
+Both CLIs' live inference, native Windows and WSL need environment-specific checks;
+mocked regression tests cannot certify a provider installation or account/model.
+
 ## Failed synchronization
 
 Source/LLM failures are isolated to their attachment/document. Available main text
@@ -14,17 +52,41 @@ of source accessibility, so unavailable attachments never become removals.
 means partial completion. Invalid configuration, API/authentication failure,
 ownership/concurrent-edit conflicts and transaction errors remain blocking.
 
+Automatic quote matching is distinct from structural and source-provenance
+validation. A nonempty quote that cannot be located at an existing processed source
+and locator, or in an existing supplied note, creates a validation warning with
+its evidence reference and failure reason. It does not fail execution. Unknown
+sources/locators, unread pages, missing notes, invalid identifiers, malformed JSON
+and forbidden agent fields still fail. No provenance check is waived.
+
+Unverifiable summaries become `kind: claim` artifacts in `Reviews/Revisions/`;
+existing established notes stay intact. No draft content enters concept indexing
+or reasoning. Uncertain links stay in `Reviews/Links/`, with justification,
+evidence and warnings. Both queues accept approved/rejected status decisions and
+a separate `revision` object in Obsidian. Sync validates revisions and registers
+new pending proposals without inheriting approval; apply alone integrates the
+exact reviewed replacement. Source hashes, ownership and stale-note checks still
+apply. Rejections persist through incremental and full syncs.
+
+`completed_operations` counts validated inference jobs, including cached reuse;
+`completed_documents` counts documents retained as summaries or review drafts.
+`pending_claim_reviews`, `pending_link_reviews` and `processing_failures` are
+reported separately. Pending scientific reviews permit exit 0 and advance
+`last_success` when all technical processing completes. Incomplete extraction,
+missing sources and actual processing errors retain the existing incomplete status.
+
 Validated results use distinct content-addressed cache namespaces under
 `.pipeline/cache/`:
 
 | Stage | Namespace | Validity |
 | --- | --- | --- |
 | Source attachment/page extraction | `extractions` | Attachment SHA256, source key, page number (page records), PDF extractor implementation/version, PyMuPDF version and OCR settings |
-| Individual document summaries / consolidation | `document_summaries` | Exact source/chunk or summary payload, own role/global instructions, model configuration, summary/chunking contract and upstream extraction version |
-| Concept extraction | `concept_extraction` | Exact note fragment, source provenance/completeness, own role/global instructions, concept schema/contract and model configuration |
-| Relationship proposals | `relationship_proposals` | Exact retrieved notes/concepts/passages/coverage, own role/global instructions, relationship schema/contract and model configuration |
-| High-level synthesis | `high_level_synthesis` | Exact bounded reasoning context, synthesis instructions/schema/contract and model configuration |
-| Maintenance | `maintenance` | Exact bounded context, maintenance instructions/schema/contract and model configuration |
+| Individual document summaries / consolidation | `document_summaries` | Exact source/chunk or summary payload, own role/global instructions, provider/model configuration, summary/chunking contract and upstream extraction version |
+| Concept extraction | `concept_extraction` | Exact note fragment, source provenance/completeness, own role/global instructions, concept schema/contract and provider/model configuration |
+| Relationship proposals | `relationship_proposals` | Exact retrieved notes/concepts/passages/coverage, own role/global instructions, relationship schema/contract and provider/model configuration |
+| High-level synthesis | `high_level_synthesis` | Exact bounded reasoning context, synthesis instructions/schema/contract and provider/model configuration |
+| Maintenance | `maintenance` | Exact bounded context, maintenance instructions/schema/contract and provider/model configuration |
+| Optional second-provider comparison | `evaluations` | Secondary provider's own role recipe and exact primary request; results cannot enter the approval queue |
 
 Pure text extraction has no LLM/model or role-instruction dependency. Changing a
 synthesis instruction leaves extraction, summaries and concept results valid.
@@ -142,7 +204,7 @@ would leave approval/history inconsistent with the deleted/active identity.
 ## Working on the code
 
 Install with `pip install -e '.[dev]'`. The package is editable, so updates to src
-are used by the CLI immediately. Role instruction changes, code changes and Codex
+are used by the CLI immediately. Role instruction changes, code changes and LLM runtime
 settings invalidate the relevant stage contracts and changed downstream inputs. Note layouts in
 Templates are documentation/manual reference; automatic summaries use the stable
 managed-section renderer in notes.py. Keep marker contracts backward compatible

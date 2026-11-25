@@ -62,12 +62,14 @@ class Registry:
         ):
             return False
         annotations = old.get("annotations", [])
+        validation_warnings = old.get("validation_warnings", [])
         if (
             old.get("fingerprint") != signature
             or old.get("recipe") != concept_recipe
             or processor.full
         ):
             annotations = []
+            validation_warnings = []
             budget = payload_budget(config, "concepts")
             if budget < 1500:
                 raise VaultError("Concept extraction budget cannot fit instructions and context")
@@ -79,7 +81,19 @@ class Registry:
                         validate_note_evidence(concept["evidence"], payload["notes"])
                         validate_note_evidence(concept["evidence"], {name: text})
 
-                annotations.extend(processor.run("concepts", payload, check)["concepts"])
+                primary = processor.run("concepts", payload, check)["concepts"]
+                for concept in primary:
+                    validation_warnings.extend(
+                        validate_note_evidence(concept["evidence"], payload["notes"])
+                    )
+                    validation_warnings.extend(
+                        validate_note_evidence(concept["evidence"], {name: text})
+                    )
+                annotations.extend(primary)
+            # Unverified annotations cannot supply established concepts or retrieval terms.
+            annotations = [
+                a for a in annotations if not validate_note_evidence(a["evidence"], {name: text})
+            ]
         self.remove(name)
         # Exact annotation identity is an indexing convention, not scientific equivalence.
         concept_ids = []
@@ -124,6 +138,7 @@ class Registry:
             "index_recipe": index_recipe,
             "provenance": provenance,
             "annotations": annotations,
+            "validation_warnings": list({digest(w): w for w in validation_warnings}.values()),
             "concept_ids": sorted(set(concept_ids)),
             "fragments": indexed,
         }
@@ -189,6 +204,10 @@ class Registry:
                 focus_text = notes[name][focus["start"] : focus["end"]]
                 for piece in fragments([{"text": focus_text}], max(64, available // 32)):
                     payload = {
+                        "focus_fragment": {
+                            "note": name,
+                            "character_offset": focus["start"] + piece["character_offset"],
+                        },
                         "notes": {name: piece["text"]},
                         "source_passages": [],
                         "active_literature": [],

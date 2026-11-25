@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,6 +35,8 @@ OCR_DEFAULTS = {
 
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
+PROVIDERS = ("codex", "claude")
+ROLES = ("literature", "manuscript", "concepts", "linking", "synthesis", "maintenance")
 
 
 def load_yaml(path: Path) -> dict:
@@ -51,12 +53,13 @@ def load_yaml(path: Path) -> dict:
 class Config:
     root: Path
     data: dict
+    provider_override: str | None = None
 
     @classmethod
     def load(cls, root: Path) -> Config:
         root = root.resolve()
         data = load_yaml(inside(root, "config.yaml"))
-        for field in ("zotero", "codex", "attachments", "processing", "ocr"):
+        for field in ("zotero", "codex", "claude", "llm", "attachments", "processing", "ocr"):
             if not isinstance(data.get(field, {}), dict):
                 raise VaultError(f"{field} must be a mapping")
         z = data.get("zotero", {})
@@ -106,6 +109,7 @@ class Config:
         for field, default in {"output_reserve_chars": 16000}.items():
             if type(c.get(field, default)) is not int or c.get(field, default) < 0:
                 raise VaultError(f"codex.{field} must be a nonnegative integer")
+        cls.validate_llm(data)
         for field, default in PROCESSING_DEFAULTS.items():
             if (
                 type(data.get("processing", {}).get(field, default)) is not int
@@ -126,6 +130,86 @@ class Config:
         if ocr["dpi"] > 600:
             raise VaultError("ocr.dpi must be at most 600")
         return cls(root, data)
+
+    @staticmethod
+    def validate_llm(data: dict) -> None:
+        llm = data.get("llm", {})
+        if set(llm) - {"default_provider", "agents", "evaluation"}:
+            raise VaultError("Unknown llm configuration field")
+        if llm.get("default_provider", "codex") not in PROVIDERS:
+            raise VaultError("llm.default_provider must be codex or claude")
+        roles = llm.get("agents", {})
+        if not isinstance(roles, dict) or set(roles) - set(ROLES):
+            raise VaultError("llm.agents must map supported agent roles to runtime settings")
+        for role, override in roles.items():
+            if isinstance(override, str):
+                override = {"provider": override}
+            if not isinstance(override, dict) or set(override) - {"provider", "model"}:
+                raise VaultError(f"llm.agents.{role} accepts only provider and model")
+            if override.get("provider", llm.get("default_provider", "codex")) not in PROVIDERS:
+                raise VaultError(f"Unknown provider for {role}")
+            if override.get("model") is not None and (
+                not isinstance(override["model"], str) or not override["model"].strip()
+            ):
+                raise VaultError(f"Invalid model for {role}")
+        evaluation = llm.get("evaluation", {})
+        if not isinstance(evaluation, dict) or set(evaluation) - {"enabled", "provider"}:
+            raise VaultError("llm.evaluation accepts enabled and provider")
+        if type(evaluation.get("enabled", False)) is not bool:
+            raise VaultError("llm.evaluation.enabled must be true or false")
+        if (evaluation.get("enabled") or "provider" in evaluation) and evaluation.get(
+            "provider"
+        ) not in PROVIDERS:
+            raise VaultError("Enabled evaluation requires a codex or claude provider")
+        for provider in PROVIDERS:
+            settings = data.get(provider, {})
+            if not isinstance(settings, dict):
+                raise VaultError(f"{provider} must be a mapping")
+            if set(settings) - {
+                "executable",
+                "model",
+                "timeout_seconds",
+                "max_input_chars",
+                "output_reserve_chars",
+            }:
+                raise VaultError(f"Unknown {provider} configuration field")
+            for key in ("executable", "model"):
+                value = settings.get(key)
+                if (key == "executable" and key in settings or value is not None) and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise VaultError(f"{provider}.{key} must be a nonempty string")
+            for key, default, minimum in (
+                ("timeout_seconds", 600, 1),
+                ("max_input_chars", 500000, 1000),
+                ("output_reserve_chars", 16000, 0),
+            ):
+                if (
+                    type(settings.get(key, default)) is not int
+                    or settings.get(key, default) < minimum
+                ):
+                    raise VaultError(f"{provider}.{key} must be an integer >= {minimum}")
+
+    def with_provider(self, provider: str | None) -> Config:
+        if provider is not None and provider not in PROVIDERS:
+            raise VaultError("Provider must be codex or claude")
+        return replace(self, provider_override=provider)
+
+    def runtime(self, role: str, provider: str | None = None) -> tuple[str, dict]:
+        if role not in ROLES:
+            raise VaultError(f"Unknown agent role: {role}")
+        llm = self.data.get("llm", {})
+        override = llm.get("agents", {}).get(role, {})
+        if isinstance(override, str):
+            override = {"provider": override}
+        configured = override.get("provider", llm.get("default_provider", "codex"))
+        selected = provider or self.provider_override or configured
+        if selected not in PROVIDERS:
+            raise VaultError(f"Unknown LLM provider: {selected}")
+        settings = dict(self.data.get(selected, {}))
+        if selected == configured and "model" in override:
+            settings["model"] = override["model"]
+        return selected, settings
 
     def processing(self, key: str) -> int:
         return self.data.get("processing", {}).get(key, PROCESSING_DEFAULTS[key])

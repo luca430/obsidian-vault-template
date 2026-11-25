@@ -11,13 +11,13 @@ from .storage import digest, file_hash, inside
 # These explicit versions cover implementation changes, independently of role instructions.
 VERSIONS = {
     "extraction": 4,
-    "literature": 3,
-    "manuscript": 3,
-    "concepts": 1,
-    "linking": 2,
-    "synthesis": 2,
-    "maintenance": 2,
-    "retrieval": 2,
+    "literature": 4,
+    "manuscript": 4,
+    "concepts": 2,
+    "linking": 3,
+    "synthesis": 3,
+    "maintenance": 3,
+    "retrieval": 3,
 }
 NAMESPACES = {
     "literature": "document_summaries",
@@ -29,7 +29,7 @@ NAMESPACES = {
 }
 
 
-def stage_recipe(config, stage):
+def stage_recipe(config, stage, provider=None):
     if stage == "extraction":
         from .sources import pdf
 
@@ -51,7 +51,7 @@ def stage_recipe(config, stage):
                 },
             ]
         )
-    settings = config.data.get("codex", {})
+    selected, settings = config.runtime(stage, provider)
     return digest(
         {
             "algorithm": VERSIONS[stage],
@@ -59,6 +59,8 @@ def stage_recipe(config, stage):
             "global_instructions": file_hash(inside(config.root, "AGENTS.md")),
             "role_instructions": file_hash(inside(config.root, f"agents/{stage}.md")),
             "model": {k: settings.get(k) for k in ("model", "executable")},
+            # Default Codex retains the exact pre-provider contract and existing cache keys.
+            **({"provider": selected, "adapter": 1} if selected != "codex" else {}),
             "chunking": {k: config.processing(k) for k in ("chunk_chars", "chunk_context_chars")}
             if stage in {"literature", "manuscript"}
             else {},

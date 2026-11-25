@@ -25,6 +25,7 @@ def launch(config, full=False, startup=False):
         "log": f".pipeline/runs/{run_id}.log",
         "full": full,
         "startup": startup,
+        "provider_override": config.provider_override,
     }
     record_path = inside(config.root, f".pipeline/runs/{run_id}.json")
     atomic(record_path, json.dumps(record, indent=2))
@@ -42,6 +43,8 @@ def launch(config, full=False, startup=False):
         command.append("--full")
     if startup:
         command.append("--startup")
+    if config.provider_override:
+        command.extend(["--provider", config.provider_override])
     options = (
         {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS}
         if os.name == "nt"

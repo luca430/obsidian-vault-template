@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "research-vault-template"
 version = "0.1.0"
-description = "Review-driven Obsidian, Zotero and Codex research vault"
+description = "Review-driven Obsidian, Zotero and interchangeable LLM research vault"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

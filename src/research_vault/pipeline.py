@@ -10,7 +10,6 @@ from pathlib import Path
 
 from .agents import (
     AuthenticationError,
-    Codex,
     payload_budget,
     validate_note_evidence,
 )
@@ -23,12 +22,15 @@ from .registry import Registry
 from .reviews import (
     apply_decisions,
     checkpoint,
+    claim_proposal,
     counts,
     link_proposal,
     proposal,
     read_reviews,
     refresh_pending,
+    revise_proposals,
 )
+from .runtimes import LLMRunner
 from .sources import (
     coverage_error,
     manuscript,
@@ -79,7 +81,7 @@ class Pipeline:
         self.config, self.root = config, config.root
         self.on_progress = progress
         self.zotero = zotero if zotero is not None else Zotero(config)
-        self.agent = agent if agent is not None else Codex(config)
+        self.agent = agent if agent is not None else LLMRunner(config)
 
     def state(self) -> dict:
         state = read_json(inside(self.root, STATE), initial_state())
@@ -126,6 +128,7 @@ class Pipeline:
             f"Processed papers: {sum(p.get('processed', False) for p in state['papers'].values())}",
             f"Active collection members: {len(state['membership'])}",
             f"Pending links: {pending['link']}",
+            f"Pending claim reviews: {pending['claim']}",
             f"Pending removals: {pending['removal']}",
             f"Pending revisions: {pending['revision']}",
             f"Errors: {1 if error else 0}",
@@ -150,6 +153,12 @@ class Pipeline:
         if getattr(self, "last_progress", None):
             lines.append("Current stage: " + self.last_progress["stage"])
         if state.get("last_report"):
+            lines.append(
+                f"Completed operations: {state['last_report'].get('completed_operations', 0)}"
+            )
+            lines.append(
+                f"Processing failures: {state['last_report'].get('processing_failures', 0)}"
+            )
             lines.append(
                 "Last attempt: "
                 + (
@@ -250,7 +259,10 @@ class Pipeline:
             != digest([item["fingerprint"], summary_recipe])
             or state["papers"].get(key, {}).get("status", "successful") != "successful"
             or state["papers"].get(key, {}).get("completeness", "complete") != "complete"
-            or f"Literature/{key}.md" not in notes
+            or (
+                f"Literature/{key}.md" not in notes
+                and not state["papers"].get(key, {}).get("claim_review")
+            )
         ]
         removed = sorted(set(state["membership"]) - set(snapshot))
         works, changed_works, warnings, skipped, partial_candidates = {}, [], [], {}, {}
@@ -296,7 +308,7 @@ class Pipeline:
                     and old.get("source") == str(self.config.authorized(work["source_path"]))
                     and files
                     and all(file_hash(self.config.authorized(p)) == h for p, h in files.items())
-                    and f"My Work/{key}.md" in notes
+                    and (f"My Work/{key}.md" in notes or old.get("claim_review"))
                 )
                 if unchanged:
                     continue
@@ -380,7 +392,7 @@ class Pipeline:
                     blockers.append(f"Paper {key}: {exc}")
             if hasattr(self.agent, "authenticate"):
                 try:
-                    self.agent.authenticate()
+                    self.authenticate_agent(changed_papers, changed_works, not startup)
                 except (VaultError, OSError) as exc:
                     blockers.append(str(exc))
         personal = {n: digest(t) for n, t in notes.items() if n.startswith("My Notes/")}
@@ -389,6 +401,17 @@ class Pipeline:
             full or graph_input != state["graph_digest"] or bool(changed_papers or changed_works)
         )
         plan = {
+            "providers": {
+                role: self.config.runtime(role)[0]
+                for role in (
+                    "literature",
+                    "manuscript",
+                    "concepts",
+                    "linking",
+                    "synthesis",
+                    "maintenance",
+                )
+            },
             "papers": changed_papers,
             "works": changed_works,
             "removed": removed,
@@ -422,7 +445,7 @@ class Pipeline:
         if (
             any(k not in skipped for k in changed_papers) or works or (graph_needed and notes)
         ) and hasattr(self.agent, "authenticate"):
-            self.agent.authenticate()
+            self.authenticate_agent(changed_papers, changed_works, graph_needed and not startup)
         for key in removed:
             if key in state["papers"]:
                 old = state["papers"][key]
@@ -486,6 +509,7 @@ class Pipeline:
         )
         total = len(scheduled_papers) + len(scheduled_works)
         completed = 0
+        successful_documents = 0
         for key in scheduled_papers:
             self.progress(
                 "documents",
@@ -534,9 +558,45 @@ class Pipeline:
                 completed += 1
                 continue
             path = f"Literature/{key}.md"
-            notes[path] = update_note(
-                notes.get(path), f"zotero:{key}", "literature", result["title"], content
-            )
+            changes = {}
+            verification = processor.warnings_for(result)
+            if verification:
+                context = {
+                    "note": path,
+                    "identity": f"zotero:{key}",
+                    "kind": "literature",
+                    "category": "papers",
+                    "key": key,
+                    "fingerprint": digest([item["fingerprint"], summary_recipe]),
+                    "pages": pages,
+                    "metadata": {
+                        "zotero": item["metadata"],
+                        "attachments": item["attachments"],
+                        "completeness": old["completeness"],
+                    },
+                    "files": {
+                        a["path"]: a["sha256"]
+                        for a in item["attachments"]
+                        if a.get("path")
+                        and a.get("sha256")
+                        and not a.get("error")
+                        and a["classification"] != "ignore"
+                    },
+                }
+                old["claim_review"] = claim_proposal(
+                    result, verification, context, state["proposals"], notes, changes
+                )
+                old["claim_review_status"] = "pending"
+                warnings.append(
+                    f"Paper {key}: unverified draft retained for claim review; established note retained."
+                )
+            else:
+                notes[path] = update_note(
+                    notes.get(path), f"zotero:{key}", "literature", result["title"], content
+                )
+                changes[path] = notes[path]
+                old.pop("claim_review", None)
+                old.pop("claim_review_status", None)
             if old["completeness"] == "partial":
                 partial[key] = {**attachment_errors, **unavailable}
                 warnings.append(
@@ -545,15 +605,17 @@ class Pipeline:
             old.update(
                 fingerprint=digest([item["fingerprint"], summary_recipe]),
                 note=path,
-                processed=True,
+                processed=path in notes,
                 status="successful",
                 disposition="active",
                 files=item["attachments"],
-                passages=self.store_passages(key, item["fingerprint"], pages),
                 error="; ".join(partial.get(key, {}).values()) or None,
             )
-            self.save(state, {path: notes[path]})
+            if not verification:
+                old["passages"] = self.store_passages(key, item["fingerprint"], pages)
+            self.save(state, changes)
             completed += 1
+            successful_documents += 1
         for key in scheduled_works:
             self.progress(
                 "manuscripts", current=key, processed=completed, remaining=total - completed
@@ -588,13 +650,32 @@ class Pipeline:
             path = f"My Work/{key}.md"
             if issue:
                 warnings.append(f"Manuscript {key} partially processed: {issue}")
-            notes[path] = update_note(
-                notes.get(path),
-                f"work:{key}",
-                "manuscript",
-                result["title"],
-                content,
-            )
+            changes = {}
+            verification = processor.warnings_for(result)
+            if verification:
+                context = {
+                    "note": path,
+                    "identity": f"work:{key}",
+                    "kind": "manuscript",
+                    "category": "works",
+                    "key": key,
+                    "fingerprint": source["fingerprint"],
+                    "pages": source["pages"],
+                    "metadata": source["metadata"],
+                    "files": source["files"],
+                }
+                old["claim_review"] = claim_proposal(
+                    result, verification, context, state["proposals"], notes, changes
+                )
+                old["claim_review_status"] = "pending"
+                warnings.append(f"Manuscript {key}: unverified draft retained for claim review.")
+            else:
+                notes[path] = update_note(
+                    notes.get(path), f"work:{key}", "manuscript", result["title"], content
+                )
+                changes[path] = notes[path]
+                old.pop("claim_review", None)
+                old.pop("claim_review_status", None)
             old.update(
                 fingerprint=source["fingerprint"],
                 files=source["files"],
@@ -605,11 +686,22 @@ class Pipeline:
                 note=path,
                 status="successful",
                 error=issue,
-                passages=self.store_passages(f"work-{key}", source["fingerprint"], source["pages"]),
             )
-            self.save(state, {path: notes[path]})
+            if not verification:
+                old["passages"] = self.store_passages(
+                    f"work-{key}", source["fingerprint"], source["pages"]
+                )
+            self.save(state, changes)
             completed += 1
+            successful_documents += 1
         changes = {}
+        revise_proposals(self.root, state["proposals"], reviews, notes, changes)
+        for pid, record in state["proposals"].items():
+            if record["kind"] == "claim" and record.get("superseded_by"):
+                context = record["claim_context"]
+                current = state[context["category"]][context["key"]]
+                if current.get("claim_review") == pid:
+                    current["claim_review"] = record["superseded_by"]
         for key, paper in state["papers"].items():
             path = paper["note"]
             if key not in snapshot and paper.get("disposition") == "absent" and path in notes:
@@ -736,6 +828,21 @@ class Pipeline:
             complete=complete,
             cache_hits=processor.hits,
             inference_operations=processor.calls,
+            completed_operations=processor.completed_operations,
+            completed_documents=successful_documents,
+            inference_metadata=processor.operations,
+            inference_failures=sum(
+                r["validation_status"] == "failed" and not r.get("evaluation_only")
+                for r in processor.operations
+            ),
+            evaluation_failures=processor.evaluation_failures,
+            pending_claim_reviews=counts(self.merged_reviews(state, {}), state["proposals"])[
+                "claim"
+            ],
+            pending_link_reviews=counts(self.merged_reviews(state, {}), state["proposals"])["link"],
+            processing_failures=len(failed)
+            + sum(len(e) for k, e in partial.items() if k not in failed)
+            + int(bool(graph_error)),
         )
         self.progress(
             "complete" if complete else "incomplete",
@@ -749,6 +856,15 @@ class Pipeline:
         self.save(state)
         self.log("sync", state["last_report"])
         return plan
+
+    def authenticate_agent(self, papers, works, graph_needed):
+        if isinstance(self.agent, LLMRunner):
+            roles = (["literature"] if papers else []) + (["manuscript"] if works else [])
+            if graph_needed:
+                roles += ["concepts", "linking", "synthesis", "maintenance"]
+            self.agent.authenticate(roles)
+        else:
+            self.agent.authenticate()
 
     def process_paper(self, key, item, old, processor, state):
         """Checkpoint each attachment independently, then consolidate only available evidence."""
@@ -856,9 +972,11 @@ class Pipeline:
                 "evidence": [e for s in summaries for e in s["evidence"]],
                 "claims": [c for s in summaries for c in s["claims"]],
             }
+            processor.remember(result, [w for s in summaries for w in processor.warnings_for(s)])
         complete = not errors and not unavailable
         old["completeness"] = "complete" if complete else "partial"
         if not complete:
+            verification = processor.warnings_for(result)
             result = deepcopy(result)
             result["summary"] = (
                 "Processing coverage: partial. Scientific statements below concern only the processed "
@@ -867,19 +985,23 @@ class Pipeline:
                 + "\n\nIncomplete coverage: "
                 + "; ".join(f"{k}: {v}" for k, v in sorted({**errors, **unavailable}.items()))
             )
+            processor.remember(result, verification)
         return result, pages, errors, unavailable
 
     def reasoning_changes(self, result, payload, state, notes):
         """Validate against both the retrieved context and current full notes before caching."""
         registry, changes = deepcopy(state["proposals"]), {}
         for candidate in result.get("links", []):
-            validate_note_evidence(candidate["evidence"], payload["notes"])
-            link_proposal(candidate, registry, notes, changes)
+            warnings = validate_note_evidence(candidate["evidence"], payload["notes"])
+            link_proposal(candidate, registry, notes, changes, warnings)
         for revision in result.get("revisions", []):
             if revision["note"] not in payload["notes"]:
                 raise VaultError("Revision targets a note outside retrieved context")
-            validate_note_evidence(revision["evidence"], payload["notes"])
-            validate_note_evidence(revision["evidence"], notes)
+            warnings = validate_note_evidence(
+                revision["evidence"], payload["notes"]
+            ) + validate_note_evidence(revision["evidence"], notes)
+            if warnings:
+                revision = {**revision, "validation_warnings": warnings}
             proposal("revision", revision, registry, notes, changes)
         return registry, changes
 
@@ -912,6 +1034,18 @@ class Pipeline:
         state = deepcopy(self.state())
         reviews = read_reviews(self.root, state["proposals"])
         notes = read_notes(self.root)
+        for pid, record in state["proposals"].items():
+            if (
+                record["kind"] == "claim"
+                and not record["applied"]
+                and not record.get("superseded_by")
+                and reviews[pid]["status"] == "approved"
+            ):
+                for path, expected in record["claim_context"]["files"].items():
+                    if file_hash(self.config.authorized(path)) != expected:
+                        raise VaultError(
+                            "Stale claim approval: source file changed; sync and review again"
+                        )
         changes, previews, destructive = apply_decisions(self.root, state, notes, reviews)
         result = {
             "changes": sorted(changes),
@@ -984,6 +1118,8 @@ class Pipeline:
             },
             "progress": read_json(inside(self.root, ".pipeline/progress.json")),
             "last_report": state.get("last_report"),
+            "completed_operations": (state.get("last_report") or {}).get("completed_operations", 0),
+            "processing_failures": (state.get("last_report") or {}).get("processing_failures", 0),
             "background_runs": [
                 read_json(inside(self.root, path.relative_to(self.root).as_posix()))
                 for path in sorted(
@@ -1005,6 +1141,8 @@ class Pipeline:
             ),
             "reasoning_error": state.get("graph_error"),
             "pending": counts(reviews, state["proposals"]),
+            "pending_claim_reviews": counts(reviews, state["proposals"])["claim"],
+            "pending_link_reviews": counts(reviews, state["proposals"])["link"],
             "warnings": state["warnings"],
             "transaction_requires_recovery": inside(
                 self.root, ".pipeline/transaction.json"
@@ -1093,26 +1231,7 @@ class Pipeline:
                 )
             except (VaultError, OSError) as exc:
                 checks["warnings"].append(f"Manuscript {work['id']}: {exc}")
-        try:
-            prefix = self.agent.command_prefix()
-            help_result = subprocess.run(
-                [*prefix, "exec", "--help"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                cwd=self.root,
-            )
-            required = ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--output-schema"]
-            missing = [flag for flag in required if flag not in help_result.stdout]
-            if help_result.returncode or missing:
-                raise VaultError("Codex CLI lacks required flags: " + ", ".join(missing))
-            checks["codex"] = prefix
-            checks["codex_flags"] = "ok"
-            self.agent.authenticate()
-            checks["codex_auth"] = "ok"
-        except (VaultError, OSError, subprocess.TimeoutExpired) as exc:
-            checks["codex_auth"] = str(exc)
-            checks["blocking_errors"].append(str(exc))
+        self.provider_doctor(checks)
         for role in ("literature", "manuscript", "concepts", "linking", "synthesis", "maintenance"):
             if payload_budget(self.config, role) < 1500:
                 checks["blocking_errors"].append(
@@ -1131,6 +1250,54 @@ class Pipeline:
                 "networking_mode": "not assumed; loopback API reachability was tested",
             }
         return checks
+
+    def provider_doctor(self, checks):
+        if isinstance(self.agent, LLMRunner):
+            checks["providers"] = self.agent.diagnostics()
+            checks["agent_providers"] = {
+                role: self.config.runtime(role)[0]
+                for role in (
+                    "literature",
+                    "manuscript",
+                    "concepts",
+                    "linking",
+                    "synthesis",
+                    "maintenance",
+                )
+            }
+            for provider, record in checks["providers"].items():
+                errors = [record[k] for k in ("error", "configuration_error") if record.get(k)]
+                if record["required"]:
+                    checks["blocking_errors"].extend(f"{provider}: {error}" for error in errors)
+                elif errors:
+                    checks["warnings"].append(
+                        f"Optional {provider} provider unavailable or unconfigured"
+                    )
+            codex = checks["providers"]["codex"]
+            checks["codex_auth"] = codex["authentication"]
+            checks["codex"] = codex.get("command")
+            checks["codex_flags"] = codex.get("flags", "unavailable")
+            return
+        # Injected runners implementing the original API remain supported.
+        try:
+            prefix = self.agent.command_prefix()
+            help_result = subprocess.run(
+                [*prefix, "exec", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=self.root,
+            )
+            required = ["--ignore-user-config", "--ignore-rules", "--ephemeral", "--output-schema"]
+            missing = [flag for flag in required if flag not in help_result.stdout]
+            if help_result.returncode or missing:
+                raise VaultError("Codex CLI lacks required flags: " + ", ".join(missing))
+            checks.update(codex=prefix, codex_flags="ok")
+            self.agent.authenticate()
+            checks["codex_auth"] = "ok"
+        except (VaultError, OSError, subprocess.TimeoutExpired) as exc:
+            checks["codex_auth"] = str(exc)
+            checks["blocking_errors"].append(str(exc))
 
     def log(self, command: str, details: dict) -> None:
         path = inside(self.root, ".pipeline/logs/events.jsonl")

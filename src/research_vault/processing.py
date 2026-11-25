@@ -6,7 +6,7 @@ import json
 import re
 from collections import Counter
 
-from .agents import fits, payload_budget, validate_output, validate_summary
+from .agents import fits, payload_budget, validate_note_evidence, validate_output, validate_summary
 from .chunking import section_chunks
 from .recipes import NAMESPACES, stage_recipe
 from .sources import extraction_complete, page_coverage, pdf, usable_pages
@@ -31,9 +31,14 @@ class Processor:
         self.progress, self.full = progress, full
         self.hits = 0
         self.calls = 0
+        self.completed_operations = 0
+        self.summary_warnings = {}
+        self.operations = []
+        self.evaluation_failures = []
+        self.last_cache_metadata = None
         self.extraction_recipe = stage_recipe(config, "extraction")
 
-    def cached(self, namespace, key, operation, reusable=None):
+    def cached(self, namespace, key, operation, reusable=None, metadata=None):
         path = inside(self.config.root, f".pipeline/cache/{namespace}/{digest(key)}.json")
         cached = read_json(path) if path.exists() and not self.full else None
         if cached is not None:
@@ -42,55 +47,164 @@ class Processor:
                 or cached.get("key") != digest(key)
                 or "value" not in cached
                 or cached.get("value_hash") != digest(cached["value"])
+                or (
+                    "metadata" in cached
+                    and cached.get("metadata_hash") != digest(cached["metadata"])
+                )
             ):
                 raise VaultError(
                     "Processing cache is damaged; restore or remove the affected cache file"
                 )
             if reusable is None or reusable(cached["value"]):
                 self.hits += 1
+                self.last_cache_metadata = cached.get("metadata")
                 self.progress("cache", namespace=namespace, reused=self.hits)
                 return cached["value"]
         result = operation()
+        self.last_cache_metadata = metadata() if metadata else None
         atomic(
             path,
             json.dumps(
-                {"key": digest(key), "value_hash": digest(result), "value": result},
+                {
+                    "key": digest(key),
+                    "value_hash": digest(result),
+                    "value": result,
+                    **(
+                        {
+                            "metadata": self.last_cache_metadata,
+                            "metadata_hash": digest(self.last_cache_metadata),
+                        }
+                        if metadata
+                        else {}
+                    ),
+                },
                 ensure_ascii=False,
             ),
         )
         return result
 
-    def run(self, role, payload, validator=None):
-        if not fits(self.config, role, payload):
+    def run(self, role, payload, validator=None, *, provider=None, evaluation=False):
+        selected, settings = self.config.runtime(role, provider)
+        if not fits(self.config, role, payload, provider):
             raise VaultError(
                 f"{role} request cannot fit configured input/output budget; no truncation"
             )
 
+        metadata = {
+            "role": role,
+            "provider": selected,
+            "model": settings.get("model"),
+            "recipe": stage_recipe(self.config, role, provider),
+            "evaluation_only": evaluation,
+        }
+        if hasattr(self.agent, "identity"):
+            identity = (
+                self.agent.identity(role, selected)
+                if hasattr(self.agent, "run_provider")
+                else self.agent.identity(role)
+            )
+            metadata.update(identity)
+        reused = True
+
         def invoke():
+            nonlocal reused
+            reused = False
             self.calls += 1
-            self.progress("inference", role=role, operation=self.calls)
-            result = validate_output(role, self.agent.run(role, payload))
+            self.progress(
+                "inference",
+                role=role,
+                provider=selected,
+                model=settings.get("model"),
+                operation=self.calls,
+            )
+            if provider is not None and not hasattr(self.agent, "run_provider"):
+                raise VaultError(
+                    "Injected LLM runtime does not support secondary provider execution"
+                )
+            result = validate_output(
+                role,
+                self.agent.run_provider(role, payload, selected)
+                if provider is not None
+                else self.agent.run(role, payload),
+            )
+            metadata.update(getattr(self.agent, "last_metadata", {}))
             check(result)
             return result
 
         def check(result):
+            warnings = []
             if role in {"literature", "manuscript"}:
-                validate_summary(result, payload["pages"])
+                self.remember(result, validate_summary(result, payload["pages"]))
                 if {p["source"] for p in payload["pages"]} - {
                     e["source"] for e in result["evidence"]
                 }:
                     raise VaultError(
                         "Summary must provide evidence from every processed source, including supplements"
                     )
+                warnings = self.warnings_for(result)
+            else:
+                key = (
+                    "links"
+                    if role == "linking"
+                    else "concepts"
+                    if role == "concepts"
+                    else "revisions"
+                )
+                for item in result[key]:
+                    warnings.extend(validate_note_evidence(item["evidence"], payload["notes"]))
             if validator:
                 validator(result)
+            metadata.update(
+                validation_status="review_required" if warnings else "validated", warnings=warnings
+            )
 
-        result = self.cached(
-            NAMESPACES[role], [stage_recipe(self.config, role), role, payload], invoke
-        )
-        validate_output(role, result)
-        check(result)
+        try:
+            result = self.cached(
+                "evaluations" if evaluation else NAMESPACES[role],
+                [stage_recipe(self.config, role, provider), role, payload],
+                invoke,
+                metadata=lambda: metadata,
+            )
+            if reused:
+                metadata.update(self.last_cache_metadata or {"legacy_cache": True})
+            validate_output(role, result)
+            check(result)
+        except (VaultError, OSError) as exc:
+            latest = getattr(self.agent, "last_metadata", {})
+            if not reused and latest.get("provider") == selected and latest.get("role") == role:
+                metadata.update(latest)
+            metadata.update(
+                validation_status="failed", failure=str(exc), failure_type=type(exc).__name__
+            )
+            self.record_operation({**metadata, "cached": reused})
+            raise
+        self.record_operation({**metadata, "cached": reused})
+        self.completed_operations += 1
+        comparison = self.config.data.get("llm", {}).get("evaluation", {})
+        if not evaluation and comparison.get("enabled") and comparison["provider"] != selected:
+            try:
+                self.run(role, payload, validator, provider=comparison["provider"], evaluation=True)
+            except (VaultError, OSError) as exc:
+                self.evaluation_failures.append(
+                    {"role": role, "provider": comparison["provider"], "error": str(exc)}
+                )
         return result
+
+    def record_operation(self, metadata):
+        self.operations.append(metadata)
+        path = inside(self.config.root, ".pipeline/logs/operations.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+
+    def remember(self, result, warnings):
+        self.summary_warnings[digest(result)] = list(
+            {digest(w): w for w in [*self.warnings_for(result), *warnings]}.values()
+        )
+        return result
+
+    def warnings_for(self, result):
+        return self.summary_warnings.get(digest(result), [])
 
     def extract(self, path, source, sha256):
         key = [self.extraction_recipe, source, sha256]
@@ -184,6 +298,7 @@ class Processor:
             return chunks[0]
         # Hierarchical overviews are navigational; every detailed chunk summary is retained.
         level = chunks
+        warnings = [w for chunk in chunks for w in self.warnings_for(chunk)]
         for depth in range(12):
             if len(level) == 1:
                 break
@@ -205,6 +320,7 @@ class Processor:
             ):
                 result = self.run(role, batch)
                 validate_summary(result, batch["pages"])
+                warnings.extend(self.warnings_for(result))
                 reduced.append(result)
             if len(reduced) >= len(level) and size(reduced) >= size(level):
                 raise VaultError(
@@ -222,7 +338,7 @@ class Processor:
             "evidence": [e for chunk in chunks for e in chunk["evidence"]],
         }
         result["claims"] = [claim for chunk in chunks for claim in chunk["claims"]]
-        return result
+        return self.remember(result, warnings)
 
 
 def terms(text):

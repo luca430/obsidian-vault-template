@@ -2,7 +2,7 @@
 
 An empty Obsidian vault and a working Python pipeline for scientific research.
 Zotero owns references and source files; Obsidian holds research knowledge;
-Python controls synchronization, validation and approvals; Codex supplies
+Python controls synchronization, validation and approvals; Codex or Claude Code supplies
 structured scientific summaries and suggestions. The code is independent of your
 research subject and Zotero collection.
 
@@ -15,6 +15,24 @@ is required. Zotero must be open during synchronization.
 become graph edges. Original manuscripts and Zotero data are read only. Personal
 notes are never rewritten during synchronization. Generated notes have separate
 managed and user-editable sections.
+
+## Table of contents
+
+- [Quick start](#quick-start)
+- [Choose LLM runtimes](#choose-llm-runtimes)
+- [Open the empty vault](#open-the-empty-vault)
+- [Architecture and folders](#architecture-and-folders)
+- [Configure Zotero](#configure-zotero)
+- [Register personal manuscripts](#register-personal-manuscripts)
+- [Install Shell Commands and use Obsidian](#install-shell-commands-and-use-obsidian)
+- [Graph colors](#graph-colors)
+- [Review conceptual relationships](#review-conceptual-relationships)
+- [Removed papers](#removed-papers)
+- [Initial sync, incremental work and request budgets](#initial-sync-incremental-work-and-request-budgets)
+- [Commands, status and troubleshooting](#commands-status-and-troubleshooting)
+- [Git, privacy and template updates](#git-privacy-and-template-updates)
+- [Publish this repository as a GitHub template](#publish-this-repository-as-a-github-template)
+- [Validation and current limits](#validation-and-current-limits)
 
 ## Quick start
 
@@ -151,12 +169,134 @@ and symlink resolution. UNC paths require a working Windows share/mount; transla
 does not mount a share or download a cloud file. Doctor includes the original URL,
 resolved path and reason for attachment access failures.
 
-Codex may consume account usage allowances or incur charges depending on your
+LLM inference may consume account usage allowances or incur charges depending on your
 account and authentication. The first synchronization extracts every configured
 PDF and may make many inference requests. Extracted document text, manuscript
-material and personal-note context are sent to the configured Codex inference
+material and personal-note context are sent to the explicitly configured LLM inference
 service. Confirm that your research material can be processed there before running
 `sync`. An unchanged project makes no inference requests.
+
+## Choose LLM runtimes
+
+Codex remains the default. Existing `codex:` configuration and processing state
+continue to work without an `llm:` section. You can install only the runtime you
+use; an absent optional runtime does not block `doctor`. The earlier quick-start
+commands install and authenticate Codex with `npm install -g @openai/codex`,
+`codex login` and `codex login status`.
+
+For Claude Code, follow Anthropic's [installation instructions](https://code.claude.com/docs/en/setup).
+Use the native installer for Linux/WSL or Windows; WinGet users can run
+`winget install Anthropic.ClaudeCode`. In a terminal in the same environment as
+Python, run `claude --version`, `claude auth login` and `claude auth status`.
+The [CLI reference](https://code.claude.com/docs/en/cli-reference) documents these
+authentication and diagnostic commands. Existing CLI-managed credentials are used;
+never put credentials into `config.yaml` or commit them. API credentials supplied
+through the environment are also left to the CLI to resolve.
+
+Select providers in local `config.yaml`:
+
+```yaml
+llm:
+  default_provider: codex
+  agents:
+    literature: codex
+    manuscript: codex
+    concepts: codex
+    linking: {provider: claude, model: sonnet}
+    synthesis: claude
+    maintenance: claude
+  evaluation:
+    enabled: false
+    provider: claude
+codex:
+  executable: codex
+  model: null
+claude:
+  executable: claude
+  model: null
+  timeout_seconds: 600
+  max_input_chars: 500000
+  output_reserve_chars: 16000
+```
+
+Each role accepts either a provider name or a mapping containing `provider` and/or
+`model`. Supported provider names are `codex` and `claude`. Both providers use the
+same `AGENTS.md`, `agents/<role>.md`, scientific schemas and Python validators.
+Provider-specific configuration contains only execution settings. Character
+budgets and timeout settings have the same meanings for both providers.
+
+Override all primary role providers for one run, without changing configuration:
+
+```bash
+.venv/bin/python scripts/research.py sync --provider claude
+.venv/bin/python scripts/research.py sync --provider codex --background
+```
+
+On Windows, substitute `.\.venv\Scripts\python.exe` as in the quick start. The
+precedence is run override, per-role provider, then default provider. A per-role
+model applies only to its configured provider, so a run override never sends a
+Claude model name to Codex or vice versa. Model aliases/defaults may change outside
+this vault; pin a supported model ID when you need more reproducible inference.
+
+Native Windows accepts native executables and standard npm `.cmd`/`.bat` shims;
+Python resolves npm entries through Node without a command shell. In WSL, install
+and authenticate the **Linux** provider CLI inside WSL. Windows executables found
+on WSL's PATH are rejected. Set `codex.executable` or `claude.executable` to a local
+absolute executable path if Obsidian's environment has a different PATH, then
+restart Obsidian. Never reuse a Windows Python environment from WSL.
+
+Claude runs through `claude -p` with JSON output. Its wrapper is normalized from
+`structured_output` (or a JSON-only `result` fallback); the unchanged scientific
+schema is then validated in Python. Unsupported transport string-length
+constraints are omitted for Claude, while Python still enforces the full schema.
+See Anthropic's [programmatic execution guide](https://code.claude.com/docs/en/headless)
+and [structured output constraints](https://platform.claude.com/docs/en/build-with-claude/structured-outputs).
+
+Inference metadata is separate from scientific output: cached values retain the
+existing schemas, evidence and provenance. Cache metadata and
+`.pipeline/logs/operations.jsonl` record provider, requested model, CLI version,
+instruction/schema hashes, validation status, scientific warnings and usage when
+available. `.pipeline/logs/inference.jsonl` records transport outcomes. Reports
+include `providers`, `inference_metadata`, `inference_operations`,
+`inference_failures` and `evaluation_failures`. Cached events retain historical
+usage with `cached: true`; that usage is not a new billable operation. Unknown
+resolved model/usage data remain unknown rather than being estimated.
+
+Codex keeps its existing read-only sandbox and disabled shell tools. Claude runs
+with built-in tools removed, MCP denied/empty, safe and restricted modes, external
+instruction discovery disabled, hooks disabled, and no resumable session. Neither
+provider can create approvals, write notes through tools or apply proposals. Claude's
+tool restrictions are not an OS filesystem sandbox. Both adapters depend on a
+trusted installed CLI and host environment; organization-enforced policies are
+outside this template's control. Managed Claude hooks can override local hook
+settings: deployments requiring managed executable hooks are not supported by
+this isolation profile. See [Claude settings policy](https://code.claude.com/docs/en/settings-reference#disableallhooks).
+The adapter checks required CLI flags and fails if isolation flags are unavailable;
+it never retries with fewer restrictions. It uses safe mode rather than bare mode
+so normal CLI login remains available.
+
+Provider changes invalidate only affected inference stages. PDF extraction caches
+have no provider dependency. Switching back reuses the earlier provider's valid
+inference cache. Codex's existing cache-key contract and old cache envelopes are
+accepted; old entries are marked as legacy when metadata is unavailable. Updated
+global/role instruction files intentionally invalidate affected inference, as
+before. No state migration, review deletion or note renaming is required.
+
+Dual-provider evaluation is **off by default**. Enabling `llm.evaluation` runs the
+secondary runtime for scheduled inference jobs and stores its validated responses
+under `.pipeline/cache/evaluations/`. It incurs additional inference cost, never
+creates secondary proposals or graph edges, and never selects a scientific winner.
+An unavailable/invalid comparison is reported in `evaluation_failures` without
+failing a successful primary workflow. Enabling evaluation alone does not schedule
+unchanged documents; explicitly use `--full` when you want to compare them.
+
+Run `doctor` after changing runtimes. It reports both CLIs' installation, version,
+authentication, required flags and which providers each role requires. Invalid
+provider names, role names and execution settings fail configuration validation.
+If authentication fails, log in from the same environment; if flags are missing,
+update the CLI. If a CLI exits unsuccessfully or returns invalid JSON, inspect its
+private staging directory's `stderr.txt`, response/output files and `metadata.json`.
+No automatic provider fallback occurs: existing notes and approvals remain intact.
 
 ## Open the empty vault
 
@@ -191,7 +331,7 @@ research-vault-template/
 ├── Templates/                Reference note/review layouts, optional manual templates
 ├── scripts/research.py       Same entry point for terminal and Obsidian
 ├── src/research_vault/       Config, API, extraction, agents, reviews, storage, CLI
-├── tests/                    Synthetic PDFs, mocked Zotero/Codex, Git/lock/recovery tests
+├── tests/                    Synthetic PDFs, mocked Zotero/LLM runtimes, Git/lock/recovery tests
 ├── docs/                     Implementation, recovery and integration checklist
 ├── .pipeline/                Ignored state, staging, locks, logs and backups
 └── .obsidian/                Portable core settings only
@@ -287,12 +427,12 @@ All fragments are indexed, but each reasoning call sees only its selected excerp
 Validated reasoning calls are cached, so interrupted Stage B work can resume too.
 
 Python explicitly reads `AGENTS.md` and `agents/<role>.md` on every invocation; it
-does not assume arbitrary saved role files are automatically discovered by Codex.
+does not assume arbitrary saved role files are automatically discovered by a CLI.
 
-Codex runs non-interactively with `codex exec`, staged JSON schemas, a read-only
+The default Codex adapter runs non-interactively with `codex exec`, staged JSON schemas, a read-only
 sandbox, no approval prompts, disabled shell tools and disabled web search. User
 Codex config and exec-policy rules are ignored; existing authentication is used.
-Recent CLI flags `--ignore-user-config`, `--ignore-rules`, `--ephemeral` and
+Recent Codex CLI flags `--ignore-user-config`, `--ignore-rules`, `--ephemeral` and
 `--output-schema` are required. `doctor` checks them and login status. Upgrade the
 CLI if necessary; the pipeline never falls back to broader permissions.
 See the [official non-interactive guide](https://developers.openai.com/codex/noninteractive)
@@ -300,6 +440,9 @@ and [Codex source/install guide](https://github.com/openai/codex).
 
 Agent responses are staged under `.pipeline/staging/`, checked against JSON schemas,
 checked for prohibited link/managed syntax and checked against exact source excerpts.
+Malformed outputs, invalid identifiers and evidence naming sources or locators that
+were not processed remain processing errors. Quote mismatches at valid source
+locations become scientific review warnings, with the evidence and failure reason retained.
 Literature evidence must cover every processed PDF, including supplements. Python
 integrates only permitted changes. An atomic write-ahead journal covers notes,
 review registrations, the dashboard and state; an interrupted batch is rolled back
@@ -647,6 +790,9 @@ After `sync`, open files in `Reviews/Links/` in Obsidian. Each has a stable prop
 ID, plain-text source/target paths, relationship type, scientific justification,
 evidence, timestamp and `status: pending`. A proposed new concept is contained in
 `target_concept`; it is not created yet.
+When an evidence quote cannot be found in the retrieved excerpt or current note,
+`validation_warnings` records the reason. This is a pending human review, not a sync
+failure. Verify scientific support in the actual notes before approving it.
 
 Use source mode or Obsidian Properties to change only:
 
@@ -661,8 +807,18 @@ Approving a source under `My Notes/` explicitly authorizes that appended link;
 synchronization and deletion never modify personal notes. Reject a proposal if you
 want the personal note untouched. Existing body text is preserved.
 
-Never edit proposal payload fields to approve a different target or justification.
-The local registry records their digest and rejects such edits. The LLM cannot set
+To revise a new claim or link review directly in Obsidian, leave `status: pending`
+and replace `revision: null` with a complete replacement object: the summary fields
+`title`, `summary`, `evidence`, `claims` for a claim, or the link fields `source`,
+`target`, `relationship`, `justification`, `evidence`, `target_concept` for a link.
+Use source mode for nested objects. Run `sync` to validate the revision and register
+a separate pending review. The original review names its replacement and records
+`superseded_by` in private state; it cannot apply. Open and approve or reject the new review. A revision never
+inherits approval. This also allows a corrected justification with the same evidence.
+
+Original proposal payload fields remain immutable; the separate `revision` field
+requests a new proposal. The local registry records their digest and rejects edits
+outside the documented decision/revision fields. The LLM cannot set
 status or approval fields. Do not manually copy template review layouts into the
 queue; only registered proposals can be applied.
 
@@ -677,6 +833,22 @@ the same identity even if the LLM rephrases its justification. New evidence can
 produce a new proposal. Already-existing links are not proposed again. Python
 checks excerpt presence and structural integrity; **scientific validity remains
 a human review decision**, especially for claimed equivalence or contradiction.
+
+Unverifiable literature or manuscript summaries are retained as clearly marked
+`kind: claim` drafts in the existing `Reviews/Revisions/` folder, including the
+complete summary, attributed claims, evidence references, per-page processing
+methods and validation warnings. The established literature/manuscript note stays
+unchanged; a new paper has no established note until review. Drafts never enter
+concept extraction, synthesis or approved graph relationships. Source text remains
+in private caches/state for validation and revision; pending reviews reuse completed
+inference on later runs.
+
+Approve, reject or revise these claim drafts in Obsidian using the same workflow.
+`apply` checks unchanged source files, processing identity, destination ownership
+and note hashes before publishing the exact approved draft in the managed section.
+Published drafts carry their human approval ID; automatic verification warnings
+remain in the review history. Rejecting a draft preserves the established note
+and does not cause repeated proposals for identical source content.
 
 Synthesis and maintenance output goes to `Reviews/Revisions/`. These are advisory:
 edit the target note yourself, then mark the revision approved to acknowledge it.
@@ -766,7 +938,11 @@ explicitly rather than labeling an incomplete summary successful. Output reserve
 is an estimate, not a Codex output-token cap. Chunk summaries and exact evidence
 are retained so you can audit what the overview consolidated.
 
-A fully completed sync exits **0**. A completed attempt with skipped/failed documents
+A fully completed sync exits **0**, including runs with pending scientific reviews.
+Reports separate `completed_operations` (successful inference jobs, including cache
+reuse), `completed_documents`, `pending_claim_reviews`, `pending_link_reviews` and
+`processing_failures`. Pending reviews do not prevent `last_success` advancing.
+A completed attempt with skipped/failed documents
 or incomplete reasoning exits **2**, with details in JSON. Blocking configuration,
 API, authentication, ownership, concurrent-edit or transaction errors exit **1**;
 keyboard interruption exits **130**. Progress events are JSON on stderr; the final
@@ -813,7 +989,7 @@ The wrapper script selects its own vault directory, even when called from elsewh
 | `apply --dry-run` | Validate approvals and print affected paths/removal impact; no writes |
 | `apply` | Deterministically apply validated user decisions |
 | `status` | Report counts, last success, warnings and pending transaction status |
-| `doctor` | Check config, packages, Zotero snapshot, native PDF page coverage, optional OCR availability, source authorization and Codex/login/flags |
+| `doctor` | Check config, packages, Zotero snapshot, native PDF page coverage, OCR availability, source authorization and both LLM runtimes' versions/login/flags |
 
 `Home.md` shows last successful synchronization, processed/active papers, pending
 links/removals/revisions, warnings and errors. Edit only below the generated status
@@ -822,7 +998,7 @@ status/doctor/dry-run commands may inspect a changing vault; dry runs refuse an
 unrecovered journal. No command requires an active VS Code session.
 
 Inspect `.pipeline/logs/events.jsonl` for execution outcomes and
-`.pipeline/staging/<run-id>/stderr.txt` for a failed Codex call. Staging also contains
+`.pipeline/staging/<run-id>/stderr.txt` for a failed inference call. Staging also contains
 the actual input, schema and response; it may contain sensitive research text.
 Keep `.pipeline` private and backed up. Do not delete state to “fix” a failed run:
 you would lose rejection/approval history. Run the same command again after fixing
@@ -840,8 +1016,12 @@ the cause. The next normal mutation recovers an interrupted file transaction fir
 | Inaccessible manuscript/include | Check source_roots, path spelling, permissions and recursive includes |
 | Codex not found from Obsidian | Restart Obsidian to refresh PATH or set codex.executable to its local absolute path |
 | Login/model/usage error | Run codex login/status in a terminal, select an available model and inspect limits |
+| Claude missing/authentication failure | Install Claude Code and run `claude auth login` / `claude auth status` in the same environment as Python; check `claude.executable` |
+| Claude required isolation flags unavailable | Update Claude Code; `doctor` names missing flags. The adapter refuses to weaken its restrictions |
+| Invalid provider/role/model settings | Use `codex` or `claude`, supported role names, and a model available to the selected provider |
 | Missing Codex flags | Update Codex; no insecure compatibility fallback is used |
-| Invalid agent JSON/evidence | Inspect staging response; retry the failed job; completed papers and approvals are retained |
+| Invalid agent JSON, identifiers or nonexistent evidence source/locator | Inspect staging response; retry the failed job; completed papers and approvals are retained |
+| Quote cannot be verified at a valid source/note | Review the unverified claim draft or pending link and its validation warnings in Obsidian; sync can still succeed |
 | Input budget / consolidation failure | Check instructions and output reserve fit the configured budget; chunks remain cached. Adjust chunk sizing or model capacity; no scientific text is silently dropped |
 | Windows URL under WSL | Doctor shows the original URL and translated path; check wslpath, Windows mounts and file availability |
 | Plugin command does not run | Confirm plugin enabled, alias visible, correct Bash/PowerShell shell, quoted vault variable, output panel and venv path |
@@ -934,7 +1114,7 @@ start. GitHub hosting is optional for local pipeline use.
 ## Validation and current limits
 
 Run `python -m pytest -q` inside the project venv. Tests use generated synthetic PDFs,
-mock HTTP responses and mock agent execution; no Zotero account, Codex session or
+mock HTTP responses and mock agent execution; no Zotero account, live LLM session or
 inference bill is required. A temporary local Git repository tests deletion and
 backup behavior. CI covers Python 3.11/3.13 on Linux and Windows. Local validation
 and remaining live checks are recorded in [docs/validation.md](docs/validation.md).
@@ -948,7 +1128,7 @@ Caches and staging currently accumulate; back them up privately and monitor disk
 usage. Removing only cache/staging files when no run is active is safe but forces
 more extraction/inference; never remove state, reviews or a transaction journal.
 
-Live Zotero version behavior, actual Codex structured responses and native Windows
+Live Zotero version behavior, actual Codex/Claude structured responses and native Windows
 sandbox/npm setup, Obsidian plugin events and graph UI need real-world integration
 testing. These are not simulated as successful integrations by the tests. See the
 [integration checklist](docs/validation.md) before relying on a research project.

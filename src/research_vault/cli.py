@@ -8,7 +8,7 @@ import re
 import sys
 from pathlib import Path
 
-from .config import Config
+from .config import PROVIDERS, Config
 from .execution import finish, launch, running
 from .pipeline import Pipeline
 from .storage import VaultError, atomic, inside, lock, now, recover
@@ -34,6 +34,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Bounded incremental documents; defer conceptual reasoning",
     )
     sync.add_argument("--run-id", help=argparse.SUPPRESS)
+    sync.add_argument(
+        "--provider", choices=PROVIDERS, help="Override every agent's provider for this run only"
+    )
     apply = commands.add_parser(
         "apply", help="Apply validated, explicitly approved review decisions"
     )
@@ -56,8 +59,11 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     try:
+        config = Config.load(args.vault)
+        if args.command == "sync" and args.provider:
+            config = config.with_provider(args.provider)
         pipeline = Pipeline(
-            Config.load(args.vault),
+            config,
             progress=progress,
         )
         dry = getattr(args, "dry_run", False)

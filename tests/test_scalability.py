@@ -215,13 +215,13 @@ def test_real_adapter_recovers_from_unavailable_managed_and_linked_files(vault, 
     assert (root / "Literature/PAPER001.md").exists()
 
 
-def test_invalid_evidence_is_not_cached_as_success(vault):
+def test_nonexistent_source_is_not_cached_as_success(vault):
     p = processor(vault)
     original = vault[3].run
 
     def invalid(role, payload):
         result = original(role, payload)
-        result["evidence"][0]["quote"] = "Fabricated evidence."
+        result["evidence"][0]["source"] = "UNKNOWN1"
         return result
 
     vault[3].run = invalid

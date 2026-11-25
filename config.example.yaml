@@ -30,6 +30,18 @@ ocr:
 # Give each manuscript project directory, not a broad home or filesystem directory.
 source_roots: []
 
+llm:
+  default_provider: codex     # Existing vaults without llm settings continue to use Codex.
+  agents: {}                 # Role names: literature, manuscript, concepts, linking, synthesis, maintenance.
+  # Example mixed workflow (instead of agents: {}):
+  # agents:
+  #   literature: codex
+  #   linking: {provider: claude, model: sonnet}
+  #   synthesis: claude
+  evaluation:
+    enabled: false           # Extra inference/cost; results stay private and never create proposals.
+    provider: claude          # Secondary runtime for scheduled jobs; same-provider comparisons are skipped.
+
 codex:
   executable: codex          # Native binary or standard npm codex.cmd shim; local absolute paths allowed.
   model: null                # Use CLI default; optionally set an account-supported model.
@@ -37,6 +49,13 @@ codex:
   max_input_chars: 500000     # Per-request total budget, never a collection-wide limit.
   # Budget includes instruction files, schema, JSON context and this expected output reserve.
   # Character counts are conservative safety controls, not model-token measurements.
+  output_reserve_chars: 16000
+
+claude:
+  executable: claude         # Native CLI recommended; standard npm claude.cmd is also supported.
+  model: null                # Use Claude CLI default or an account-supported model ID/alias.
+  timeout_seconds: 600
+  max_input_chars: 500000
   output_reserve_chars: 16000
 
 processing:

@@ -36,3 +36,4 @@ Reviews/Revisions/*
 .ruff_cache/
 .aws/
 .codex/
+.claude/

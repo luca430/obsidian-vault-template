@@ -177,10 +177,11 @@ def test_statement_provenance_is_checked_independently():
             }
         ],
     }
-    with pytest.raises(VaultError, match="absent"):
-        validate_summary(
-            result, [{"source": "PDF00001", "locator": "page 1", "text": "Actual expression."}]
-        )
+    warnings = validate_summary(
+        result, [{"source": "PDF00001", "locator": "page 1", "text": "Actual expression."}]
+    )
+    assert warnings[0]["evidence"] == result["claims"][0]["evidence"][0]
+    assert warnings[0]["code"] == "source_quote_not_found"
 
 
 def test_startup_is_bounded_and_manual_sync_resumes_reasoning(vault):
