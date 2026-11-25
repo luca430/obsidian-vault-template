@@ -1,0 +1,9 @@
+{
+  "id": "research-vault",
+  "name": "Research Vault",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.7",
+  "description": "Run the local Python research pipeline and inspect progress and review queues.",
+  "author": "Research Vault contributors",
+  "isDesktopOnly": true
+}

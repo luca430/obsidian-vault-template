@@ -234,7 +234,33 @@ Missing passage caches reduce retrieval context until the relevant source is
 processed again; never claim uncached passages were read. Keep state, journals,
 backups and review files. No recovery requires broadening inference permissions.
 
-## Detached Obsidian execution
+## Native Obsidian plugin and optional detached CLI execution
+
+The bundled Research Vault plugin launches foreground CLI processes asynchronously
+with Node spawn and no shell. It does not use `--background`: keeping the finite
+child attached supplies streaming progress and its real exit code without blocking
+Obsidian. Native mode selects the project venv; Windows-to-WSL mode translates the
+vault path with wslpath and runs the Linux venv under wsl.exe in that directory.
+Interactive shell profiles are not loaded. See the README's
+[Obsidian setup](../README.md#running-the-pipeline-from-obsidian) for PATH and updates.
+
+The plugin performs no scientific processing or direct note/approval/state writes.
+Apply Reviews first runs Python `apply --dry-run`, displays its paths/impacts for
+confirmation, then invokes `apply`. A cancelled, failed or oversized preview
+cannot apply. Python remains the authority for approved decisions, stale evidence,
+ownership, impact, clean Git and verified backups. The UI guard prevents duplicate
+commands in one app; Python's existing lock covers other windows/terminal runs.
+Automatic startup sync is opt in, once after workspace readiness, and uses only
+`sync --startup`. No failed or potentially expensive run is retried automatically.
+
+Disabling the plugin allows an already launched finite process to finish; it does
+not kill a transaction or only the WSL launcher. Closing Obsidian/OS termination
+may still interrupt work. Python's existing recovery/checkpoints apply on the next
+ordinary sync/apply. UI logs are bounded and best-effort redacted; full reports
+remain in the private pipeline logs. No persistent polling/watcher is installed.
+
+The following detached operations remain available independently from a terminal
+or another explicitly configured launcher:
 
 Use `sync --background` for the manual incremental command and
 `sync --full --background` for an explicitly requested full run. The launcher
@@ -244,7 +270,7 @@ vault lock as foreground sync/apply. Concurrent launch races may start a losing
 child that reports a lock error, but no concurrent synchronization can execute.
 The parent never overwrites a fast child's final report.
 
-Use a separate `sync --startup --background` alias for the Obsidian-start event.
+An external launcher can use `sync --startup --background` for its startup event.
 Startup caps document jobs and defers concept extraction/reasoning; manual sync
 resumes them. It still needs a complete API snapshot and source hashing. WSL runs
 validate the actual loopback endpoint and local attachment accessibility, independent

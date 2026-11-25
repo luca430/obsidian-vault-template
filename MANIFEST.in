@@ -5,6 +5,13 @@ recursive-include scripts *.py
 recursive-include tests *.py
 recursive-include docs *.md
 include .obsidian/app.json .obsidian/core-plugins.json
+include .obsidian/plugins/research-vault/manifest.json
+include .obsidian/plugins/research-vault/main.js .obsidian/plugins/research-vault/styles.css
+include obsidian-plugin/package.json obsidian-plugin/package-lock.json
+include obsidian-plugin/manifest.json obsidian-plugin/tsconfig.json
+include obsidian-plugin/esbuild.config.mjs obsidian-plugin/test.mjs obsidian-plugin/styles.css
+recursive-include obsidian-plugin/src *.ts
+recursive-include obsidian-plugin/tests *.ts
 include .github/workflows/tests.yml
 include Literature/.gitkeep Concepts/.gitkeep
 include My?Work/.gitkeep My?Notes/.gitkeep

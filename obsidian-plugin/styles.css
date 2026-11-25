@@ -1,0 +1,10 @@
+.research-vault-view { padding: 12px; }
+.research-vault-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+.research-vault-stats dt { color: var(--text-muted); }
+.research-vault-stats dd { margin: 0; overflow-wrap: anywhere; }
+.research-vault-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+.research-vault-logs, .research-vault-diagnostic { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--font-smallest); user-select: text; }
+.research-vault-logs { max-height: 320px; overflow: auto; }
+.research-vault-status { font-weight: var(--font-semibold); }
+.research-vault-status.status-failed { color: var(--text-error); }
+.research-vault-status.status-incomplete { color: var(--text-warning); }

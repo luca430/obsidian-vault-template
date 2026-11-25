@@ -8,8 +8,9 @@ research subject and Zotero collection.
 
 **Nothing runs continuously.** A command checks sources, processes changes and
 exits. Run it manually, from Obsidian's command palette, or optionally when the
-vault opens. No custom Obsidian plugin, watcher, editor or persistent LLM session
-is required. Zotero must be open during synchronization.
+vault opens. A bundled desktop Obsidian plugin provides the native interface;
+the terminal CLI remains available. No watcher or persistent LLM session is
+required. Zotero must be open during synchronization.
 
 **All new conceptual links require review.** Citation records never automatically
 become graph edges. Original manuscripts and Zotero data are read only. Personal
@@ -24,7 +25,7 @@ managed and user-editable sections.
 - [Architecture and folders](#architecture-and-folders)
 - [Configure Zotero](#configure-zotero)
 - [Register personal manuscripts](#register-personal-manuscripts)
-- [Install Shell Commands and use Obsidian](#install-shell-commands-and-use-obsidian)
+- [Running the pipeline from Obsidian](#running-the-pipeline-from-obsidian)
 - [Graph colors](#graph-colors)
 - [Review conceptual relationships](#review-conceptual-relationships)
 - [Removed papers](#removed-papers)
@@ -149,9 +150,10 @@ Linux virtual environment. Choose a WSL distribution and use it consistently.
    Set `zotero.base_url: http://127.0.0.1:23119/api/` if localhost resolves to an
    unsuitable address. Connection refusal/403 remains blocking: check mirrored
    mode, Windows Zotero's API setting and firewall policy. No API key is needed.
-5. Select **PowerShell** in Windows Obsidian's Shell Commands settings. Use the
-   WSL commands below, not the native Windows Python commands. Check `doctor` from
-   that same launch environment before enabling a startup event.
+5. Enable the bundled **Research Vault** plugin and select **WSL** under its
+   settings, as described below. Use the distribution where you installed Python
+   and the agent CLIs. Run **Research: Doctor** from Obsidian before enabling
+   optional startup synchronization.
 
 Windows file URLs are UTF-8 decoded and translated with `wslpath -u`, without a
 shell or a hardcoded drive/mount/user. This covers Zotero-managed PDFs and linked
@@ -306,8 +308,8 @@ workflow guide. The research folders start empty; no example papers or scientifi
 conclusions are installed. You can begin writing Markdown in `My Notes/` before
 configuring automation.
 
-The `.obsidian` directory contains only portable core settings. No community plugin
-is installed or enabled automatically. Obsidian's automatic link rewriting is
+The `.obsidian` directory contains portable core settings and the bundled Research
+Vault plugin. No community plugin is enabled automatically. Obsidian's automatic link rewriting is
 turned off so deleting a generated note cannot silently change personal notes.
 Keep that setting off when using the pipeline's removal workflow.
 
@@ -332,9 +334,10 @@ research-vault-template/
 ├── scripts/research.py       Same entry point for terminal and Obsidian
 ├── src/research_vault/       Config, API, extraction, agents, reviews, storage, CLI
 ├── tests/                    Synthetic PDFs, mocked Zotero/LLM runtimes, Git/lock/recovery tests
+├── obsidian-plugin/          TypeScript source, reproducible build and mocked API/process tests
 ├── docs/                     Implementation, recovery and integration checklist
 ├── .pipeline/                Ignored state, staging, locks, logs and backups
-└── .obsidian/                Portable core settings only
+└── .obsidian/                Portable core settings and compiled Research Vault plugin
 ```
 
 Python accepts a complete Zotero membership snapshot before comparing removals,
@@ -611,150 +614,208 @@ metadata trigger updates. Unchanged registered files skip extraction and inferen
 A missing registered main source or removed registry entry leaves the existing
 summary and produces a warning; it is never deleted automatically.
 
-## Install Shell Commands and use Obsidian
+## Running the pipeline from Obsidian
 
-In Obsidian, go to **Settings → Community plugins**, explicitly turn off Restricted
-mode if you accept community plugins, choose **Browse**, find **Shell commands**
-by **Taitava**, then **Install** and **Enable**. This is an explicit permission to
-execute local commands. Do not install a custom research plugin.
+The template includes the compiled **Research Vault** plugin in
+`.obsidian/plugins/research-vault/`. It needs no Node.js/npm installation to run.
+It is a **local, desktop-only plugin capable of launching programs on your
+computer**. Enable it only from trusted repository sources. It is bundled for
+manual installation, not automatically installed from Obsidian's community catalog.
+No Shell Commands, Local Runner or Open in Terminal plugin is required.
 
-Open **Settings → Shell commands**. Add the following four commands. Set each
-command's alias/display name exactly as shown, and leave command-palette visibility
-enabled. Choose **Bash** on Linux or **PowerShell** on Windows in the plugin's shell
-settings. Configure stdout and stderr to an output panel or notification; do not
-insert command output into the active note. Restart Obsidian after installing CLI
-tools if its inherited PATH is stale.
+### Enable and configure
 
-`{{vault_path}}` is a plugin variable. The default working directory is already the
-vault root, but these commands also use absolute vault paths, so virtual-environment
-activation and the current note's directory do not matter. For unusual directory
-names containing shell metacharacters, use the plugin's variable escaping settings
-and inspect its command preview. Standard paths with spaces work with these quotes.
-See the [Shell Commands variable documentation](https://publish.obsidian.md/shellcommands/Variables/%7B%7Bvault_path%7D%7D)
-and [plugin guide](https://publish.obsidian.md/shellcommands).
+After setting up Python dependencies and local `config.yaml` as above:
 
-### Linux commands (Bash)
+1. Open this project directory as an Obsidian vault.
+2. In **Settings → Community plugins**, turn off Restricted mode if you accept
+   local community plugins. Under installed plugins, enable **Research Vault**.
+   Reload Obsidian if it has not discovered the bundled directory yet. This
+   repository does not automatically enable community plugins.
+3. Open **Settings → Research Vault**. The vault directory is derived from
+   Obsidian's filesystem adapter, regardless of the active note or working directory.
+   Choose the environment below. Blank Python/script settings use project-relative
+   defaults; no shell activation is needed.
 
-**Research: Update knowledge base**
+| Installation | Execution environment | Default Python |
+| --- | --- | --- |
+| Linux desktop Obsidian + Linux Python | Native (Linux default) | `.venv/bin/python` |
+| Windows Obsidian + Windows Python | Native (select explicitly) | `.venv/Scripts/python.exe` |
+| Windows Obsidian + WSL2 Python | WSL (Windows default) | `.venv/bin/python` inside WSL |
+
+For **Windows Obsidian + WSL Python**, keep one vault on the Windows filesystem,
+create its Linux virtual environment from WSL using the quick start, and choose
+**WSL** in the plugin. Leave **WSL distribution** blank for your Windows default,
+or enter the exact installed distribution used for installation/login. The plugin
+runs `wsl.exe`, translates the Windows vault path using that distribution's
+`wslpath -a -u`, and launches Linux Python with `--cd` set to the translated vault.
+There are no assumed drive letters, usernames or mount points. Spaces, Unicode and
+OneDrive directory names are passed as separate arguments without a command shell.
+An optional custom Python path must be a Linux path in this mode.
+
+The virtual environment's executable directory is prepended to the selected
+environment's PATH and its VIRTUAL_ENV is set. WSL preserves its own environment
+rather than receiving Windows PATH. **WSL --exec does not load interactive shell
+profiles.** Install Linux Node/Codex/Claude on a PATH available to noninteractive
+WSL processes, or configure absolute Linux provider executable paths in
+`config.yaml`. A Codex npm entry still needs Linux Node on PATH. For nvm-only
+installations, make the intended Linux Node and CLI accessible in the noninteractive
+environment (for example through an existing project venv's `bin` directory).
+Authenticate each provider in that same distribution. No credentials, Zotero
+collection IDs or provider choices are stored in the plugin's settings.
+
+**Python executable path** and **Custom CLI script path** accept project-relative
+or absolute paths, without command arguments, quotes or `~` expansion. Blank script
+uses `scripts/research.py`; a custom trusted `.py` script must implement the same
+CLI including `--vault`. Missing executables/configuration produce explicit errors;
+the plugin does not fall back to a globally installed Python.
+
+### Commands and sidebar
+
+Press **Ctrl+P** and search for these command names (Obsidian may also prefix the
+plugin name). Commands use the existing Python CLI, without changing its semantics:
+
+| Command | Python operation |
+| --- | --- |
+| Research: Sync | `sync`, incremental |
+| Research: Full Sync | `sync --full`, after a warning and confirmation |
+| Research: Dry Run | `sync --dry-run`, inspect changes without inference or research writes |
+| Research: Apply Reviews | `apply --dry-run` preview, confirmation, then `apply` |
+| Research: Status | `status` |
+| Research: Doctor | `doctor` |
+| Research: Open Dashboard | Open existing `Home.md` |
+| Research: Open Review Queue | Search existing links, removals and revisions |
+
+Click the **microscope ribbon icon** or **Settings → Research Vault → Open sidebar**
+to open the Research Vault sidebar. The ribbon can be disabled in settings (reload
+the plugin after changing it). The sidebar has Sync, Apply Reviews, Doctor, Refresh
+Status and navigation buttons. **Open sidebar automatically** is optional.
+
+Run Doctor, then Dry Run, then Sync manually for your first run. Processing runs
+asynchronously in a finite child process; Obsidian remains responsive. The plugin
+keeps that process attached for progress and its real exit code, so it does **not**
+add `--background`. Terminal `--background` remains supported independently.
+
+The sidebar displays idle/running/completed/incomplete/failed status, the last
+reported stage, processed/remaining/failed/skipped document counts, cache hits,
+pending links/claim drafts/removals/revisions and last successful sync. Counters
+are shown only when Python reports them; nested cache/inference stages retain the
+last document counts. Pending counts and last success refresh through Python
+`status` after sync/apply and when you request Status. There is no persistent
+watcher for changes made by another process; use Refresh Status for those.
+Historical progress is the last report, not proof that an external process is alive.
+
+Progress events are read from stderr, ordinary output is retained in a bounded log,
+and multiline final JSON supplies diagnostics. Exit 2 or `complete: false` means
+**incomplete**; nonzero error exits mean **failed**. Scientific warnings and pending
+human reviews alone do not turn a technically complete run into a failure. Full
+reports remain in `.pipeline/logs/` and `status`; very large JSON (over 8 MiB) is
+omitted from the display. Common credentials are redacted where possible, but do
+not paste sensitive logs into public issues. Change **Maximum displayed log lines**
+(20–2000) to adjust session output retention. Output is rendered as plain text,
+never as executable content or HTML from scientific sources.
+
+Use **Open Review Queue** to search paths in `Reviews/Links/`,
+`Reviews/Removals/` and `Reviews/Revisions/`; results include the note's current
+status. This includes existing approved/rejected artifacts so they remain
+inspectable. Review the actual evidence and edit decisions in Obsidian Properties
+or source mode. Claim drafts also reside in `Reviews/Revisions/`. The plugin
+never writes approvals or scientific notes directly. Apply Reviews first displays
+Python's exact dry-run changes and removal impacts. Cancel leaves them unapplied;
+a failed/oversized preview blocks the GUI apply. Python rechecks approvals, stale
+sources, ownership, removal impacts, clean Git state and recoverable backups. A
+confirmation never substitutes for an explicit approved/delete review decision.
+
+### Optional startup synchronization
+
+**Synchronize at startup** is disabled by default. Enable it explicitly in Research
+Vault settings only after a successful manual Doctor/Sync. Once the workspace is
+ready, the plugin runs `sync --startup` exactly once, asynchronously. This is the
+existing bounded incremental mode: it processes at most
+`processing.startup_max_documents` jobs (default 5), defers conceptual reasoning,
+and can finish incomplete until a manual Sync resumes the remaining work. It still
+scans the full membership and hashes sources. It never starts a full sync, retries
+expensive work automatically, or starts a watcher/daemon.
+
+Only one plugin command runs per vault at a time; Python's existing OS lock also
+protects against terminal runs and other Obsidian windows. A lock conflict is
+reported without retry. Startup failures are shown in a notice and the sidebar.
+Completion notifications can be disabled; errors are still reported. Disabling the
+plugin does not kill an already launched Python process mid-transaction: the finite
+process finishes under Python's lock/checkpoints. Use Status after re-enabling.
+Avoid closing Obsidian during work; OS termination can interrupt processes, and the
+next ordinary sync/apply performs Python's existing transaction recovery.
+
+### Troubleshooting
+
+- **Missing virtual environment/Python:** select the correct execution environment.
+  Create `.venv` in the vault using that environment's Python and install `.[dev]`
+  (or `.` for use only). A Windows venv cannot be reused by WSL. Set a custom Python
+  path only when intentionally using another environment. Do not include flags or
+  surrounding quotes. Run Doctor from Obsidian after setup.
+- **wsl.exe or distribution errors:** from PowerShell run `wsl.exe --list --verbose`
+  and `wsl.exe --status`. Select an installed WSL2 distribution in plugin settings,
+  or leave it blank to use your default. Current WSL with `--cd` support is required.
+- **Path conversion:** test `wsl.exe --exec wslpath -a -u 'YOUR_WINDOWS_VAULT_PATH'`
+  in PowerShell; add `--distribution YOUR_DISTRO` before `--exec` when configured.
+  Check the reported Linux directory using that distribution. The plugin does not
+  guess a `/mnt/c` replacement or mount UNC shares. OneDrive files must be downloaded
+  locally; use **Always keep on this device**. `~` and control characters are rejected.
+- **Python works but agents are unavailable:** run Doctor in Obsidian, check Linux
+  versus Windows executables and the noninteractive PATH, and authenticate the
+  chosen providers in that environment. Provider settings belong in `config.yaml`.
+  Restart Obsidian after changing native environment variables.
+- **Zotero connection refused:** keep Windows Zotero running and check the WSL
+  mirrored networking/local API steps above. The plugin does not change networking
+  policy. Configuration and service errors stay with Python's Doctor diagnostics.
+- **Another run holds the vault lock:** let it finish, then run Status. Do not remove
+  locks/state or relaunch expensive work automatically. If a process was interrupted,
+  retry ordinary Sync after addressing the cause; Python performs recovery.
+
+### Develop, distribute and update
+
+Source and development tooling live in `obsidian-plugin/`. The build follows the
+[official Obsidian sample plugin](https://github.com/obsidianmd/obsidian-sample-plugin)
+(CommonJS bundle, Obsidian/Node imports external, desktop manifest, native API).
+With Node.js 18+ (Node 22 in CI):
 
 ```bash
-"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" sync --background
+cd obsidian-plugin
+npm ci --ignore-scripts --no-audit --no-fund
+npm run build
+npm test
 ```
 
-**Research: Full synchronization**
+`npm run build` runs strict TypeScript checking, produces ignored `dist/` files and
+updates only `main.js`, `manifest.json` and `styles.css` in
+`.obsidian/plugins/research-vault/`. Include those **three compiled files**, source
+and `package-lock.json` in template updates. No lint tool is configured for this
+plugin; strict TypeScript checking is part of the build. CI checks builds, mocked
+plugin tests, distribution drift and the separate existing Python suite. Tests do
+not claim live Obsidian/Windows/WSL/Zotero/agent integration.
 
-```bash
-"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" sync --full --background
-```
+To deploy a plugin update into an existing vault such as **vault-thermothing**:
 
-**Research: Apply reviewed changes**
+1. Back up the vault and finish active pipeline work; disable Research Vault during
+   replacement. Inspect changes from a trusted template revision.
+2. Create the destination `.obsidian/plugins/research-vault/` if missing. Copy only
+   the three bundled files (`main.js`, `manifest.json`, `styles.css`) from that
+   trusted revision into the same destination directory. No npm is needed.
+3. Preserve `data.json` (plugin-local settings), `.obsidian/community-plugins.json`
+   and all other Obsidian configuration. Never replace the entire `.obsidian/`
+   directory, `config.yaml`, `works.yaml`, `.venv/`, `.pipeline/`, `Home.md`, review
+   queues, generated notes, personal notes, manuscripts or Zotero files.
+4. Enable/reload Research Vault. Check the environment/distribution and Python path
+   in settings, run Status and Doctor, then Dry Run before a manual Sync. If this
+   older vault lacks the supported CLI/progress/status contract, merge the matching
+   Python **code** update separately using the template-update procedure below and
+   reinstall Python dependencies. Copying the plugin does not migrate Python state.
 
-```bash
-"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" apply
-```
-
-**Research: Check status**
-
-```bash
-"{{vault_path}}/.venv/bin/python" "{{vault_path}}/scripts/research.py" status
-```
-
-### Windows commands (PowerShell)
-
-**Research: Update knowledge base**
-
-```powershell
-& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" sync --background
-```
-
-**Research: Full synchronization**
-
-```powershell
-& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" sync --full --background
-```
-
-**Research: Apply reviewed changes**
-
-```powershell
-& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" apply
-```
-
-**Research: Check status**
-
-```powershell
-& "{{vault_path}}\.venv\Scripts\python.exe" "{{vault_path}}\scripts\research.py" status
-```
-
-Press Ctrl+P to open the command palette and select the alias (some plugin versions
-prefix aliases with “Shell commands:”). These are the same one-shot Python calls
-used in a terminal. You may assign Obsidian hotkeys to them.
-
-### Windows Obsidian → WSL commands (PowerShell)
-
-Select your distribution as WSL's default, or add `--distribution YOUR_DISTRO`
-before `--cd` in **every** command. `--cd` accepts the absolute Windows vault path,
-and `--exec` runs the Linux virtual-environment Python directly in that directory.
-These semantics are documented in [WSL's command help](https://github.com/microsoft/WSL/blob/master/localization/strings/en-US/Resources.resw).
-No Windows username, drive or Linux home is embedded in these commands.
-
-**Research: Update knowledge base**
-
-```powershell
-wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py sync --background
-```
-
-**Research: Full synchronization**
-
-```powershell
-wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py sync --full --background
-```
-
-**Research: Apply reviewed changes**
-
-```powershell
-wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py apply
-```
-
-**Research: Check status**
-
-```powershell
-wsl.exe --cd "{{vault_path}}" --exec ./.venv/bin/python ./scripts/research.py status
-```
-
-For diagnosis, replace the final command with `doctor` or `sync --dry-run`.
-WSL `--exec` does not initialize an interactive shell: if you use nvm or a custom
-npm prefix, ensure Linux Node and Codex are on the inherited PATH or configure
-`codex.executable` to a Linux executable available in that environment. Restart
-Obsidian after changes. Codex's subprocess working directory is its private staging
-directory inside this vault, matching its `--cd` sandbox boundary.
-
-### Optional lightweight startup synchronization
-
-Create a separate **Research: Startup update** alias using the appropriate sync
-command above with `sync --startup --background`. Enable the Shell Commands
-**Obsidian starts** event only for that alias. `--startup` processes at most
-`processing.startup_max_documents` changed document jobs (default 5), deferring
-concept extraction and cross-document reasoning. A normal manual update resumes
-remaining work; `--full` is explicit and cannot be combined with `--startup`.
-A complete membership/API scan and content hashing still occur, so startup I/O
-cost depends on collection size. This is a finite command, not a daemon or watcher.
-
-`--background` returns immediately after spawning the **same Python environment**
-with detached stdin/stdout/stderr. The child takes the existing OS vault lock, so
-concurrent sync/apply execution is prevented. No community plugin is enabled by
-this repository. Keep plugin output in an output panel, never the active note.
-
-`Home.md` shows checkpointed progress and completeness; **Research: Check status**
-shows live `.pipeline/progress.json`, the last result and recent background runs.
-The launch result identifies `.pipeline/runs/<id>.log` and `<id>.json`; the JSON
-record stores the final exit code and full execution report. Background launch
-exit 0 confirms launch only; inspect the child report for completion. Abrupt kills
-can leave a last-reported running/launching record; they never imply success.
-The OS releases the lock when the process exits. Retry ordinary sync for recovery.
-Zotero must be open. On WSL, doctor and every sync actually contact the loopback
-API and resolve/open/hash attachments; mirrored networking is never presumed to
-be working merely because Python runs in WSL. Check the completed report from the
-actual Windows Obsidian launch environment before enabling unattended startup.
+Local plugin `data.json`, development dependencies, dist output and generated
+research remain ignored. The three bundled distribution files are explicitly
+included by `.gitignore` and the Python source-distribution manifest. GitHub's
+**Use this template** therefore carries a ready-to-enable plugin to each new
+independent project without user-specific settings.
 
 ## Graph colors
 
@@ -872,7 +933,7 @@ Set `status: approved` and choose one `decision`:
 | `keep` | Retain it without an absence banner |
 | `delete` | Explicitly delete the generated literature note after safety checks |
 
-Before deletion, preview from the terminal (or add a fifth Shell Commands alias):
+Before deletion, use the plugin’s Apply Reviews preview or run from the terminal:
 
 ```bash
 .venv/bin/python scripts/research.py apply --dry-run
@@ -1029,7 +1090,7 @@ the cause. The next normal mutation recovers an interrupted file transaction fir
 | Quote cannot be verified at a valid source/note | Review the unverified claim draft or pending link and its validation warnings in Obsidian; sync can still succeed |
 | Input budget / consolidation failure | Check instructions and output reserve fit the configured budget; chunks remain cached. Adjust chunk sizing or model capacity; no scientific text is silently dropped |
 | Windows URL under WSL | Doctor shows the original URL and translated path; check wslpath, Windows mounts and file availability |
-| Plugin command does not run | Confirm plugin enabled, alias visible, correct Bash/PowerShell shell, quoted vault variable, output panel and venv path |
+| Plugin command does not run | Enable Research Vault, check execution mode/distribution and Python path in its settings, then inspect sidebar output and run Doctor |
 | Another run holds lock | Wait for that process or stop it; the lock releases when the process exits, regardless of the lock file's presence |
 | Malformed/missing review | Restore the file from your backup, correct only status/decision; apply refuses the batch |
 | Stale approval/changed impact | Reset pending and sync to re-review, or reject an obsolete removal proposal |
@@ -1079,7 +1140,7 @@ ignored research/configuration files.
 
 For a native Windows → WSL move, replace the Windows virtual environment with a
 new Linux environment after backing it up, sign into Linux Codex, and use the WSL
-Shell Commands configuration. Translate/update manuscript roots and include paths
+Research Vault execution mode. Translate/update manuscript roots and include paths
 in local configuration as necessary. Old absolute manuscript include paths are
 reauthorized before reuse; doctor identifies path problems. Never share one venv
 between Windows and Linux. Do not change the Zotero collection/library identity.

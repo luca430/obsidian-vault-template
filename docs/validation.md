@@ -2,6 +2,25 @@
 
 ## Verified in this workspace
 
+Native Obsidian plugin follow-up (2026-11-25): TypeScript build/strict type checking
+passed and the bundled desktop distribution was generated under
+`.obsidian/plugins/research-vault/`. The plugin suite passed **37 tests**, covering
+command registration, Linux/Windows executable/venv selection, Windows-to-WSL
+translation with custom mounts/distributions, spaces/Unicode/literal shell
+metacharacters, invalid/missing settings and executables, bounded streaming JSON
+and UTF-8 parsing, exit/error/incomplete semantics, credential redaction, duplicate
+command prevention, workspace-ready opt-in startup, full-sync confirmation,
+Python approval-impact preview before apply, oversized/failed preview refusal,
+lock errors without retry, navigation and sidebar rendering. The existing full
+Python suite passed **209 tests** in 213.37 seconds. Python Ruff lint/format and
+diff whitespace checks passed. No TypeScript linter is configured.
+
+Obsidian APIs and Windows/WSL subprocesses are mocked. This Linux run did not
+launch a live Obsidian GUI, Windows Python, wsl.exe, Zotero or a real agent session.
+The compiled plugin is bundled but not enabled automatically. Live desktop checks
+below remain necessary. The plugin leaves the Python implementation, state schema,
+agent restrictions and approval/deletion workflow unchanged.
+
 Multiple-runtime follow-up (2026-11-25): the full synthetic suite passed **205 tests**
 in 180.65 seconds, including 40 new runtime regression cases. Coverage includes
 Codex and Claude Code adapters, mixed-role providers/models, run-only and detached
@@ -108,8 +127,8 @@ collection, manuscript or personal research note was added to this template.
 4. Run sync again unchanged and confirm no new Codex staging invocation. Change one
    supplement and confirm only its parent summary is regenerated. Change one included
    LaTeX source and confirm the work summary updates while user additions survive.
-5. In Obsidian explicitly install Shell Commands, use the documented OS-specific
-   command and inspect stdout/stderr. Verify the virtual-environment executable,
+5. Enable the bundled Research Vault plugin, select Native/WSL in its settings,
+   run Doctor/Dry Run and inspect the sidebar's stdout/stderr diagnostics. Verify the virtual-environment executable,
    Node/npm/native Codex resolution, PATH and native sandbox setup on Windows.
    For split WSL mode, use the same distribution for setup/login and Obsidian
    invocation, check mirrored loopback connectivity from WSL, and verify actual
@@ -118,9 +137,12 @@ collection, manuscript or personal research note was added to this template.
    its main summary must remain usable with partial coverage, and the next sync must
    retry the supplement without repeating unchanged main inference. With no usable
    attachment at all, the previous note must survive unchanged.
-6. Enable only the incremental command's Obsidian-start event. Close/reopen the
+6. Enable Research Vault's optional startup synchronization. Close/reopen the
    vault with Zotero open, then closed; the latter must report an error without
    removing membership. Trigger a second run concurrently and verify locking.
+    Verify disabled startup performs status only, full sync requires confirmation,
+    Apply Reviews shows Python's exact impact preview, cancelling applies nothing,
+    and completion/error/incomplete states agree with the actual CLI exit codes.
 7. Inspect a pending conceptual proposal: no graph link or concept page should
    exist yet. Approve it in Properties/source mode, run apply and confirm exactly
    one edge. Reject another and confirm unchanged evidence is not proposed again.
