@@ -957,6 +957,11 @@ coverage; unavailable optional OCR is a warning, not a blocking dependency error
 `sync --dry-run` reports `page_processing` and `partial_candidates`. Both inspect
 native text only and **never run OCR**; scanned PDFs with no native text may be
 listed as skipped in a dry run even when OCR is configured for the real sync.
+Check `ocr.enabled` for the configured setting and `ocr.status` for executable
+availability. `doctor` also shows the configuration file it loaded in `config_file`.
+Diagnostic page records have `diagnostic_only: true`, `ocr_configured_enabled`
+and `ocr_attempted: false`. When OCR is enabled, their reason says it was not run
+during diagnostics; this does not mean OCR is disabled for synchronization.
 These checks do not verify installed language data or predict OCR quality.
 After `sync`, `status` reports actual per-page methods, incomplete flags and reasons
 under `attachments.<parent>.<attachment>.page_processing` and `manuscript_processing`.

@@ -339,18 +339,26 @@ def test_wsl_ocr_executable_uses_existing_local_path_translation(monkeypatch):
     assert result["resolved_executable"].startswith("/mnt/c/")
 
 
-def test_diagnostics_report_missing_pages_without_ocr_or_writes(vault, monkeypatch):
+@pytest.mark.parametrize("available", [False, True])
+def test_diagnostics_report_missing_pages_without_ocr_or_writes(vault, monkeypatch, available):
     root, source, zotero, agent, pipeline = vault
     enable_ocr(pipeline)
     path = make_pdf(source / "mixed.pdf", ["text", "scan"])
     zotero.paper("PAPER001", [("PDF00001", path, "main")])
     monkeypatch.setattr(sources, "ocr_page", lambda *a: pytest.fail("Diagnostics must not run OCR"))
-    monkeypatch.setattr(sources.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        sources.shutil, "which", lambda name: "/synthetic/tesseract" if available else None
+    )
     before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
     report = pipeline.sync(dry_run=True)
     assert report["processable"] == ["PAPER001"]
     assert "PAPER001" in report["partial_candidates"]
     assert report["page_processing"]["PDF00001"][1]["extraction_status"] == "unprocessed"
+    assert report["ocr"]["enabled"] is True
+    page = report["page_processing"]["PDF00001"][1]
+    assert page["ocr_configured_enabled"] is True and page["ocr_attempted"] is False
+    assert "OCR not run during native-text-only diagnostics" in page["reason"]
+    assert "OCR disabled" not in json.dumps(report)
     agent.command_prefix = lambda: ["fake-codex"]
     agent.authenticate = lambda: None
     monkeypatch.setattr(
@@ -360,10 +368,76 @@ def test_diagnostics_report_missing_pages_without_ocr_or_writes(vault, monkeypat
         ),
     )
     doctor = pipeline.doctor()
-    assert doctor["ocr"]["status"] == "unavailable"
+    assert doctor["ocr"]["enabled"] is True
+    assert doctor["ocr"]["status"] == ("available" if available else "unavailable")
+    assert doctor["config_file"] == str(root / "config.yaml")
     assert doctor["pdf_pages"]["PDF00001"][1]["extraction_status"] == "unprocessed"
     assert doctor["warnings"] and not doctor["blocking_errors"]
+    assert (
+        "OCR not run during native-text-only diagnostics"
+        in doctor["pdf_pages"]["PDF00001"][1]["reason"]
+    )
+    assert "OCR disabled" not in json.dumps(doctor)
     assert before == {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert not agent.calls
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_inspection_preserves_configured_ocr_setting_and_actual_read_coverage(
+    tmp_path, monkeypatch, enabled
+):
+    path = make_pdf(tmp_path / "inspection.pdf", ["text", "scan"])
+    settings = {**sources.OCR_DEFAULTS, "enabled": enabled}
+    before = dict(settings)
+    monkeypatch.setattr(
+        sources, "ocr_page", lambda *a: pytest.fail("Inspection must not invoke OCR")
+    )
+    pages = sources.inspect_pdf(path, "PDF00001", settings)
+    assert settings == before
+    assert [p["extraction_status"] for p in pages] == ["text", "unprocessed"]
+    assert all(
+        p["ocr_configured_enabled"] is enabled and not p["ocr_attempted"]
+        for p in sources.page_coverage(pages)
+    )
+    assert all(p["diagnostic_only"] for p in pages)
+    assert ("OCR disabled" in pages[1]["reason"]) is (not enabled)
+    assert not sources.extraction_complete(pages)
+
+
+def test_manuscript_diagnostics_do_not_misreport_enabled_ocr(vault, monkeypatch):
+    root, source, _, agent, pipeline = vault
+    enable_ocr(pipeline)
+    path = make_pdf(source / "manuscript.pdf", ["text", "scan"])
+    work = {
+        "id": "draft",
+        "title": "Draft",
+        "document_type": "manuscript",
+        "status": "draft",
+        "source_type": "pdf",
+        "source_path": str(path),
+    }
+    (root / "works.yaml").write_text(yaml.safe_dump({"works": [work]}))
+    monkeypatch.setattr(
+        sources, "ocr_page", lambda *a: pytest.fail("Diagnostics must not invoke OCR")
+    )
+    agent.command_prefix = lambda: ["fake-codex"]
+    agent.authenticate = lambda: None
+    monkeypatch.setattr(
+        "research_vault.pipeline.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a, 0, "--ignore-user-config --ignore-rules --ephemeral --output-schema", ""
+        ),
+    )
+    dry = pipeline.sync(dry_run=True)
+    doctor = pipeline.doctor()
+    for page in (
+        dry["page_processing"]["work:draft"][1],
+        doctor["manuscripts"][0]["page_processing"][1],
+    ):
+        assert page["ocr_configured_enabled"] is True
+        assert "OCR not run during native-text-only diagnostics" in page["reason"]
+        assert "OCR disabled" not in page["reason"]
+    assert pipeline.config.ocr["enabled"] is True
     assert not agent.calls
 
 

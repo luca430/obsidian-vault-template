@@ -62,7 +62,16 @@ def page_coverage(pages: list[dict]) -> list[dict]:
     return [
         {
             k: p[k]
-            for k in ("source", "locator", "extraction_status", "incomplete", "reason")
+            for k in (
+                "source",
+                "locator",
+                "extraction_status",
+                "incomplete",
+                "reason",
+                "diagnostic_only",
+                "ocr_configured_enabled",
+                "ocr_attempted",
+            )
             if k in p
         }
         for p in pages
@@ -152,6 +161,24 @@ def pdf(path: Path, source: str, ocr: dict | None = None, page_cache=None) -> li
                 raise VaultError("PDF has no pages")
     except Exception as exc:
         raise VaultError(f"Unreadable PDF {path.name}: {exc}") from exc
+    return pages
+
+
+def inspect_pdf(path: Path, source: str, settings: dict) -> list[dict]:
+    """Inspect native text without confusing skipped diagnostic work with configuration."""
+    pages = pdf(path, source, {**settings, "enabled": False})
+    for page in pages:
+        page.update(
+            diagnostic_only=True, ocr_configured_enabled=settings["enabled"], ocr_attempted=False
+        )
+        if settings["enabled"]:
+            old = "OCR disabled; no OCR was performed"
+            replacement = "OCR not run during native-text-only diagnostics; OCR is enabled for synchronization"
+            if "reason" in page:
+                page["reason"] = page["reason"].replace(old, replacement)
+            page["extraction_warnings"] = [
+                warning.replace(old, replacement) for warning in page.get("extraction_warnings", [])
+            ]
     return pages
 
 

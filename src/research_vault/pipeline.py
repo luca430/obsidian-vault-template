@@ -33,10 +33,10 @@ from .reviews import (
 from .runtimes import LLMRunner
 from .sources import (
     coverage_error,
+    inspect_pdf,
     manuscript,
     ocr_diagnostics,
     page_coverage,
-    pdf,
     usable_pages,
 )
 from .storage import (
@@ -320,11 +320,7 @@ class Pipeline:
                 works[key] = manuscript(
                     self.config,
                     work,
-                    (
-                        lambda path, source, sha: pdf(
-                            path, source, {**self.config.ocr, "enabled": False}
-                        )
-                    )
+                    (lambda path, source, sha: inspect_pdf(path, source, self.config.ocr))
                     if dry_run
                     else processor.extract,
                 )
@@ -366,10 +362,10 @@ class Pipeline:
                     if attachment["classification"] == "ignore" or attachment.get("error"):
                         continue
                     try:
-                        extracted = pdf(
+                        extracted = inspect_pdf(
                             Path(attachment["path"]),
                             attachment["key"],
-                            {**self.config.ocr, "enabled": False},
+                            self.config.ocr,
                         )
                         page_diagnostics[attachment["key"]] = page_coverage(extracted)
                         pages.extend(usable_pages(extracted))
@@ -423,7 +419,7 @@ class Pipeline:
             "partial_candidates": partial_candidates,
             "page_processing": page_diagnostics,
             "ocr": ocr_diagnostics(self.config.ocr),
-            "extraction_diagnostic_note": "Dry runs inspect native text only; OCR is attempted only during synchronization.",
+            "extraction_diagnostic_note": "Dry runs inspect native text only; OCR is not run during diagnostics. The configured OCR setting is unchanged and applies during synchronization.",
             "estimated_document_operations": len([k for k in changed_papers if k not in skipped])
             + len(works)
             if not dry_run
@@ -1153,11 +1149,12 @@ class Pipeline:
         checks = {
             "environment": environment(),
             "python": __import__("sys").executable,
+            "config_file": str(self.root / "config.yaml"),
             "blocking_errors": [],
             "warnings": [],
             "ocr": ocr_diagnostics(self.config.ocr),
             "pdf_pages": {},
-            "extraction_diagnostic_note": "Native text inspection only; doctor does not run OCR. Availability does not verify language data or recognition quality.",
+            "extraction_diagnostic_note": "Native text inspection only; doctor does not run OCR. The configured OCR setting is unchanged and applies during synchronization. Availability does not verify language data or recognition quality.",
         }
         if checks["ocr"]["status"] == "unavailable":
             checks["warnings"].append(
@@ -1183,10 +1180,10 @@ class Pipeline:
                         )
                     elif checks["pymupdf"] == "ok":
                         try:
-                            pages = pdf(
+                            pages = inspect_pdf(
                                 Path(attachment["path"]),
                                 attachment["key"],
-                                {**self.config.ocr, "enabled": False},
+                                self.config.ocr,
                             )
                             checks["pdf_pages"][attachment["key"]] = page_coverage(pages)
                             issue = coverage_error(pages)
@@ -1213,9 +1210,7 @@ class Pipeline:
                 document = manuscript(
                     self.config,
                     work,
-                    lambda path, source, sha: pdf(
-                        path, source, {**self.config.ocr, "enabled": False}
-                    ),
+                    lambda path, source, sha: inspect_pdf(path, source, self.config.ocr),
                 )
                 issue = coverage_error(document["pages"])
                 if issue:
