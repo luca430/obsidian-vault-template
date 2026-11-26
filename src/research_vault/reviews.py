@@ -6,6 +6,7 @@ import json
 import subprocess
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from .agents import no_edges, normalized, validate_note_evidence, validate_output, validate_summary
@@ -192,6 +193,10 @@ def read_reviews(root: Path, registry: dict) -> dict[str, dict]:
                 f"Registered review is missing: {record['path']}; restore it from backup"
             )
         meta, _ = frontmatter(path.read_text(encoding="utf-8"))
+        # Obsidian may unquote this timestamp; PyYAML then returns a datetime.
+        # Normalize only this metadata field, preserving all payload checks.
+        if isinstance(meta.get("proposed_at"), datetime):
+            meta["proposed_at"] = meta["proposed_at"].isoformat()
         permitted = {"id", "kind", "proposed_at", "status", *record["payload"]}
         if record["kind"] == "removal":
             permitted.add("decision")

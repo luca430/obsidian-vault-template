@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import datetime, timedelta
 
 import pytest
 from conftest import decide, link, write_pdf
@@ -114,6 +115,73 @@ def test_rejected_claims_do_not_publish_or_reappear_on_full_sync(vault):
     assert pipeline.sync(full=True)["complete"]
     assert len(proposals(pipeline, "claim")) == 1
     assert pipeline.status()["pending_claim_reviews"] == 0
+    assert not (root / "Literature/PAPER001.md").exists()
+
+
+@pytest.mark.parametrize("timestamp_style", ["iso", "space", "utc_suffix"])
+def test_claim_approval_accepts_unquoted_yaml_timestamp(vault, timestamp_style):
+    root, _, _, agent, pipeline = vault
+    add_paper(vault)
+    uncertain_summaries(agent)
+    pipeline.sync()
+    pid, record = next(iter(proposals(pipeline, "claim").items()))
+    decide(root, pipeline.state(), pid)
+    path = root / record["path"]
+    text = path.read_text()
+    timestamp = record["proposed_at"]
+    rendered = {
+        "iso": timestamp,
+        "space": timestamp.replace("T", " "),
+        "utc_suffix": timestamp.replace("+00:00", "Z"),
+    }[timestamp_style]
+    lines = text.splitlines(keepends=True)
+    path.write_text("".join(
+        f"proposed_at: {rendered}\n" if line.startswith("proposed_at:") else line
+        for line in lines
+    ))
+    assert isinstance(frontmatter(path.read_text())[0]["proposed_at"], datetime)
+
+    preview = pipeline.apply(dry_run=True)
+    assert "Literature/PAPER001.md" in preview["changes"]
+    assert not pipeline.state()["proposals"][pid]["applied"]
+    assert not (root / "Literature/PAPER001.md").exists()
+    pipeline.apply()
+    assert pipeline.state()["proposals"][pid]["applied"]
+    assert (root / "Literature/PAPER001.md").exists()
+
+
+@pytest.mark.parametrize("change", [
+    "changed_timestamp", "naive_timestamp", "date_only", "changed_payload",
+    "extra_field", "missing_field",
+])
+def test_yaml_timestamp_normalization_preserves_review_integrity(vault, change):
+    root, _, _, agent, pipeline = vault
+    add_paper(vault)
+    uncertain_summaries(agent)
+    pipeline.sync()
+    pid, record = next(iter(proposals(pipeline, "claim").items()))
+    decide(root, pipeline.state(), pid)
+    path = root / record["path"]
+    meta, body = frontmatter(path.read_text())
+    timestamp = datetime.fromisoformat(record["proposed_at"])
+    meta["proposed_at"] = timestamp
+    if change == "changed_timestamp":
+        meta["proposed_at"] = timestamp + timedelta(seconds=1)
+    elif change == "naive_timestamp":
+        meta["proposed_at"] = timestamp.replace(tzinfo=None)
+    elif change == "date_only":
+        meta["proposed_at"] = timestamp.date()
+    elif change == "changed_payload":
+        meta["draft"]["summary"] = "A changed scientific assertion."
+    elif change == "extra_field":
+        meta["unexpected"] = "Unregistered field"
+    else:
+        del meta["source_fingerprint"]
+    path.write_text(markdown(meta, body))
+
+    with pytest.raises(VaultError, match="Review payload was changed"):
+        pipeline.apply(dry_run=True)
+    assert not pipeline.state()["proposals"][pid]["applied"]
     assert not (root / "Literature/PAPER001.md").exists()
 
 
