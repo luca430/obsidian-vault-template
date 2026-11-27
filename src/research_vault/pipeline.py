@@ -17,10 +17,12 @@ from .agents import (
 from .cancellation import check_cancelled
 from .config import ROLES, Config
 from .identities import literature_path
+from .inference_errors import AllowanceExhausted, OperationDeferred, RateLimited
 from .notes import bibliography, diagnostics, impact, read_notes, summary_content, update_note
+from .operations import OperationStore
 from .paths import environment
 from .processing import Processor
-from .recipes import reasoning_recipe, stage_recipe
+from .recipes import content_recipe, reasoning_recipe, stage_recipe
 from .registry import Registry
 from .review_state import candidate_groups, concept_catalog, migrate_matching_dependencies
 from .review_workflow import readiness, select_reviews
@@ -127,6 +129,24 @@ class Pipeline:
             ]
         )
 
+    def retry_limit(self, record):
+        role = record.get("processing_role") or (
+            "manuscript" if str(record.get("note", "")).startswith("My Work/") else "literature"
+        )
+        return (
+            self.config.runtime(role)[1]
+            .get("retry_policy", {})
+            .get("max_attempts", self.config.processing("max_retry_attempts"))
+        )
+
+    def graph_retry_limit(self):
+        return max(
+            self.config.runtime(role)[1]
+            .get("retry_policy", {})
+            .get("max_attempts", self.config.processing("max_retry_attempts"))
+            for role in ("concepts", "linking", "synthesis", "maintenance")
+        )
+
     def synchronization_status(self, state, reviews, notes=None):
         previous = (state.get("last_report") or {}).get("status")
         if previous == "failed":
@@ -137,16 +157,12 @@ class Pipeline:
         if state.get("graph_error"):
             return (
                 "failed"
-                if state.get("graph_retry_attempts", 0)
-                >= self.config.processing("max_retry_attempts")
+                if state.get("graph_retry_attempts", 0) >= self.graph_retry_limit()
                 else "incomplete_resumable"
             )
         if any(
-            r.get("status") == "pending"
-            or (
-                r.get("retryable")
-                and r.get("attempts", 0) < self.config.processing("max_retry_attempts")
-            )
+            r.get("status") in {"pending", "running", "deferred"}
+            or (r.get("retryable") and r.get("attempts", 0) < self.retry_limit(r))
             for r in records
         ):
             return "incomplete_resumable"
@@ -327,9 +343,49 @@ class Pipeline:
             r.get("suppressed_duplicates", 0) for r in state["proposals"].values()
         )
         recipe = reasoning_recipe(self.config)
-        summary_recipe = self.recipe("literature")
-        manuscript_recipe = self.recipe("manuscript")
-        processor = Processor(self.config, self.agent, recipe, self.progress, full)
+        summary_recipe = content_recipe(self.config, "literature")
+        manuscript_recipe = content_recipe(self.config, "manuscript")
+        if state.get("recipe_policy") != 2:
+            for r in state["papers"].values():
+                if r.get("status", "successful") == "successful" and r.get(
+                    "summary_recipe"
+                ) == stage_recipe(self.config, "literature", legacy=True):
+                    r["summary_recipe"] = summary_recipe
+            for r in state["works"].values():
+                if r.get("status", "successful") == "successful" and r.get(
+                    "recipe"
+                ) == stage_recipe(self.config, "manuscript", legacy=True):
+                    r["recipe"] = manuscript_recipe
+            for name, r in state.get("concept_registry", {}).get("documents", {}).items():
+                if (
+                    name in notes
+                    and r.get("fingerprint") == digest(scientific_text(notes[name]))
+                    and r.get("recipe") == stage_recipe(self.config, "concepts", legacy=True)
+                ):
+                    r["recipe"] = content_recipe(self.config, "concepts")
+            legacy_graph_recipe = digest(
+                [
+                    stage_recipe(self.config, role, legacy=True)
+                    for role in ("concepts", "linking", "synthesis", "maintenance", "retrieval")
+                ]
+            )
+            if state.get("graph_recipe") == legacy_graph_recipe and not state.get("graph_error"):
+                if state.get("graph_notes") == {
+                    n: digest(scientific_text(t)) for n, t in notes.items()
+                }:
+                    state["graph_digest"] = graph_signature(notes, recipe)
+                state["graph_recipe"] = recipe
+            state["recipe_policy"] = 2
+        processor = Processor(
+            self.config,
+            self.agent,
+            recipe,
+            self.progress,
+            full,
+            dry_run=dry_run,
+            retry=retry,
+            operation_budget=self.config.processing("startup_max_operations") if startup else None,
+        )
         self.current_processor = processor
         identified = {}
         for name, text in sorted(notes.items()):
@@ -380,7 +436,9 @@ class Pipeline:
 
         def select_paper(key, item):
             old = state["papers"].get(key, {})
-            attempt = digest([source_signature(item), summary_recipe])
+            attempt = digest(
+                [source_signature(item), summary_recipe, stage_recipe(self.config, "literature")]
+            )
             previous_source = old.get("source_signature")
             changed = (
                 previous_source != source_signature(item)
@@ -401,10 +459,16 @@ class Pipeline:
                 else "source or summary recipe changed"
                 if changed or old.get("summary_recipe", summary_recipe) != summary_recipe
                 else "unfinished operation"
-                if old.get("status") == "pending"
+                if old.get("status") in {"pending", "running", "deferred"}
                 else "temporary failure retry"
                 if old.get("retryable")
-                and old.get("attempts", 0) < self.config.processing("max_retry_attempts")
+                and old.get("attempts", 0)
+                < self.config.runtime("literature")[1]
+                .get("retry_policy", {})
+                .get("max_attempts", self.config.processing("max_retry_attempts"))
+                else "unfinished agent configuration changed"
+                if old.get("status") == "failed"
+                and old.get("agent_recipe") != stage_recipe(self.config, "literature")
                 else "missing generated note"
                 if paths[key] not in notes and not old.get("claim_review") and old.get("processed")
                 else None
@@ -461,10 +525,17 @@ class Pipeline:
                             or old.get("completeness", "complete") != "complete"
                         )
                     )
-                    and old.get("status", "successful") != "pending"
+                    and old.get("status", "successful") not in {"pending", "running", "deferred"}
+                    and not (
+                        old.get("status") == "failed"
+                        and old.get("agent_recipe") != stage_recipe(self.config, "manuscript")
+                    )
                     and not (
                         old.get("retryable")
-                        and old.get("attempts", 0) < self.config.processing("max_retry_attempts")
+                        and old.get("attempts", 0)
+                        < self.config.runtime("manuscript")[1]
+                        .get("retry_policy", {})
+                        .get("max_attempts", self.config.processing("max_retry_attempts"))
                     )
                     and old.get("source") == str(self.config.authorized(work["source_path"]))
                     and files
@@ -618,9 +689,17 @@ class Pipeline:
             full
             or retry
             or state.get("graph_attempt_signature") != graph_input
-            or state.get("graph_retry_attempts", 0) < self.config.processing("max_retry_attempts")
+            or state.get("graph_retry_attempts", 0) < self.graph_retry_limit()
         )
-        graph_auth = not startup and (
+        graph_auth = (
+            not startup
+            or state.get("graph_deferred")
+            or any(
+                r.get("role") in {"concepts", "linking", "synthesis", "maintenance"}
+                and r["status"] != "completed"
+                for r in processor.tasks.records.values()
+            )
+        ) and (
             (graph_needed and graph_eligible)
             or any(k not in skipped for k in changed_papers)
             or bool(works)
@@ -657,6 +736,7 @@ class Pipeline:
                 attempt_fingerprint=attempt,
                 source_signature=source_signature(snapshot[key]),
                 summary_recipe=summary_recipe,
+                agent_recipe=stage_recipe(self.config, "literature"),
                 metadata=snapshot[key]["metadata"],
                 fingerprint=digest([snapshot[key]["fingerprint"], summary_recipe]),
             )
@@ -673,7 +753,11 @@ class Pipeline:
                 }
         for work in registered:
             if work["id"] in changed_works:
-                state["works"].setdefault(work["id"], {})["status"] = "pending"
+                state["works"].setdefault(work["id"], {}).update(
+                    status="pending",
+                    processing_role="manuscript",
+                    agent_recipe=stage_recipe(self.config, "manuscript"),
+                )
         state.update(
             identity=self.config.identity,
             server=self.zotero.server,
@@ -700,6 +784,30 @@ class Pipeline:
                 if text != notes[path]:
                     notes[path] = text
                     presentation[path] = text
+        document_tasks = {}
+        for category, keys, role in (
+            ("papers", changed_papers, "literature"),
+            ("works", changed_works, "manuscript"),
+        ):
+            for key in keys:
+                record = state[category][key]
+                task = digest(
+                    [
+                        "document",
+                        category,
+                        key,
+                        record.get("source_signature") or record.get("fingerprint"),
+                        content_recipe(self.config, role),
+                    ]
+                )
+                document_tasks[(category, key)] = task
+                processor.tasks.plan(
+                    task,
+                    kind="document",
+                    role=role,
+                    provider=self.config.runtime(role)[0],
+                    document=key,
+                )
         # Membership is complete independently of attachment processing; never infer removals from I/O.
         self.save(state, presentation)
         failed, partial = {}, {}
@@ -716,6 +824,16 @@ class Pipeline:
             )
             scheduled_papers = candidates[:limit]
             scheduled_works = changed_works[: max(0, limit - len(scheduled_papers))]
+        for category, keys, scheduled in (
+            ("papers", changed_papers, scheduled_papers),
+            ("works", changed_works, scheduled_works),
+        ):
+            for key in set(keys) - set(scheduled):
+                processor.tasks.update(
+                    document_tasks[(category, key)],
+                    "deferred",
+                    reason="Startup document budget; resume during the next manual/startup Sync",
+                )
         deferred = (
             len(changed_papers)
             + len(changed_works)
@@ -736,7 +854,12 @@ class Pipeline:
                 failed=len(failed),
             )
             item, old = snapshot[key], state["papers"][key]
+            task = document_tasks[("papers", key)]
+            processor.tasks.update(task, "running")
             try:
+                provider = self.config.runtime("literature")[0]
+                if provider in processor.blocked_providers:
+                    raise OperationDeferred(processor.blocked_providers[provider])
                 result, pages, attachment_errors, unavailable = self.process_paper(
                     key, item, old, processor, state
                 )
@@ -750,6 +873,14 @@ class Pipeline:
                             "completeness": old["completeness"],
                         },
                     )
+            except (AllowanceExhausted, OperationDeferred, RateLimited) as exc:
+                old.update(status="deferred", error=str(exc), retryable=False)
+                processor.tasks.update(
+                    task, "deferred", reason=str(exc), error_type=getattr(exc, "code", "deferred")
+                )
+                self.save(state)
+                completed += 1
+                continue
             except (AuthenticationError, IntegrationError):
                 raise
             except (OSError, VaultError) as exc:
@@ -770,6 +901,9 @@ class Pipeline:
                     skipped[key] = error
                     old.update(status="skipped", error=error, retryable=False)
                 warnings.append(f"Paper {key}: {error}; existing note retained.")
+                processor.tasks.update(
+                    task, "failed" if old.get("retryable") else "completed", reason=error
+                )
                 self.save(state)
                 completed += 1
                 continue
@@ -835,6 +969,7 @@ class Pipeline:
             if not verification:
                 old["passages"] = self.store_passages(key, item["fingerprint"], pages)
             self.save(state, changes)
+            processor.tasks.update(task, "completed")
             completed += 1
             successful_documents += 1
         for key in scheduled_works:
@@ -842,8 +977,13 @@ class Pipeline:
                 "manuscripts", current=key, processed=completed, remaining=total - completed
             )
             old = state["works"][key]
+            task = document_tasks[("works", key)]
+            processor.tasks.update(task, "running")
             if key in work_errors:
                 old.update(status="skipped", completeness="metadata_only", error=work_errors[key])
+                processor.tasks.update(
+                    task, "completed", reason="Source unavailable; coverage limitation retained"
+                )
                 self.save(state)
                 completed += 1
                 continue
@@ -853,10 +993,21 @@ class Pipeline:
             if issue:
                 partial[f"work:{key}"] = {"pages": issue}
             try:
+                provider = self.config.runtime("manuscript")[0]
+                if provider in processor.blocked_providers:
+                    raise OperationDeferred(processor.blocked_providers[provider])
                 result = processor.summarize("manuscript", source)
                 if any(file_hash(Path(p)) != h for p, h in source["files"].items()):
                     raise VaultError("Manuscript changed while summarizing; retry sync")
                 content = summary_content(result, source["pages"], source["metadata"])
+            except (AllowanceExhausted, OperationDeferred, RateLimited) as exc:
+                old.update(status="deferred", error=str(exc), retryable=False)
+                processor.tasks.update(
+                    task, "deferred", reason=str(exc), error_type=getattr(exc, "code", "deferred")
+                )
+                self.save(state)
+                completed += 1
+                continue
             except (AuthenticationError, IntegrationError):
                 raise
             except (OSError, VaultError) as exc:
@@ -869,6 +1020,12 @@ class Pipeline:
                     attempts=old.get("attempts", 0) + 1,
                 )
                 warnings.append(f"Manuscript {key} failed: {exc}")
+                processor.tasks.update(
+                    task,
+                    "failed",
+                    reason=str(exc),
+                    error_type=getattr(exc, "code", "source_failure"),
+                )
                 self.save(state)
                 completed += 1
                 continue
@@ -918,6 +1075,7 @@ class Pipeline:
                     f"work-{key}", source["fingerprint"], source["pages"]
                 )
             self.save(state, changes)
+            processor.tasks.update(task, "completed")
             completed += 1
             successful_documents += 1
         changes = {}
@@ -951,15 +1109,28 @@ class Pipeline:
             or bool(state.get("graph_error"))
         )
         graph_attempt = graph_signature(notes, recipe)
+        graph_profile = digest(
+            [
+                stage_recipe(self.config, role)
+                for role in ("concepts", "linking", "synthesis", "maintenance")
+            ]
+        )
+        if state.get("graph_error") and state.get("graph_agent_recipe") != graph_profile:
+            state["graph_retry_attempts"] = 0
+        state["graph_agent_recipe"] = graph_profile
         if state.get("graph_attempt_signature") != graph_attempt:
             state.update(graph_attempt_signature=graph_attempt, graph_retry_attempts=0)
         graph_retry_allowed = (
-            full
-            or retry
-            or state.get("graph_retry_attempts", 0) < self.config.processing("max_retry_attempts")
+            full or retry or state.get("graph_retry_attempts", 0) < self.graph_retry_limit()
         )
         graph_error = state.get("graph_error") if graph_needed and not graph_retry_allowed else None
-        if graph_needed and notes and not startup and graph_retry_allowed:
+        resume_graph = state.get("graph_deferred", False) or any(
+            r.get("role") in {"concepts", "linking", "synthesis", "maintenance"}
+            and r["status"] in {"pending", "running", "failed", "deferred"}
+            for r in processor.tasks.records.values()
+        )
+        graph_deferred = bool(startup and graph_needed and not resume_graph)
+        if graph_needed and notes and (not startup or resume_graph) and graph_retry_allowed:
             state["graph_retry_attempts"] = state.get("graph_retry_attempts", 0) + 1
             prior = state.get("graph_notes", {})
             changed = {
@@ -1023,7 +1194,7 @@ class Pipeline:
                     for role in ("linking", "synthesis", "maintenance"):
                         operation = digest(
                             [
-                                stage_recipe(self.config, role),
+                                content_recipe(self.config, role),
                                 role,
                                 {
                                     k: v
@@ -1038,6 +1209,24 @@ class Pipeline:
                             ]
                         )
                         ledger = state.setdefault("reasoning_operations", {})
+                        legacy_operation = digest(
+                            [
+                                stage_recipe(self.config, role, legacy=True),
+                                role,
+                                {
+                                    k: v
+                                    for k, v in payload.items()
+                                    if k
+                                    not in {
+                                        "existing_relationships",
+                                        "document_status",
+                                        "active_literature",
+                                    }
+                                },
+                            ]
+                        )
+                        if not full and legacy_operation in ledger and operation not in ledger:
+                            ledger[operation] = dict(ledger[legacy_operation])
                         if not full and operation in ledger:
                             processor.hits += 1
                             continue
@@ -1055,11 +1244,30 @@ class Pipeline:
                             else "scientific focus changed",
                         }
                         plan["reasoning_operations"].append(selection)
-                        result = processor.run(
-                            role,
-                            payload,
-                            lambda result: self.reasoning_changes(result, payload, state, notes),
-                        )
+                        task_id, _ = processor.plan_inference(role, payload)
+                        if startup and processor.calls >= self.config.processing(
+                            "startup_max_operations"
+                        ):
+                            processor.tasks.update(
+                                task_id,
+                                "deferred",
+                                reason="Startup inference budget; resume next Sync",
+                            )
+                            processor.deferred_operations.append(task_id)
+                            graph_deferred = True
+                            continue
+                        try:
+                            result = processor.run(
+                                role,
+                                payload,
+                                lambda result: self.reasoning_changes(
+                                    result, payload, state, notes
+                                ),
+                            )
+                        except (AllowanceExhausted, OperationDeferred, RateLimited) as exc:
+                            graph_error = str(exc)
+                            self.save(state)
+                            continue
                         registry, changes = self.reasoning_changes(result, payload, state, notes)
                         state["proposals"] = registry
                         selection["completed"] = True
@@ -1069,6 +1277,8 @@ class Pipeline:
                             "focus": payload["focus_fragment"]["note"],
                         }
                         self.save(state, changes)
+            except (AllowanceExhausted, OperationDeferred, RateLimited) as exc:
+                graph_error = str(exc)
             except (AuthenticationError, IntegrationError):
                 raise
             except (VaultError, OSError) as exc:
@@ -1080,7 +1290,7 @@ class Pipeline:
                     raise
                 graph_error = str(exc)
                 warnings.append(f"Conceptual reasoning incomplete: {exc}")
-            if not graph_error:
+            if not graph_error and not graph_deferred:
                 state.update(
                     graph_digest=graph_signature(notes, recipe),
                     graph_notes={n: digest(scientific_text(t)) for n, t in notes.items()},
@@ -1098,6 +1308,9 @@ class Pipeline:
             self.root, {p: v for p, v in state["proposals"].items() if p in reviews}, notes, reviews
         )
         state["graph_error"] = graph_error
+        state["graph_deferred"] = bool(graph_deferred)
+        if processor.blocked_providers or processor.deferred_operations:
+            state["graph_retry_attempts"] = 0
         outstanding = {
             k: r.get("error")
             for group in (state["papers"], state["works"])
@@ -1117,7 +1330,7 @@ class Pipeline:
             or partial
             or graph_error
             or deferred
-            or (startup and graph_needed)
+            or graph_deferred
             or outstanding
         )
         state["warnings"] = warnings
@@ -1128,7 +1341,7 @@ class Pipeline:
             failed=failed,
             partial=partial,
             deferred_documents=deferred,
-            reasoning_deferred=bool(startup and graph_needed),
+            reasoning_deferred=bool(graph_deferred),
             graph_error=graph_error,
             complete=complete,
             cache_hits=processor.hits,
@@ -1141,6 +1354,17 @@ class Pipeline:
                 for r in processor.operations
             ),
             evaluation_failures=processor.evaluation_failures,
+            usage_by_agent=processor.usage_by_agent(),
+            task_status=processor.tasks.summary(),
+            deferred_operations=[
+                r for r in processor.tasks.records.values() if r["status"] == "deferred"
+            ],
+            provider_interruptions=processor.blocked_providers,
+            resume_instructions=(
+                "After the provider allowance resets or the reported problem is fixed, run Sync (or startup synchronization). Completed tasks are retained; --full is not required."
+                if not complete
+                else None
+            ),
             pending_claim_reviews=counts(self.merged_reviews(state, {}), state["proposals"])[
                 "claim"
             ],
@@ -1159,20 +1383,14 @@ class Pipeline:
             for p, r in state["proposals"].items()
         )
         retry_pending = any(
-            r.get("status") == "pending"
-            or (
-                r.get("retryable")
-                and r.get("attempts", 0) < self.config.processing("max_retry_attempts")
-            )
+            r.get("status") in {"pending", "running", "deferred"}
+            or (r.get("retryable") and r.get("attempts", 0) < self.retry_limit(r))
             for group in (state["papers"], state["works"])
             for r in group.values()
         )
         plan.update(
             status="incomplete_resumable"
-            if (graph_error and graph_retry_allowed)
-            or retry_pending
-            or deferred
-            or (startup and graph_needed)
+            if (graph_error and graph_retry_allowed) or retry_pending or deferred or graph_deferred
             else "failed"
             if graph_error
             or any(
@@ -1211,7 +1429,7 @@ class Pipeline:
                 or retry_pending
                 or deferred
                 or failed
-                or (startup and graph_needed)
+                or graph_deferred
                 or any(
                     r.get("status") == "failed"
                     for group in (state["papers"], state["works"])
@@ -1222,6 +1440,8 @@ class Pipeline:
             human_reviews_pending=pending_total,
             approved_unapplied=approved_unapplied,
         )
+        if processor.blocked_providers or processor.deferred_operations or graph_deferred:
+            plan.update(status="incomplete_resumable", complete=False, technical_complete=False)
         if not processor.calls and not changed_papers and not changed_works:
             plan["message"] = (
                 "Vault is up to date; no inference was required."
@@ -1323,7 +1543,13 @@ class Pipeline:
                     summary="complete",
                     error=issue,
                 )
-            except (AuthenticationError, IntegrationError):
+            except (
+                AuthenticationError,
+                IntegrationError,
+                AllowanceExhausted,
+                OperationDeferred,
+                RateLimited,
+            ):
                 raise
             except (VaultError, OSError) as exc:
                 errors[attachment_key] = str(exc)
@@ -1344,7 +1570,7 @@ class Pipeline:
             return None, pages, errors, unavailable
         try:
             result = processor.combine("literature", summaries)
-        except AuthenticationError:
+        except (AuthenticationError, AllowanceExhausted, OperationDeferred, RateLimited):
             raise
         except (VaultError, OSError) as exc:
             errors["consolidation"] = str(exc)
@@ -1834,6 +2060,15 @@ class Pipeline:
             },
             "progress": read_json(inside(self.root, ".pipeline/progress.json")),
             "last_report": state.get("last_report"),
+            "task_status": OperationStore(self.root).summary(),
+            "usage_by_agent": (state.get("last_report") or {}).get("usage_by_agent", {}),
+            "provider_interruptions": (state.get("last_report") or {}).get(
+                "provider_interruptions", {}
+            ),
+            "resume_instructions": (state.get("last_report") or {}).get("resume_instructions"),
+            "deferred_operations": [
+                r for r in OperationStore(self.root).records.values() if r["status"] == "deferred"
+            ],
             "status": self.synchronization_status(state, reviews, read_notes(self.root)),
             "review_history": [
                 {
@@ -2050,6 +2285,8 @@ class Pipeline:
                 "cache_hits": processor.hits if processor else 0,
                 "completed_operations": processor.completed_operations if processor else 0,
                 "inference_metadata": processor.operations if processor else [],
+                "usage_by_agent": processor.usage_by_agent() if processor else {},
+                "task_status": processor.tasks.summary() if processor else {},
                 "archived_reviews": getattr(self, "archived_reviews", 0),
                 "new_proposals": len(
                     set(state["proposals"])

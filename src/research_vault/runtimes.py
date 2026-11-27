@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import uuid
 from typing import Protocol
@@ -20,6 +19,7 @@ from .agents import (
 )
 from .cancellation import run_process
 from .config import PROVIDERS, ROLES, Config
+from .inference_errors import InvalidModel, InvalidOutput, provider_error
 from .storage import VaultError, atomic, inside
 
 
@@ -67,9 +67,11 @@ class ClaudeCode(CLIAdapter):
     def environment(self) -> dict:
         # Preserve externally managed credentials and platform PATH; never log environment values.
         return {
-            **os.environ,
+            **{k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_RETRY_WATCHDOG"},
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "DISABLE_AUTOUPDATER": "1",
+            "CLAUDE_CODE_MAX_RETRIES": "0",
+            "MAX_STRUCTURED_OUTPUT_RETRIES": "1",
         }
 
     def authenticate(self) -> None:
@@ -117,7 +119,7 @@ class ClaudeCode(CLIAdapter):
             "--setting-sources",
             "",
             "--settings",
-            '{"disableAllHooks":true}',
+            '{"disableAllHooks":true,"fallbackModel":[],"autoContinueAtUsageLimit":false}',
             "--safe-mode",
             "--restricted",
             "--disable-slash-commands",
@@ -128,6 +130,9 @@ class ClaudeCode(CLIAdapter):
             str(staging / "instructions.txt"),
         ]
         settings = self.settings(role)
+        self.validate_model(role)
+        if settings.get("reasoning_effort"):
+            command.extend(["--effort", settings["reasoning_effort"]])
         if settings.get("model"):
             command.extend(["--model", settings["model"]])
         try:
@@ -139,7 +144,19 @@ class ClaudeCode(CLIAdapter):
                 encoding="utf-8",
                 cwd=staging,
                 timeout=settings.get("timeout_seconds", 600),
-                env=self.environment(),
+                env={
+                    **self.environment(),
+                    **(
+                        {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(settings["max_output_tokens"])}
+                        if settings.get("max_output_tokens")
+                        else {}
+                    ),
+                    **(
+                        {"CLAUDE_CODE_EFFORT_LEVEL": settings["reasoning_effort"]}
+                        if settings.get("reasoning_effort")
+                        else {}
+                    ),
+                },
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise VaultError(f"Claude Code {role} execution failed: {exc}") from exc
@@ -150,7 +167,7 @@ class ClaudeCode(CLIAdapter):
         except ValueError as exc:
             if process.returncode:
                 self.failure(process.returncode, process.stderr + "\n" + process.stdout)
-            raise VaultError(f"Claude Code {role} returned invalid JSON") from exc
+            raise InvalidOutput(f"Claude Code {role} returned invalid JSON") from exc
         if not isinstance(envelope, dict):
             raise VaultError("Claude Code response must be a JSON result object")
         self.last_metadata["usage"] = envelope.get("usage")
@@ -159,13 +176,28 @@ class ClaudeCode(CLIAdapter):
         if isinstance(envelope.get("modelUsage"), dict):
             self.last_metadata["model_usage"] = envelope["modelUsage"]
             self.last_metadata["resolved_models"] = sorted(envelope["modelUsage"])
+            if len(self.last_metadata["resolved_models"]) == 1:
+                resolved = self.last_metadata["resolved_models"][0]
+                self.last_metadata["resolved_model"] = resolved
+                requested = settings.get("model")
+                if requested and requested.startswith("claude-") and requested != resolved:
+                    raise InvalidModel(
+                        "Claude returned a different model than explicitly requested; output withheld"
+                    )
         if (
             process.returncode
             or envelope.get("is_error")
             or envelope.get("subtype", "success") != "success"
         ):
             self.failure(
-                process.returncode, process.stderr + "\n" + str(envelope.get("result", ""))
+                process.returncode,
+                process.stderr
+                + "\n"
+                + str(envelope.get("result", ""))
+                + "\n"
+                + json.dumps(
+                    {k: envelope[k] for k in ("errors", "error", "subtype") if k in envelope}
+                ),
             )
         if "structured_output" in envelope:
             result = envelope["structured_output"]
@@ -174,23 +206,13 @@ class ClaudeCode(CLIAdapter):
             try:
                 result = json.loads(envelope.get("result", ""))
             except (TypeError, ValueError) as exc:
-                raise VaultError("Claude Code returned no valid structured output") from exc
+                raise InvalidOutput("Claude Code returned no valid structured output") from exc
         atomic(staging / "output.json", json.dumps(result, ensure_ascii=False))
         return validate_output(role, result)
 
     @staticmethod
     def failure(code, detail):
-        if re.search(
-            r"unauthori[sz]ed|\b401\b|not logged in|authentication|token.{0,30}expired|invalid api key",
-            detail,
-            re.I,
-        ):
-            raise AuthenticationError(
-                "Claude Code authentication failed; run claude auth login in this environment"
-            )
-        raise VaultError(
-            f"Claude Code execution failed (exit {code}); inspect staged response.json and stderr.txt"
-        )
+        raise provider_error(detail, "claude", code=code)
 
 
 class LLMRunner:
@@ -223,6 +245,9 @@ class LLMRunner:
             adapter = self.adapters[provider]
             try:
                 adapter.probe()
+                for role in roles:
+                    if self.config.runtime(role)[0] == provider:
+                        adapter.validate_model(role)
                 adapter.authenticate()
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise VaultError(f"{provider} CLI preflight failed: {exc}") from exc

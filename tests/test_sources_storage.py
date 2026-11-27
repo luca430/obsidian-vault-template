@@ -199,7 +199,7 @@ def test_codex_failure_and_invalid_json_are_explicit(vault, monkeypatch):
         stderr = "Synthetic failure"
 
     monkeypatch.setattr("research_vault.agents.subprocess.run", lambda *a, **kw: Result())
-    with pytest.raises(VaultError, match=r"failed \(exit 1\)"):
+    with pytest.raises(VaultError, match=r"failed.*\(exit 1\)"):
         codex.run("linking", {})
 
     def invalid(command, **kwargs):

@@ -68,7 +68,13 @@ def mock_runtimes(vault, monkeypatch, transform=None, missing=(), unauthenticate
                     "is_error": False,
                     "structured_output": result,
                     "usage": {"input_tokens": 10, "output_tokens": 5},
-                    "modelUsage": {"synthetic-model": {"inputTokens": 10}},
+                    "modelUsage": {
+                        (
+                            command[command.index("--model") + 1]
+                            if "--model" in command
+                            else "synthetic-model"
+                        ): {"inputTokens": 10}
+                    },
                     "total_cost_usd": 0.01,
                 }
             )
@@ -177,7 +183,7 @@ def legacy_recipe(config, role):
 def test_codex_legacy_cache_keys_and_envelopes_remain_compatible(vault):
     root, _, _, agent, pipeline = vault
     for role in ROLES:
-        assert stage_recipe(pipeline.config, role) == legacy_recipe(pipeline.config, role)
+        assert stage_recipe(pipeline.config, role) != legacy_recipe(pipeline.config, role)
     role, payload, result = "linking", {"notes": {}}, {"links": []}
     key = digest([legacy_recipe(pipeline.config, role), role, payload])
     path = root / f".pipeline/cache/relationship_proposals/{key}.json"
@@ -212,11 +218,11 @@ def test_provider_switch_reuses_extraction_and_switch_back_reuses_codex_inferenc
     second = Pipeline(next_config, z, LLMRunner(next_config)).sync()
     assert second["complete"] and extracted == ["PDF00001"]
     assert stage_recipe(next_config, "extraction") == extraction_recipe
-    assert any(r["provider"] == "claude" and not r["cached"] for r in second["inference_metadata"])
+    assert second["inference_operations"] == 0  # Settings affect future tasks, not completed notes.
     before = len(agent.calls)
     third = Pipeline(old.config, z, LLMRunner(old.config)).sync()
     assert third["complete"] and len(agent.calls) == before
-    assert third["cache_hits"] and extracted == ["PDF00001"]
+    assert third["inference_operations"] == 0 and extracted == ["PDF00001"]
 
 
 def test_changing_link_provider_does_not_resummarize_sources(vault, monkeypatch):
@@ -232,9 +238,7 @@ def test_changing_link_provider_does_not_resummarize_sources(vault, monkeypatch)
     assert report["papers"] == []
     assert sum(role == "literature" for role, _ in agent.calls) == before
     assert stage_recipe(old.config, "literature") == previous
-    assert any(
-        r["role"] == "linking" and r["provider"] == "claude" for r in report["inference_metadata"]
-    )
+    assert report["inference_operations"] == 0
 
 
 def test_cli_override_is_run_only_and_overrides_all_role_providers(vault, monkeypatch, capsys):
@@ -515,8 +519,9 @@ def test_cache_metadata_is_integrity_checked_and_reused_usage_is_historical(vaul
     cached = json.loads(path.read_text())
     cached["metadata"]["provider"] = "claude"
     path.write_text(json.dumps(cached))
-    with pytest.raises(VaultError, match="cache is damaged"):
-        second.run("linking", {"notes": {}})
+    previous_calls = second.calls
+    second.run("linking", {"notes": {}})
+    assert second.calls == previous_calls + 1  # Only the corrupt receipt is recomputed.
 
 
 def test_optional_evaluation_with_legacy_injected_runner_reports_limitation(vault):

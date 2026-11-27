@@ -20,8 +20,106 @@ include separately hashed metadata with provider, requested model, CLI version,
 instruction versions, validation status, warnings and available usage. Legacy
 entries cannot supply historical CLI versions or usage. Scientific source
 extraction remains independent of provider, model, and inference instructions.
-Changed provider/model invalidates the affected inference stages; returning to an
-earlier provider can reuse its original results. No state schema migration occurs.
+Each new inference recipe includes the resolved model (when reported), effort,
+prompt version and effective agent settings. A separate content identity pins
+successful results: changing runtime settings does not regenerate existing
+scientific notes. New inputs, changed scientific instructions/processing recipes,
+or explicit full reprocessing use the new profile. A one-time recipe-policy rebase
+retains successful existing notes and compatible legacy caches.
+
+### Agent profiles and provider validation
+
+Configuration precedence is provider settings, `llm.defaults`, then
+`llm.agents.<role>`. Each role accepts provider, model, reasoning_effort,
+max_input_chars, output_reserve_chars, timeout_seconds and retry_policy
+(`max_attempts`, `retry_after_seconds`). Claude additionally accepts
+`max_output_tokens`. A run-only provider override does not transfer an incompatible
+agent model to the other provider. Consolidation inherits linking unless overridden.
+The plugin settings page exposes provider, model and reasoning-intensity dropdowns
+for each agent after **Load agent settings**. The Agent Settings command opens
+the same editor in a dialog. CLI login-status commands enable provider selection;
+Save rechecks login for changed effective profiles, without blocking unchanged
+profiles using a currently signed-out provider. Failed auth output is not exposed.
+Refresh preserves staged choices; no login flow, polling or inference is started.
+Codex model metadata supplies model-specific intensity options; configured catalogs
+take precedence. Claude's documented Sonnet/Opus aliases expose conservative common
+efforts, while Haiku uses default/inherited effort unless a catalog declares its
+capabilities. Aliases do not certify account entitlement or the resolved version.
+Provider switches visibly reset the affected model and effort to CLI defaults;
+models from the previous provider are not transferred. Unsupported saved choices
+remain visible until corrected, and no replacement model is silently selected.
+The editor stages all changes until explicit Save;
+Python validates and atomically saves only the `llm` mapping under the vault lock,
+rejecting concurrent edits. It starts no inference or synchronization.
+
+Codex translates effort to `-c model_reasoning_effort=...`; Claude uses `--effort`
+and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. Codex exec has no supported native output-token
+cap in this adapter, so that setting is rejected for Codex; output_reserve_chars
+remains an estimate for request budgeting. Character counts are not token counts.
+Claude's limits are subject to provider/model caps. Timeout applies to each CLI
+request, and retries happen only during eligible subsequent synchronization.
+Claude CLI transport retries and structured-output loops are bounded; automatic
+usage-limit continuation, watchdog retries and fallback models are disabled.
+See the official [Claude CLI reference](https://code.claude.com/docs/en/cli-reference),
+[environment variables](https://code.claude.com/docs/en/env-vars),
+[settings reference](https://code.claude.com/docs/en/settings-reference), and
+[Codex configuration reference](https://developers.openai.com/codex/config-reference/).
+
+Malformed settings and provider-incompatible effort names fail before inference.
+An optional `llm.model_catalog` maps providers to allowed exact model IDs and
+`reasoning_efforts` (plus optional max_output_tokens ceiling); it is a locally
+maintained capability allowlist. Known Codex effort capabilities also use its
+local model metadata. Without a catalog, account access and unknown model support
+are checked by actual provider responses, without speculative validation requests.
+Explicit full Claude model substitutions are rejected. CLI aliases/defaults resolve
+according to the provider; an unreported actual model remains unknown in receipts.
+No replacement model/provider is selected after failure. Host-managed provider
+policies and account entitlements cannot be certified offline.
+
+### Task receipts and resumption
+
+Each operation has an atomic JSON receipt under `.pipeline/operations/`. Extraction,
+document integration and inference track pending, running, completed, failed and
+deferred states. Validated content-addressed outputs precede completed receipts;
+normal recovery resets orphaned running operations and validates saved output
+before reuse. A crash between cache publication and completion reuses that output.
+Corrupt/incomplete cache entries recompute only their affected operation. Scientific
+note integration still uses the existing transaction journal and ownership checks.
+
+Provider allowance exhaustion stops further inference requests to that provider
+for the run, persists completed work and defers unfinished tasks. Another provider
+may continue its configured tasks. Status records the interruption and instructions:
+restore the allowance, then run ordinary Sync or allow the next startup Sync.
+No `--full`, polling, timer or background worker is needed. Temporary rate limits
+have a distinct error and eligible-after time (provider Retry-After or configured
+retry_after_seconds). Authentication, unavailable model/effort, context exhaustion,
+and invalid/incomplete output remain separate diagnostics. Correct the cause and
+resume; `sync --retry` explicitly overrides exhausted retry ceilings/cooldowns.
+Scientific tasks never silently use a cheaper model on exhaustion.
+
+Startup has a finite new-inference budget (`startup_max_operations`, default 20)
+in addition to its document budget. Deferred graph operations resume on subsequent
+startup or manual Sync. Diagnostics include per-agent requests, cache hits,
+failures, tokens when reported, deferred operations, and persistent task counts.
+Cached historical token usage is never counted as a new request's usage.
+
+### Agent audit
+
+All surviving LLM roles need scientific or semantic judgment. There are no
+formatting-only agents to downgrade automatically. Explicit low-effort/lightweight
+profiles are available when the user chooses a suitable model; scientific roles
+should use models and effort suitable for their evidence and mathematics.
+
+| Work | Execution |
+| --- | --- |
+| Zotero metadata, identity, filenames and bibliographies | Deterministic Python |
+| Attachment rules, exact duplicate checks, chunking and retrieval scoring | Deterministic Python |
+| State, receipts, cache validation, schema/provenance validation | Deterministic Python |
+| Rendering, review deduplication, review application and approvals | Deterministic Python; exact human decisions govern integration |
+| Literature/manuscript extraction and hierarchical scientific consolidation | LLM literature/manuscript roles; scientific claims and uncertainty |
+| Concept extraction and conceptual relationships | LLM concepts/linking roles; semantic evidence assessment |
+| Synthesis and personal-note revision proposals | LLM synthesis/maintenance roles; advisory scientific reasoning |
+| Explicit concept consolidation comparison | LLM consolidation role; semantic equivalence is never inferred from names |
 
 `operations.jsonl` records domain validation and cached reuse; `inference.jsonl`
 records transport outcomes. A schema-valid transport result can subsequently fail
@@ -315,8 +413,8 @@ child that reports a lock error, but no concurrent synchronization can execute.
 The parent never overwrites a fast child's final report.
 
 An external launcher can use `sync --startup --background` for its startup event.
-Startup caps document jobs and defers concept extraction/reasoning; manual sync
-resumes them. It still needs a complete API snapshot and source hashing. WSL runs
+Startup caps document jobs and new inference requests; subsequent manual/startup
+sync resumes deferred document and graph operations. It still needs a complete API snapshot and source hashing. WSL runs
 validate the actual loopback endpoint and local attachment accessibility, independent
 of whether mirrored networking was configured correctly.
 

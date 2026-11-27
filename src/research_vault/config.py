@@ -23,6 +23,7 @@ PROCESSING_DEFAULTS = {
     "candidate_pool": 128,
     "startup_max_documents": 5,
     "max_retry_attempts": 3,
+    "startup_max_operations": 20,
 }
 
 OCR_DEFAULTS = {
@@ -36,6 +37,19 @@ OCR_DEFAULTS = {
 
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
+RUNTIME_FIELDS = {
+    "model",
+    "reasoning_effort",
+    "timeout_seconds",
+    "max_input_chars",
+    "output_reserve_chars",
+    "max_output_tokens",
+    "retry_policy",
+}
+EFFORTS = {
+    "codex": {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"},
+    "claude": {"low", "medium", "high", "xhigh", "max"},
+}
 PROVIDERS = ("codex", "claude")
 ROLES = (
     "literature",
@@ -65,9 +79,9 @@ class Config:
     provider_override: str | None = None
 
     @classmethod
-    def load(cls, root: Path) -> Config:
+    def load(cls, root: Path, *, data_override=None) -> Config:
         root = root.resolve()
-        data = load_yaml(inside(root, "config.yaml"))
+        data = load_yaml(inside(root, "config.yaml")) if data_override is None else data_override
         for field in ("zotero", "codex", "claude", "llm", "attachments", "processing", "ocr"):
             if not isinstance(data.get(field, {}), dict):
                 raise VaultError(f"{field} must be a mapping")
@@ -138,12 +152,15 @@ class Config:
                 raise VaultError(f"ocr.{field} must be a positive integer")
         if ocr["dpi"] > 600:
             raise VaultError("ocr.dpi must be at most 600")
-        return cls(root, data)
+        config = cls(root, data)
+        for role in ROLES:
+            config.runtime(role)
+        return config
 
     @staticmethod
     def validate_llm(data: dict) -> None:
         llm = data.get("llm", {})
-        if set(llm) - {"default_provider", "agents", "evaluation"}:
+        if set(llm) - {"default_provider", "defaults", "agents", "evaluation", "model_catalog"}:
             raise VaultError("Unknown llm configuration field")
         if llm.get("default_provider", "codex") not in PROVIDERS:
             raise VaultError("llm.default_provider must be codex or claude")
@@ -153,14 +170,42 @@ class Config:
         for role, override in roles.items():
             if isinstance(override, str):
                 override = {"provider": override}
-            if not isinstance(override, dict) or set(override) - {"provider", "model"}:
-                raise VaultError(f"llm.agents.{role} accepts only provider and model")
+            if not isinstance(override, dict) or set(override) - {"provider", *RUNTIME_FIELDS}:
+                raise VaultError(
+                    f"llm.agents.{role} accepts provider and supported runtime settings"
+                )
             if override.get("provider", llm.get("default_provider", "codex")) not in PROVIDERS:
                 raise VaultError(f"Unknown provider for {role}")
             if override.get("model") is not None and (
                 not isinstance(override["model"], str) or not override["model"].strip()
             ):
                 raise VaultError(f"Invalid model for {role}")
+            Config.validate_runtime(override, f"llm.agents.{role}")
+        defaults = llm.get("defaults", {})
+        Config.validate_runtime(defaults, "llm.defaults")
+        if "provider" in defaults:
+            raise VaultError("Use llm.default_provider for the global provider")
+        catalog = llm.get("model_catalog", {})
+        if not isinstance(catalog, dict) or set(catalog) - set(PROVIDERS):
+            raise VaultError("llm.model_catalog must map providers to model capabilities")
+        for provider, models in catalog.items():
+            if not isinstance(models, dict):
+                raise VaultError("Model catalog must be a mapping")
+            for model, capabilities in models.items():
+                if (
+                    not isinstance(model, str)
+                    or not isinstance(capabilities, dict)
+                    or set(capabilities) - {"reasoning_efforts", "max_output_tokens"}
+                ):
+                    raise VaultError("Invalid model capability record")
+                efforts = capabilities.get("reasoning_efforts", [])
+                if not isinstance(efforts, list) or any(
+                    not isinstance(e, str) or e not in EFFORTS[provider] for e in efforts
+                ):
+                    raise VaultError("Invalid model reasoning effort capability")
+                cap = capabilities.get("max_output_tokens")
+                if cap is not None and (type(cap) is not int or cap < 1):
+                    raise VaultError("Invalid model output-token capability")
         evaluation = llm.get("evaluation", {})
         if not isinstance(evaluation, dict) or set(evaluation) - {"enabled", "provider"}:
             raise VaultError("llm.evaluation accepts enabled and provider")
@@ -180,8 +225,14 @@ class Config:
                 "timeout_seconds",
                 "max_input_chars",
                 "output_reserve_chars",
+                "reasoning_effort",
+                "max_output_tokens",
+                "retry_policy",
             }:
                 raise VaultError(f"Unknown {provider} configuration field")
+            Config.validate_runtime(
+                {k: v for k, v in settings.items() if k != "executable"}, provider
+            )
             for key in ("executable", "model"):
                 value = settings.get(key)
                 if (key == "executable" and key in settings or value is not None) and (
@@ -198,6 +249,37 @@ class Config:
                     or settings.get(key, default) < minimum
                 ):
                     raise VaultError(f"{provider}.{key} must be an integer >= {minimum}")
+
+    @staticmethod
+    def validate_runtime(settings, label):
+        if not isinstance(settings, dict) or set(settings) - {"provider", *RUNTIME_FIELDS}:
+            raise VaultError(f"Invalid runtime settings in {label}")
+        model = settings.get("model")
+        if model is not None and (
+            not isinstance(model, str)
+            or not model.strip()
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/\[\]-]{0,159}", model)
+        ):
+            raise VaultError(f"Invalid model in {label}")
+        effort = settings.get("reasoning_effort")
+        if effort is not None and (
+            not isinstance(effort, str) or effort not in set.union(*EFFORTS.values())
+        ):
+            raise VaultError(f"Invalid reasoning_effort in {label}")
+        for key, minimum in (
+            ("max_input_chars", 1000),
+            ("output_reserve_chars", 0),
+            ("max_output_tokens", 1),
+            ("timeout_seconds", 1),
+        ):
+            if key in settings and (type(settings[key]) is not int or settings[key] < minimum):
+                raise VaultError(f"Invalid {label}.{key}")
+        policy = settings.get("retry_policy", {})
+        if not isinstance(policy, dict) or set(policy) - {"max_attempts", "retry_after_seconds"}:
+            raise VaultError(f"Invalid {label}.retry_policy")
+        for key, value in policy.items():
+            if type(value) is not int or value < (1 if key == "max_attempts" else 0):
+                raise VaultError(f"Invalid {label}.retry_policy.{key}")
 
     def with_provider(self, provider: str | None) -> Config:
         if provider is not None and provider not in PROVIDERS:
@@ -218,8 +300,38 @@ class Config:
         if selected not in PROVIDERS:
             raise VaultError(f"Unknown LLM provider: {selected}")
         settings = dict(self.data.get(selected, {}))
-        if selected == configured and "model" in override:
-            settings["model"] = override["model"]
+        for layer in (
+            self.data.get("llm", {}).get("defaults", {}),
+            {k: v for k, v in override.items() if k != "provider"}
+            if selected == configured
+            else {},
+        ):
+            policy = {**settings.get("retry_policy", {}), **layer.get("retry_policy", {})}
+            settings.update(layer)
+            if policy:
+                settings["retry_policy"] = policy
+        self.validate_runtime({k: v for k, v in settings.items() if k != "executable"}, role)
+        effort = settings.get("reasoning_effort")
+        if effort is not None and effort not in EFFORTS[selected]:
+            raise VaultError(f"{selected} does not support reasoning effort {effort}")
+        capabilities = self.data.get("llm", {}).get("model_catalog", {}).get(selected)
+        model = settings.get("model")
+        if capabilities is not None and model:
+            if model not in capabilities:
+                raise VaultError(
+                    f"Model {model} is unavailable in the configured {selected} catalog"
+                )
+            if effort is not None and effort not in capabilities[model].get(
+                "reasoning_efforts", []
+            ):
+                raise VaultError(f"Model {model} does not support effort {effort}")
+            cap = capabilities[model].get("max_output_tokens")
+            if cap and settings.get("max_output_tokens", 0) > cap:
+                raise VaultError(f"Model {model} does not support the requested output-token cap")
+        if selected == "codex" and settings.get("max_output_tokens") is not None:
+            raise VaultError(
+                "Codex exec cannot enforce a native max_output_tokens cap; use output_reserve_chars for request budgeting"
+            )
         return selected, settings
 
     def processing(self, key: str) -> int:

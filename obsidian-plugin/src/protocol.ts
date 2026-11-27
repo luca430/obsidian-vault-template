@@ -91,6 +91,9 @@ export interface Snapshot {
   status: PipelineStatus;
   stage: string;
   syncStatus?: string;
+  agentUsage?: RecordValue;
+  taskCounts?: RecordValue;
+  resumeInstructions?: string;
   processed?: number;
   remaining?: number;
   skipped?: number;
@@ -104,7 +107,7 @@ export interface Snapshot {
 
 export function progress(snapshot: Snapshot, value: RecordValue): void {
   if (typeof value.stage !== 'string') return;
-  snapshot.stage = value.stage;
+  snapshot.stage = value.stage + (typeof value.reason === 'string' ? `: ${value.reason}` : '');
   for (const key of ['processed', 'remaining', 'skipped', 'failed'] as const) {
     if (typeof value[key] === 'number') snapshot[key] = value[key];
   }
@@ -113,6 +116,9 @@ export function progress(snapshot: Snapshot, value: RecordValue): void {
 }
 
 export function statusDetails(snapshot: Snapshot, value: RecordValue): void {
+  if (isRecord(value.usage_by_agent)) snapshot.agentUsage = value.usage_by_agent;
+  if (isRecord(value.task_status)) snapshot.taskCounts = value.task_status;
+  snapshot.resumeInstructions = typeof value.resume_instructions === 'string' ? value.resume_instructions : undefined;
   if (typeof value.status === 'string') snapshot.syncStatus = value.status;
   if (isRecord(value.pending)) snapshot.pending = value.pending;
   if ('last_success' in value) snapshot.lastSuccess = typeof value.last_success === 'string' ? value.last_success : undefined;

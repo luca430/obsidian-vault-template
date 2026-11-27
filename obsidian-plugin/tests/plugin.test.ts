@@ -6,7 +6,8 @@ import { mkdtemp, mkdir, writeFile, chmod, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Element, Modal, Notice, TFile, WorkspaceLeaf } from 'obsidian';
-import Plugin, { COMMANDS, ResearchView } from '../src/main';
+import Plugin, { COMMANDS, ResearchView, ResearchSettingTab } from '../src/main';
+import { AgentSettingsEditor, AgentSettingsModal } from '../src/agent-settings';
 import { ACTION_ARGS, Runner, capture, prepare, Spawn } from '../src/execution';
 import { OutputParser, outcome, progress, redact, Snapshot, statusDetails } from '../src/protocol';
 import { defaults, defaultPython, loadSettings } from '../src/settings';
@@ -647,4 +648,142 @@ test('technical completion, source limitations and interruption have distinct pr
   const snapshot: Snapshot = { status: 'completed', stage: '', logs: [], diagnostics: [] };
   statusDetails(snapshot, { status: 'completed_reviews_pending', pending: { link: 1 } });
   assert.equal(snapshot.syncStatus, 'completed_reviews_pending');
+});
+
+
+const tree = (node: Element): Element[] => [node, ...node.children.flatMap(tree)];
+const pickerReport = (): Record<string, unknown> => ({
+  plan_token: 'a'.repeat(64), defaults: {}, agents: {}, default_provider: 'codex', provider_defaults: {},
+  providers: {
+    codex: { authenticated: true, message: 'Signed in', models: [{ id: 'precise-model', label: 'Precise', reasoning_efforts: ['low', 'high'], source: 'local metadata' }, { id: 'light-model', reasoning_efforts: ['low'], source: 'local metadata' }] },
+    claude: { authenticated: true, message: 'Signed in', models: [{ id: 'sonnet', label: 'Sonnet', reasoning_efforts: ['low', 'medium', 'high'], source: 'alias' }] },
+  },
+});
+const agentSection = (root: Element, role: string): Element => tree(root).find(node => node.children[0]?.text === role)!;
+const field = (root: Element, label: string): Element => {
+  const all = tree(root); const index = all.findIndex(node => node.text === label);
+  return all.slice(index + 1).find(node => node.events.has('change'))!;
+};
+const choose = (root: Element, label: string, value: string): void => { const input = field(root, label); input.value = value; input.events.get('change')!(); };
+
+test('agent settings editor stages dependent provider/model/intensity overrides until explicit save', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  let captured: Record<string, unknown> | undefined;
+  const modal = new AgentSettingsModal(plugin.app, pickerReport(), async request => { captured = request; return true; });
+  modal.open();
+  choose(agentSection(modal.contentEl, 'linking'), 'Provider', 'claude');
+  choose(agentSection(modal.contentEl, 'linking'), 'Model', 'sonnet');
+  const section = agentSection(modal.contentEl, 'linking');
+  assert.deepEqual(Object.keys(field(section, 'Reasoning intensity').options), ['', '__provider_default__', 'low', 'medium', 'high']);
+  choose(section, 'Reasoning intensity', 'high');
+  choose(agentSection(modal.contentEl, 'linking'), 'Maximum attempts', '4');
+  choose(agentSection(modal.contentEl, 'linking'), 'Rate-limit retry delay (seconds)', '120');
+  assert.equal(captured, undefined);
+  await tree(modal.contentEl).find(node => node.text === 'Save agent settings')!.events.get('click')!();
+  assert.deepEqual((captured!.agents as Record<string, unknown>).linking, { provider: 'claude', model: 'sonnet', reasoning_effort: 'high', retry_policy: {max_attempts: 4, retry_after_seconds: 120} });
+  assert.equal(captured!.plan_token, 'a'.repeat(64));
+  assert.ok(!('consolidation' in (captured!.agents as object)));
+  plugin.onunload();
+});
+
+test('provider switch updates model list and never transfers the previous model or effort', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const modal = new AgentSettingsModal(plugin.app, pickerReport(), async () => true); modal.open();
+  choose(agentSection(modal.contentEl, 'linking'), 'Model', 'precise-model');
+  choose(agentSection(modal.contentEl, 'linking'), 'Reasoning intensity', 'high');
+  choose(agentSection(modal.contentEl, 'linking'), 'Provider', 'claude');
+  const section = agentSection(modal.contentEl, 'linking');
+  assert.ok(field(section, 'Model').options.sonnet);
+  assert.ok(!field(section, 'Model').options['precise-model']);
+  assert.equal(field(section, 'Model').value, '__provider_default__');
+  assert.equal(field(section, 'Reasoning intensity').value, '__provider_default__');
+  plugin.onunload();
+});
+
+test('signed out providers cannot be selected and their current model selectors stay disabled', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const report = pickerReport(); (report.providers as Record<string, {authenticated:boolean}>).claude.authenticated = false;
+  report.agents = { linking: { provider: 'claude', model: 'sonnet' } };
+  const modal = new AgentSettingsModal(plugin.app, report, async () => true); modal.open();
+  assert.equal(field(agentSection(modal.contentEl, 'literature'), 'Provider').optionDisabled.claude, true);
+  assert.equal(field(agentSection(modal.contentEl, 'linking'), 'Model').disabled, true);
+  choose(agentSection(modal.contentEl, 'literature'), 'Provider', 'claude');
+  assert.equal(field(agentSection(modal.contentEl, 'literature'), 'Model').disabled, false);
+  assert.ok(!field(agentSection(modal.contentEl, 'literature'), 'Model').options.sonnet);
+  plugin.onunload();
+});
+
+test('model changes filter intensities and preserve unsupported saved values visibly', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const modal = new AgentSettingsModal(plugin.app, pickerReport(), async () => true); modal.open();
+  choose(agentSection(modal.contentEl, 'linking'), 'Model', 'precise-model');
+  choose(agentSection(modal.contentEl, 'linking'), 'Reasoning intensity', 'high');
+  choose(agentSection(modal.contentEl, 'linking'), 'Model', 'light-model');
+  const intensity = field(agentSection(modal.contentEl, 'linking'), 'Reasoning intensity');
+  assert.ok(intensity.options.high.includes('saved'));
+  assert.equal(intensity.optionDisabled.high, true);
+  assert.equal(intensity.value, 'high');
+  assert.ok(!intensity.options.medium && !intensity.options.max);
+  plugin.onunload();
+});
+
+test('plugin settings load agent selectors inline without opening another modal', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  plugin.execute = async () => pickerReport();
+  const tab = new ResearchSettingTab(plugin.app, plugin); tab.display();
+  const modals = Modal.opened.length;
+  await tree(tab.containerEl).find(node => node.text === 'Load agent settings')!.events.get('click')!();
+  assert.ok(agentSection(tab.containerEl, 'literature'));
+  assert.ok(agentSection(tab.containerEl, 'consolidation'));
+  assert.equal(Modal.opened.length, modals);
+  plugin.onunload();
+});
+
+test('refreshing login preserves staged choices and inline save refreshes the concurrency token', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const root = new Element(); let saved: Record<string, unknown> | undefined;
+  const editor = new AgentSettingsEditor(root as unknown as HTMLElement, pickerReport(), async request => { saved = request; return { ...pickerReport(), ...request, plan_token: 'b'.repeat(64) }; }, async () => pickerReport());
+  choose(agentSection(root, 'linking'), 'Model', 'precise-model');
+  await tree(root).find(node => node.text === 'Refresh login and models')!.events.get('click')!();
+  assert.equal(field(agentSection(root, 'linking'), 'Model').value, 'precise-model');
+  await tree(root).find(node => node.text === 'Save agent settings')!.events.get('click')!();
+  await tree(root).find(node => node.text === 'Save agent settings')!.events.get('click')!();
+  assert.equal(saved!.plan_token, 'b'.repeat(64));
+  assert.ok(editor);
+  plugin.onunload();
+});
+
+test('settings CLI arguments accept only a private request ID, never model text as command arguments', async () => {
+  const id = 'b'.repeat(32);
+  const command = await prepare('/vault', native, 'linux', 'saveAgentSettings', neverSpawn, noCheck, { settingsRequestId: id });
+  assert.deepEqual(command.args.slice(-4), ['settings', 'save', '--request-id', id]);
+  await assert.rejects(prepare('/vault', native, 'linux', 'saveAgentSettings', neverSpawn, noCheck, { settingsRequestId: '../bad' }), /Invalid agent settings/);
+});
+
+test('editing consolidation retains linking inheritance without sharing mutable retry settings', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const report = pickerReport(); report.agents = { linking: { provider: 'claude', model: 'sonnet', timeout_seconds: 77, retry_policy: {max_attempts: 3, retry_after_seconds: 30} } };
+  let saved: Record<string, unknown> | undefined;
+  const modal = new AgentSettingsModal(plugin.app, report, async request => { saved = request; return true; }); modal.open();
+  choose(agentSection(modal.contentEl, 'consolidation'), 'Model', 'sonnet');
+  choose(agentSection(modal.contentEl, 'consolidation'), 'Maximum attempts', '4');
+  await tree(modal.contentEl).find(node => node.text === 'Save agent settings')!.events.get('click')!();
+  const agents = saved!.agents as Record<string, Record<string, unknown>>;
+  assert.equal(agents.consolidation.provider, 'claude');
+  assert.equal(agents.consolidation.timeout_seconds, 77);
+  assert.deepEqual(agents.consolidation.retry_policy, {max_attempts: 4, retry_after_seconds: 30});
+  assert.deepEqual(agents.linking.retry_policy, {max_attempts: 3, retry_after_seconds: 30});
+  plugin.onunload();
+});
+
+test('changing the default provider clears inherited provider model overrides but preserves explicit providers', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const report = pickerReport(); report.agents = { literature: {model: 'precise-model', reasoning_effort: 'high'}, linking: {provider: 'codex', model: 'precise-model', reasoning_effort: 'high'} };
+  const modal = new AgentSettingsModal(plugin.app, report, async () => true); modal.open();
+  choose(modal.contentEl, 'Default provider', 'claude');
+  const literature = agentSection(modal.contentEl, 'literature');
+  assert.equal(field(literature, 'Model').value, '__provider_default__');
+  assert.ok(field(literature, 'Model').options.sonnet);
+  assert.equal(field(agentSection(modal.contentEl, 'linking'), 'Model').value, 'precise-model');
+  plugin.onunload();
 });

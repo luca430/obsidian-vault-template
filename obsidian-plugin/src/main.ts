@@ -2,6 +2,10 @@ import {
   App, FileSystemAdapter, ItemView, Modal, Notice, Plugin, PluginSettingTab,
   Setting, SuggestModal, TFile, WorkspaceLeaf,
 } from 'obsidian';
+import { randomBytes } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { AgentSettingsEditor, AgentSettingsModal } from './agent-settings';
 import { Action, ReviewSelection, Runner } from './execution';
 import { RecordValue, isRecord, outcome, redact, statusDetails } from './protocol';
 import { ResearchSettings, defaultPython, loadSettings } from './settings';
@@ -15,6 +19,7 @@ export const COMMANDS = [
   ['dashboard', 'Research: Open Dashboard'], ['reviews', 'Research: Open Review Queue'],
   ['review-history', 'Research: Open Review History'],
   ['review-readiness', 'Research: Review Readiness'],
+  ['agent-settings', 'Research: Agent Settings'],
 ] as const;
 
 class ConfirmModal extends Modal {
@@ -185,6 +190,14 @@ export class ResearchView extends ItemView {
       stats.createEl('dd', { text: typeof value === 'number' || typeof value === 'string' ? redact(String(value)) : 'Not reported' });
     }
     const controls = el.createDiv({ cls: 'research-vault-controls' });
+    if (state.resumeInstructions) el.createEl('p', { text: state.resumeInstructions });
+    if (state.taskCounts) el.createEl('p', { text: `Tasks: ${Object.entries(state.taskCounts).map(([name, count]) => `${name}: ${count}`).join(' · ')}` });
+    if (state.agentUsage && Object.keys(state.agentUsage).length) {
+      el.createEl('h3', { text: 'Inference usage by agent' });
+      for (const [agent, usage] of Object.entries(state.agentUsage)) {
+        if (isRecord(usage)) el.createEl('p', { text: `${agent}: ${usage.requests ?? 0} requests, ${usage.cache_hits ?? 0} cache hits, ${usage.failures ?? 0} failures, ${usage.deferred ?? 0} deferred. Tokens: ${JSON.stringify(usage.tokens ?? {})}` });
+      }
+    }
     for (const [action, label] of [['sync', 'Sync'], ['dry', 'Dry Run Sync'], ['apply', 'Apply Reviews'], ['doctor', 'Doctor'], ['status', 'Refresh Status']] as const) {
       const button = controls.createEl('button', { text: label });
       button.disabled = this.plugin.runner.busy;
@@ -225,6 +238,7 @@ export default class ResearchVaultPlugin extends Plugin {
         if (id === 'dashboard') void this.openDashboard();
         else if (id === 'reviews') this.openReviews();
         else if (id === 'review-history') this.openReviews(true);
+        else if (id === 'agent-settings') void this.openAgentSettings();
         else if (id === 'review-readiness') void this.previewReviews();
         else if (id === 'interrupt') void this.runner.interrupt().catch(error => new Notice(`Cannot interrupt synchronization: ${redact(String(error))}`));
         else this.request(id);
@@ -390,14 +404,42 @@ export default class ResearchVaultPlugin extends Plugin {
     modal.contentEl.createEl('pre', { text: JSON.stringify(result.record, null, 2), cls: 'research-vault-diagnostic' });
     modal.open();
   }
+  async openAgentSettings(): Promise<void> {
+    const report = await this.execute('agentSettings', true);
+    if (report && !this.runner.disposed) new AgentSettingsModal(this.app, report, request => this.saveAgentConfiguration(request), () => this.execute('agentSettings', true)).open();
+  }
+  async saveAgentConfiguration(request: RecordValue): Promise<RecordValue | undefined> {
+    if (this.runner.busy) throw new Error('Wait for the current command before saving settings.');
+    if (!(this.app.vault.adapter instanceof FileSystemAdapter)) throw new Error('A local filesystem vault is required.');
+    const root = this.app.vault.adapter.getBasePath();
+    const directory = path.join(root, '.pipeline');
+    await fs.mkdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
+    const info = await fs.lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('Settings requests require a local pipeline directory.');
+    const id = randomBytes(16).toString('hex');
+    const file = path.join(directory, `settings-request-${id}.json`);
+    await fs.writeFile(file, JSON.stringify(request), { flag: 'wx' });
+    try {
+      const result = await this.execute('saveAgentSettings', false, { settingsRequestId: id });
+      return result && this.runner.snapshot.status === 'completed' ? result : undefined;
+    } finally { await fs.unlink(file).catch(() => undefined); }
+  }
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
 }
 
-class ResearchSettingTab extends PluginSettingTab {
+export class ResearchSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: ResearchVaultPlugin) { super(app, plugin); }
   display(): void {
     const el = this.containerEl; el.empty();
     el.createEl('h2', { text: 'Research Vault' });
+    const agents = el.createDiv();
+    new Setting(agents).setName('Agent-specific models and reasoning').setDesc('Check CLI login status, then select provider, model and intensity for each agent here.').addButton(button => button.setButtonText('Load agent settings').onClick(async () => {
+      button.setDisabled(true);
+      try {
+        const report = await this.plugin.execute('agentSettings', true);
+        if (report && !this.plugin.runner.disposed) new AgentSettingsEditor(agents, report, request => this.plugin.saveAgentConfiguration(request), () => this.plugin.execute('agentSettings', true));
+      } finally { button.setDisabled(false); }
+    }));
     el.createEl('p', { text: 'Runs trusted local Python code. Zotero and LLM settings stay in config.yaml. Save settings before starting a command.' });
     const settings = this.plugin.settings;
     new Setting(el).setName('Execution environment').setDesc('Windows defaults to WSL; Linux defaults to Native. The virtual environment must match the selected environment.')

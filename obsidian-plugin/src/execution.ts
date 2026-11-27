@@ -12,9 +12,10 @@ export const ACTION_ARGS = {
   status: ['status'], doctor: ['doctor'],
   readiness: ['review', 'status'], refresh: ['review', 'refresh'], consolidate: ['concepts', 'suggest'],
   history: ['review', 'history'],
+  agentSettings: ['settings', 'show'], saveAgentSettings: ['settings', 'save'],
 } as const;
 export type Action = keyof typeof ACTION_ARGS;
-export interface ReviewSelection { proposalIds?: string[]; planToken?: string; id?: string; memberPaths?: string[]; controlId?: string }
+export interface ReviewSelection { proposalIds?: string[]; planToken?: string; id?: string; memberPaths?: string[]; controlId?: string; settingsRequestId?: string }
 export interface Command { executable: string; args: string[]; options: SpawnOptions }
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
 export const nodeSpawn: Spawn = (command, args, options) => spawn(command, args, options);
@@ -94,6 +95,10 @@ export async function prepare(
   const venvConfig = api.join(api.dirname(bin), 'pyvenv.cfg');
   let isVenv = false;
   const args = ['-u', script, '--vault', root, ...ACTION_ARGS[action]];
+  if (action === 'saveAgentSettings') {
+    if (!selection?.settingsRequestId || !/^[a-f0-9]{32}$/.test(selection.settingsRequestId)) throw new Error('Invalid agent settings request.');
+    args.push('--request-id', selection.settingsRequestId);
+  }
   if (selection?.controlId) {
     if (!['sync', 'full', 'startup', 'dry'].includes(action) || !/^[a-f0-9]{32}$/.test(selection.controlId)) throw new Error('Invalid sync control identifier.');
     args.push('--control-id', selection.controlId);
@@ -239,10 +244,15 @@ export class Runner {
       });
       this.snapshot.status = this.control?.interrupted ? 'failed' : outcome(code, result);
       if (typeof result?.status === 'string') this.snapshot.syncStatus = result.status;
+      if (result) {
+        if (isRecord(result.usage_by_agent)) this.snapshot.agentUsage = result.usage_by_agent;
+        if (isRecord(result.task_status)) this.snapshot.taskCounts = result.task_status;
+        this.snapshot.resumeInstructions = typeof result.resume_instructions === 'string' ? result.resume_instructions : undefined;
+      }
       this.snapshot.stage = `${action}: ${this.snapshot.status}`;
       if (!result) this.log('No final JSON report was available; inspect logs and run Research: Status.', settings.maxLogLines);
       if (result) {
-        for (const field of ['warnings', 'blocking_errors', 'document_errors', 'graph_error', 'reasoning_error', 'failed', 'skipped', 'partial'] as const) {
+        for (const field of ['warnings', 'blocking_errors', 'document_errors', 'graph_error', 'reasoning_error', 'provider_interruptions', 'resume_instructions', 'usage_by_agent', 'task_status', 'failed', 'skipped', 'partial'] as const) {
           const detail = result[field];
           if (detail && (!Array.isArray(detail) || detail.length) && (!isRecord(detail) || Object.keys(detail).length)) {
             this.snapshot.diagnostics.push(redact(`${field}: ${JSON.stringify(detail)}`).slice(0, 16000));

@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib.metadata import version
 from inspect import getsource
 
-from .agents import SCHEMAS
+from .agents import PROMPT_SUFFIX, SCHEMAS
 from .storage import digest, file_hash, inside
 
 # These explicit versions cover implementation changes, independently of role instructions.
@@ -31,7 +31,7 @@ NAMESPACES = {
 }
 
 
-def stage_recipe(config, stage, provider=None):
+def stage_recipe(config, stage, provider=None, *, legacy=False):
     if stage == "extraction":
         from .sources import pdf
 
@@ -61,7 +61,12 @@ def stage_recipe(config, stage, provider=None):
             "global_instructions": file_hash(inside(config.root, "AGENTS.md")),
             "role_instructions": file_hash(inside(config.root, f"agents/{stage}.md")),
             "model": {k: settings.get(k) for k in ("model", "executable")},
-            # Default Codex retains the exact pre-provider contract and existing cache keys.
+            **(
+                {"agent_configuration": settings, "prompt_version": digest(PROMPT_SUFFIX)}
+                if not legacy
+                else {}
+            ),
+            # Legacy receipts are imported only after current schema/provenance validation.
             **({"provider": selected, "adapter": 1} if selected != "codex" else {}),
             "chunking": {k: config.processing(k) for k in ("chunk_chars", "chunk_context_chars")}
             if stage in {"literature", "manuscript"}
@@ -76,7 +81,17 @@ def stage_recipe(config, stage, provider=None):
 def reasoning_recipe(config):
     return digest(
         [
-            stage_recipe(config, role)
+            content_recipe(config, role)
             for role in ("concepts", "linking", "synthesis", "maintenance", "retrieval")
         ]
     )
+
+
+def content_recipe(config, stage):
+    """Scientific invalidation excludes run-time choices; inference receipts retain them."""
+    if stage in {"extraction", "retrieval"}:
+        return stage_recipe(config, stage)
+    from dataclasses import replace
+
+    data = {**config.data, "codex": {}, "claude": {}, "llm": {}}
+    return stage_recipe(replace(config, data=data, provider_override=None), stage)

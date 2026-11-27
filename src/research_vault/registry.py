@@ -11,7 +11,7 @@ from collections import Counter
 from .agents import payload_budget, validate_note_evidence
 from .identities import registered_relationship_key, relationship_key
 from .processing import fragments, size, terms
-from .recipes import stage_recipe
+from .recipes import content_recipe, stage_recipe
 from .storage import VaultError, digest, frontmatter
 
 
@@ -60,7 +60,7 @@ class Registry:
             return False
         old = self.data["documents"].get(name, {})
         signature = digest(text)
-        concept_recipe = stage_recipe(config, "concepts")
+        concept_recipe = content_recipe(config, "concepts")
         index_recipe = stage_recipe(config, "retrieval")
         if (
             old.get("fingerprint") == signature

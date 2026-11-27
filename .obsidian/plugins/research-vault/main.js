@@ -32,53 +32,19 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 var main_exports = {};
 __export(main_exports, {
   COMMANDS: () => COMMANDS,
+  ResearchSettingTab: () => ResearchSettingTab,
   ResearchView: () => ResearchView,
   VIEW_TYPE: () => VIEW_TYPE,
   default: () => ResearchVaultPlugin
 });
 module.exports = __toCommonJS(main_exports);
+var import_obsidian2 = require("obsidian");
+var import_node_crypto2 = require("node:crypto");
+var import_node_fs2 = require("node:fs");
+var import_node_path2 = __toESM(require("node:path"));
+
+// src/agent-settings.ts
 var import_obsidian = require("obsidian");
-
-// src/execution.ts
-var import_node_child_process = require("node:child_process");
-var import_node_fs = require("node:fs");
-var import_node_path = __toESM(require("node:path"));
-var import_node_string_decoder = require("node:string_decoder");
-var import_node_crypto = require("node:crypto");
-
-// src/settings.ts
-function defaults(platform) {
-  return {
-    mode: platform === "win32" ? "wsl" : "native",
-    distribution: "",
-    python: "",
-    script: "",
-    startupSync: false,
-    openSidebar: false,
-    notifications: true,
-    ribbon: true,
-    maxLogLines: 200
-  };
-}
-function loadSettings(data, platform) {
-  const result = defaults(platform);
-  if (!data || typeof data !== "object") return result;
-  const value = data;
-  if (value.mode === "wsl" || value.mode === "native") result.mode = value.mode;
-  for (const key of ["distribution", "python", "script"]) {
-    if (typeof value[key] === "string") result[key] = value[key];
-  }
-  for (const key of ["startupSync", "openSidebar", "notifications", "ribbon"]) {
-    if (typeof value[key] === "boolean") result[key] = value[key];
-  }
-  if (typeof value.maxLogLines === "number" && Number.isFinite(value.maxLogLines)) {
-    result.maxLogLines = Math.max(20, Math.min(2e3, Math.floor(value.maxLogLines)));
-  }
-  return result;
-}
-function defaultPython(settings, platform) {
-  return settings.mode === "native" && platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python";
-}
 
 // src/protocol.ts
 var isRecord = (v) => !!v && typeof v === "object" && !Array.isArray(v);
@@ -165,7 +131,7 @@ function outcome(code, result) {
 }
 function progress(snapshot, value) {
   if (typeof value.stage !== "string") return;
-  snapshot.stage = value.stage;
+  snapshot.stage = value.stage + (typeof value.reason === "string" ? `: ${value.reason}` : "");
   for (const key of ["processed", "remaining", "skipped", "failed"]) {
     if (typeof value[key] === "number") snapshot[key] = value[key];
   }
@@ -173,6 +139,9 @@ function progress(snapshot, value) {
   if (value.stage === "cache" && typeof value.reused === "number") snapshot.cacheHits = value.reused;
 }
 function statusDetails(snapshot, value) {
+  if (isRecord(value.usage_by_agent)) snapshot.agentUsage = value.usage_by_agent;
+  if (isRecord(value.task_status)) snapshot.taskCounts = value.task_status;
+  snapshot.resumeInstructions = typeof value.resume_instructions === "string" ? value.resume_instructions : void 0;
   if (typeof value.status === "string") snapshot.syncStatus = value.status;
   if (isRecord(value.pending)) snapshot.pending = value.pending;
   if ("last_success" in value) snapshot.lastSuccess = typeof value.last_success === "string" ? value.last_success : void 0;
@@ -180,6 +149,269 @@ function statusDetails(snapshot, value) {
   if (isRecord(value.last_report) && typeof value.last_report.cache_hits === "number") {
     snapshot.cacheHits = value.last_report.cache_hits;
   }
+}
+
+// src/agent-settings.ts
+var roles = ["literature", "manuscript", "concepts", "linking", "synthesis", "maintenance", "consolidation"];
+var labels = { codex: "Codex", claude: "Claude Code" };
+var providerDefault = "__provider_default__";
+var AgentSettingsEditor = class {
+  constructor(el, report, save, refresh, saved) {
+    this.el = el;
+    this.report = report;
+    this.save = save;
+    this.refresh = refresh;
+    this.saved = saved;
+    this.load(report);
+    this.render();
+  }
+  load(report) {
+    this.report = report;
+    this.request = JSON.parse(JSON.stringify({ plan_token: report.plan_token, defaults: report.defaults ?? {}, agents: report.agents ?? {}, default_provider: report.default_provider ?? "codex" }));
+  }
+  providers() {
+    return isRecord(this.report.providers) ? this.report.providers : {};
+  }
+  authenticated(provider) {
+    const status = this.providers()[provider];
+    return isRecord(status) && status.authenticated === true;
+  }
+  profile(role) {
+    const value = this.request.agents[role];
+    return isRecord(value) ? value : typeof value === "string" ? { provider: value } : {};
+  }
+  store(role, profile) {
+    const agents = this.request.agents;
+    if (role === "consolidation" && !(role in agents) && Object.keys(profile).length) {
+      const inherited = this.resolved("linking");
+      const merged = { ...inherited, ...profile, retry_policy: { ...isRecord(inherited.retry_policy) ? inherited.retry_policy : {}, ...isRecord(profile.retry_policy) ? profile.retry_policy : {} } };
+      Object.assign(profile, JSON.parse(JSON.stringify(merged)));
+    }
+    if (Object.keys(profile).length) agents[role] = profile;
+    else delete agents[role];
+  }
+  resolved(role) {
+    const profile = role ? this.profile(role) : {};
+    if (role === "consolidation" && !(role in this.request.agents)) return this.resolved("linking");
+    const provider = String(profile.provider ?? this.request.default_provider);
+    const defaults2 = isRecord(this.report.provider_defaults) && isRecord(this.report.provider_defaults[provider]) ? this.report.provider_defaults[provider] : {};
+    return { ...defaults2, ...this.request.defaults, ...profile, provider };
+  }
+  models(provider) {
+    const status = this.providers()[provider];
+    return isRecord(status) && Array.isArray(status.models) ? status.models.filter(isRecord) : [];
+  }
+  render() {
+    const el = this.el;
+    el.empty();
+    el.createEl("h3", { text: "Agent-specific models and reasoning" });
+    for (const [provider, label] of Object.entries(labels)) {
+      const status = this.providers()[provider];
+      el.createEl("p", { text: `${label}: ${isRecord(status) ? String(status.message) : "Login has not been checked."}${this.authenticated(provider) ? "" : ` Sign in with ${provider === "codex" ? "codex login" : "claude auth login"}, then refresh.`}` });
+    }
+    if (this.refresh) new import_obsidian.Setting(el).setName("Provider login status and model lists").setDesc("Refresh preserves staged choices and sends no inference requests.").addButton((button) => button.setButtonText("Refresh login and models").onClick(async () => {
+      button.setDisabled(true);
+      try {
+        const report = await this.refresh();
+        if (report) {
+          this.report = { ...this.report, providers: report.providers };
+          if (report.plan_token !== this.request.plan_token) new import_obsidian.Notice("Configuration changed externally. Reopen settings before saving; staged choices are retained here.");
+          this.render();
+        }
+      } finally {
+        button.setDisabled(false);
+      }
+    }));
+    new import_obsidian.Setting(el).setName("Default provider").setDesc("Changing provider resets affected model and intensity selections to provider defaults. Choose replacements before saving.").addDropdown((control) => {
+      this.providerOptions(control);
+      control.setValue(String(this.request.default_provider)).onChange((value) => {
+        if (!this.authenticated(value)) return;
+        this.request.default_provider = value;
+        const defaults2 = this.request.defaults;
+        defaults2.model = null;
+        defaults2.reasoning_effort = null;
+        if (value === "codex") delete defaults2.max_output_tokens;
+        for (const entry of Object.values(this.request.agents)) {
+          if (isRecord(entry) && !entry.provider) {
+            entry.model = null;
+            entry.reasoning_effort = null;
+            if (value === "codex") delete entry.max_output_tokens;
+          }
+        }
+        this.render();
+      });
+    });
+    const defaultsSection = el.createEl("details");
+    defaultsSection.createEl("summary", { text: "Global model and advanced defaults" });
+    this.modelFields(defaultsSection, this.request.defaults, this.resolved(), () => this.render());
+    this.advanced(defaultsSection, this.request.defaults, this.resolved());
+    for (const role of roles) {
+      const section = el.createDiv({ cls: "research-vault-agent-settings" });
+      section.createEl("h4", { text: role });
+      const profile = this.profile(role);
+      const resolved = this.resolved(role);
+      new import_obsidian.Setting(section).setName("Provider").setDesc(`${role === "consolidation" ? "Inherits linking unless this agent has overrides." : "Inherits the default provider unless overridden."} Changing provider resets its model and intensity to provider defaults.`).addDropdown((control) => {
+        control.addOption("", "Inherit");
+        this.providerOptions(control);
+        control.setValue(String(profile.provider ?? "")).onChange((value) => {
+          if (value && !this.authenticated(value)) return;
+          if (value) profile.provider = value;
+          else delete profile.provider;
+          profile.model = null;
+          profile.reasoning_effort = null;
+          if (String(profile.provider ?? this.request.default_provider) === "codex") delete profile.max_output_tokens;
+          this.store(role, profile);
+          this.render();
+        });
+      });
+      this.modelFields(section, profile, resolved, () => {
+        this.store(role, profile);
+        this.render();
+      });
+      const advanced = section.createEl("details");
+      advanced.createEl("summary", { text: "Limits, timeout and retries" });
+      this.advanced(advanced, profile, resolved, () => this.store(role, profile));
+    }
+    el.createEl("p", { text: "Login is checked in the selected execution environment. Model access is verified on actual requests. Codex choices use local model metadata; Claude aliases do not certify account access. Configured model catalogs take precedence. Changes apply after Save to future tasks; completed scientific notes are retained." });
+    new import_obsidian.Setting(el).addButton((button) => button.setButtonText("Save agent settings").setCta().onClick(async () => {
+      button.setDisabled(true);
+      try {
+        const result = await this.save(this.request);
+        if (result) {
+          if (isRecord(result)) {
+            this.load(result);
+            this.render();
+          }
+          new import_obsidian.Notice("Agent settings saved.");
+          this.saved?.();
+        }
+      } catch (error) {
+        new import_obsidian.Notice(String(error));
+      } finally {
+        button.setDisabled(false);
+      }
+    }));
+  }
+  providerOptions(control) {
+    for (const [provider, label] of Object.entries(labels)) {
+      control.addOption(provider, this.authenticated(provider) ? label : `${label} (login required)`);
+      const option = Array.from(control.selectEl.options).find((item) => item.value === provider);
+      if (option) option.disabled = !this.authenticated(provider);
+    }
+  }
+  modelFields(el, profile, resolved, changed) {
+    const provider = String(resolved.provider);
+    const enabled = this.authenticated(provider);
+    const models = this.models(provider);
+    const model = models.find((row) => row.id === resolved.model);
+    const selected = profile.model === null ? providerDefault : String(profile.model ?? "");
+    new import_obsidian.Setting(el).setName("Model").setDesc(`Models for ${labels[provider] ?? provider}. Inherited: ${resolved.model ?? "provider default"}.`).addDropdown((control) => {
+      control.addOption("", "Inherit").addOption(providerDefault, "Provider default");
+      for (const row of models) control.addOption(String(row.id), `${row.label ?? row.id} (${row.id})`);
+      if (selected && selected !== providerDefault && !models.some((row) => row.id === selected)) control.addOption(selected, `${selected} (saved; not in current list)`);
+      control.setValue(selected).setDisabled(!enabled).onChange((value) => {
+        if (!enabled) return;
+        if (value === providerDefault) profile.model = null;
+        else if (value) profile.model = value;
+        else delete profile.model;
+        changed();
+      });
+    });
+    const supported = model && Array.isArray(model.reasoning_efforts) ? model.reasoning_efforts.filter((v) => typeof v === "string") : [];
+    const intensity = profile.reasoning_effort === null ? providerDefault : String(profile.reasoning_effort ?? "");
+    new import_obsidian.Setting(el).setName("Reasoning intensity").setDesc(model ? `Options for this model from ${model.source}.` : "Select a model to choose its supported intensity. Inherit/provider default leave the choice to configuration or the CLI.").addDropdown((control) => {
+      control.addOption("", "Inherit").addOption(providerDefault, "Provider default");
+      for (const effort of supported) control.addOption(effort, effort);
+      if (intensity && intensity !== providerDefault && !supported.includes(intensity)) {
+        control.addOption(intensity, `${intensity} (saved; support unverified)`);
+        const option = Array.from(control.selectEl.options).find((item) => item.value === intensity);
+        if (option) option.disabled = true;
+      }
+      control.setValue(intensity).setDisabled(!enabled).onChange((value) => {
+        if (!enabled) return;
+        if (value === providerDefault) profile.reasoning_effort = null;
+        else if (value && supported.includes(value)) profile.reasoning_effort = value;
+        else if (!value) delete profile.reasoning_effort;
+        changed();
+      });
+    });
+  }
+  advanced(el, profile, inherited, changed = () => {
+  }) {
+    for (const [key, label] of [["max_input_chars", "Input character limit"], ["output_reserve_chars", "Output character reserve"], ["max_output_tokens", "Native output-token cap (Claude only)"], ["timeout_seconds", "Timeout in seconds"]]) {
+      if (key === "max_output_tokens" && inherited.provider !== "claude") continue;
+      new import_obsidian.Setting(el).setName(label).setDesc("Blank inherits.").addText((control) => control.setValue(String(profile[key] ?? "")).setPlaceholder(String(inherited[key] ?? "Inherit")).onChange((value) => {
+        if (value.trim()) profile[key] = Number(value);
+        else delete profile[key];
+        changed();
+      }));
+    }
+    const policy = isRecord(profile.retry_policy) ? profile.retry_policy : {};
+    for (const [key, label] of [["max_attempts", "Maximum attempts"], ["retry_after_seconds", "Rate-limit retry delay (seconds)"]]) {
+      new import_obsidian.Setting(el).setName(label).setDesc("Retries occur on the next eligible sync.").addText((control) => control.setValue(String(policy[key] ?? "")).onChange((value) => {
+        if (value.trim()) policy[key] = Number(value);
+        else delete policy[key];
+        if (Object.keys(policy).length) profile.retry_policy = policy;
+        else delete profile.retry_policy;
+        changed();
+      }));
+    }
+  }
+};
+var AgentSettingsModal = class extends import_obsidian.Modal {
+  constructor(app, report, save, refresh) {
+    super(app);
+    this.report = report;
+    this.save = save;
+    this.refresh = refresh;
+  }
+  onOpen() {
+    new AgentSettingsEditor(this.contentEl, this.report, this.save, this.refresh, () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// src/execution.ts
+var import_node_child_process = require("node:child_process");
+var import_node_fs = require("node:fs");
+var import_node_path = __toESM(require("node:path"));
+var import_node_string_decoder = require("node:string_decoder");
+var import_node_crypto = require("node:crypto");
+
+// src/settings.ts
+function defaults(platform) {
+  return {
+    mode: platform === "win32" ? "wsl" : "native",
+    distribution: "",
+    python: "",
+    script: "",
+    startupSync: false,
+    openSidebar: false,
+    notifications: true,
+    ribbon: true,
+    maxLogLines: 200
+  };
+}
+function loadSettings(data, platform) {
+  const result = defaults(platform);
+  if (!data || typeof data !== "object") return result;
+  const value = data;
+  if (value.mode === "wsl" || value.mode === "native") result.mode = value.mode;
+  for (const key of ["distribution", "python", "script"]) {
+    if (typeof value[key] === "string") result[key] = value[key];
+  }
+  for (const key of ["startupSync", "openSidebar", "notifications", "ribbon"]) {
+    if (typeof value[key] === "boolean") result[key] = value[key];
+  }
+  if (typeof value.maxLogLines === "number" && Number.isFinite(value.maxLogLines)) {
+    result.maxLogLines = Math.max(20, Math.min(2e3, Math.floor(value.maxLogLines)));
+  }
+  return result;
+}
+function defaultPython(settings, platform) {
+  return settings.mode === "native" && platform === "win32" ? ".venv/Scripts/python.exe" : ".venv/bin/python";
 }
 
 // src/execution.ts
@@ -195,7 +427,9 @@ var ACTION_ARGS = {
   readiness: ["review", "status"],
   refresh: ["review", "refresh"],
   consolidate: ["concepts", "suggest"],
-  history: ["review", "history"]
+  history: ["review", "history"],
+  agentSettings: ["settings", "show"],
+  saveAgentSettings: ["settings", "save"]
 };
 var nodeSpawn = (command, args, options) => (0, import_node_child_process.spawn)(command, args, options);
 function validText(value, label) {
@@ -273,6 +507,10 @@ async function prepare(vault, settings, platform, action, launch = nodeSpawn, ch
   const venvConfig = api.join(api.dirname(bin), "pyvenv.cfg");
   let isVenv = false;
   const args = ["-u", script, "--vault", root, ...ACTION_ARGS[action]];
+  if (action === "saveAgentSettings") {
+    if (!selection?.settingsRequestId || !/^[a-f0-9]{32}$/.test(selection.settingsRequestId)) throw new Error("Invalid agent settings request.");
+    args.push("--request-id", selection.settingsRequestId);
+  }
   if (selection?.controlId) {
     if (!["sync", "full", "startup", "dry"].includes(action) || !/^[a-f0-9]{32}$/.test(selection.controlId)) throw new Error("Invalid sync control identifier.");
     args.push("--control-id", selection.controlId);
@@ -456,10 +694,15 @@ var Runner = class {
       });
       this.snapshot.status = this.control?.interrupted ? "failed" : outcome(code, result);
       if (typeof result?.status === "string") this.snapshot.syncStatus = result.status;
+      if (result) {
+        if (isRecord(result.usage_by_agent)) this.snapshot.agentUsage = result.usage_by_agent;
+        if (isRecord(result.task_status)) this.snapshot.taskCounts = result.task_status;
+        this.snapshot.resumeInstructions = typeof result.resume_instructions === "string" ? result.resume_instructions : void 0;
+      }
       this.snapshot.stage = `${action}: ${this.snapshot.status}`;
       if (!result) this.log("No final JSON report was available; inspect logs and run Research: Status.", settings.maxLogLines);
       if (result) {
-        for (const field of ["warnings", "blocking_errors", "document_errors", "graph_error", "reasoning_error", "failed", "skipped", "partial"]) {
+        for (const field of ["warnings", "blocking_errors", "document_errors", "graph_error", "reasoning_error", "provider_interruptions", "resume_instructions", "usage_by_agent", "task_status", "failed", "skipped", "partial"]) {
           const detail = result[field];
           if (detail && (!Array.isArray(detail) || detail.length) && (!isRecord(detail) || Object.keys(detail).length)) {
             this.snapshot.diagnostics.push(redact(`${field}: ${JSON.stringify(detail)}`).slice(0, 16e3));
@@ -501,9 +744,10 @@ var COMMANDS = [
   ["dashboard", "Research: Open Dashboard"],
   ["reviews", "Research: Open Review Queue"],
   ["review-history", "Research: Open Review History"],
-  ["review-readiness", "Research: Review Readiness"]
+  ["review-readiness", "Research: Review Readiness"],
+  ["agent-settings", "Research: Agent Settings"]
 ];
-var ConfirmModal = class extends import_obsidian.Modal {
+var ConfirmModal = class extends import_obsidian2.Modal {
   constructor(app, title, message, proceed, details) {
     super(app);
     this.title = title;
@@ -515,7 +759,7 @@ var ConfirmModal = class extends import_obsidian.Modal {
     this.contentEl.createEl("h2", { text: this.title });
     this.contentEl.createEl("p", { text: this.message });
     if (this.details) this.contentEl.createEl("pre", { text: this.details, cls: "research-vault-diagnostic" });
-    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton((button) => button.setButtonText("Continue").setWarning().onClick(() => {
+    new import_obsidian2.Setting(this.contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton((button) => button.setButtonText("Continue").setWarning().onClick(() => {
       this.close();
       this.proceed();
     }));
@@ -524,7 +768,7 @@ var ConfirmModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
-var ReviewReadinessModal = class extends import_obsidian.Modal {
+var ReviewReadinessModal = class extends import_obsidian2.Modal {
   constructor(app, plugin, report) {
     super(app);
     this.plugin = plugin;
@@ -541,7 +785,7 @@ var ReviewReadinessModal = class extends import_obsidian.Modal {
       const row = el.createDiv();
       row.createEl("p", { text: `${item.state}: ${item.path}` });
       row.createEl("p", { text: String(item.reason ?? "") });
-      const controls = new import_obsidian.Setting(row);
+      const controls = new import_obsidian2.Setting(row);
       if (item.state === "ready" && typeof item.id === "string") {
         selected.add(item.id);
         controls.addToggle((toggle) => toggle.setValue(true).onChange((value) => {
@@ -551,7 +795,7 @@ var ReviewReadinessModal = class extends import_obsidian.Modal {
       }
       controls.addButton((button) => button.setButtonText("Open review").onClick(() => {
         const file = this.app.vault.getAbstractFileByPath(String(item.path));
-        if (file instanceof import_obsidian.TFile) void this.app.workspace.getLeaf(false).openFile(file);
+        if (file instanceof import_obsidian2.TFile) void this.app.workspace.getLeaf(false).openFile(file);
       }));
       if (item.state === "needs-revalidation" && item.refreshable === true && typeof item.id === "string") {
         controls.addButton((button) => button.setButtonText("Refresh review").onClick(() => {
@@ -575,7 +819,7 @@ ${text.slice(0, 16e3)}${text.length > 16e3 ? "\nDisplay truncated; use review st
       if (Array.isArray(group.members)) for (const member of group.members.filter(isRecord)) {
         row.createEl("p", { text: String(member.path) });
       }
-      new import_obsidian.Setting(row).addButton((button) => button.setButtonText("Suggest consolidation").onClick(() => {
+      new import_obsidian2.Setting(row).addButton((button) => button.setButtonText("Suggest consolidation").onClick(() => {
         new ConfirmModal(
           this.app,
           "Prepare a consolidation suggestion",
@@ -588,13 +832,13 @@ ${text.slice(0, 16e3)}${text.length > 16e3 ? "\nDisplay truncated; use review st
       }));
     }
     if (Array.isArray(this.report.concept_catalog)) {
-      new import_obsidian.Setting(el).addButton((button) => button.setButtonText("Compare other concepts").onClick(() => {
+      new import_obsidian2.Setting(el).addButton((button) => button.setButtonText("Compare other concepts").onClick(() => {
         new ConceptComparisonModal(this.app, this.plugin, this.report.concept_catalog.filter(isRecord)).open();
       }));
     }
-    new import_obsidian.Setting(el).addButton((button) => button.setButtonText("Preview selected").onClick(() => {
+    new import_obsidian2.Setting(el).addButton((button) => button.setButtonText("Preview selected").onClick(() => {
       if (!selected.size) {
-        new import_obsidian.Notice("Select at least one ready approval.");
+        new import_obsidian2.Notice("Select at least one ready approval.");
         return;
       }
       this.close();
@@ -605,7 +849,7 @@ ${text.slice(0, 16e3)}${text.length > 16e3 ? "\nDisplay truncated; use review st
     this.contentEl.empty();
   }
 };
-var ConceptComparisonModal = class extends import_obsidian.Modal {
+var ConceptComparisonModal = class extends import_obsidian2.Modal {
   constructor(app, plugin, catalog) {
     super(app);
     this.plugin = plugin;
@@ -618,14 +862,14 @@ var ConceptComparisonModal = class extends import_obsidian.Modal {
     for (const member of this.catalog) {
       const row = this.contentEl.createDiv();
       row.createEl("p", { text: String(member.path) });
-      new import_obsidian.Setting(row).addToggle((toggle) => toggle.setValue(false).onChange((value) => {
+      new import_obsidian2.Setting(row).addToggle((toggle) => toggle.setValue(false).onChange((value) => {
         if (value) selected.add(String(member.path));
         else selected.delete(String(member.path));
       }));
     }
-    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Suggest consolidation").onClick(() => {
+    new import_obsidian2.Setting(this.contentEl).addButton((button) => button.setButtonText("Suggest consolidation").onClick(() => {
       if (selected.size < 2) {
-        new import_obsidian.Notice("Select at least two concepts.");
+        new import_obsidian2.Notice("Select at least two concepts.");
         return;
       }
       new ConfirmModal(
@@ -643,7 +887,7 @@ var ConceptComparisonModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
-var ReviewPicker = class extends import_obsidian.SuggestModal {
+var ReviewPicker = class extends import_obsidian2.SuggestModal {
   constructor(app, history = false) {
     super(app);
     this.history = history;
@@ -670,7 +914,7 @@ var ReviewPicker = class extends import_obsidian.SuggestModal {
     void this.app.workspace.getLeaf(false).openFile(file);
   }
 };
-var HistoryPicker = class extends import_obsidian.SuggestModal {
+var HistoryPicker = class extends import_obsidian2.SuggestModal {
   constructor(app, plugin, records) {
     super(app);
     this.plugin = plugin;
@@ -690,7 +934,7 @@ var HistoryPicker = class extends import_obsidian.SuggestModal {
     void this.plugin.openArchivedReview(String(record.id));
   }
 };
-var ResearchView = class extends import_obsidian.ItemView {
+var ResearchView = class extends import_obsidian2.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
@@ -716,8 +960,8 @@ var ResearchView = class extends import_obsidian.ItemView {
     el.addClass("research-vault-view");
     el.createEl("h2", { text: "Research Vault" });
     const state = this.plugin.runner.snapshot;
-    const labels = { up_to_date: "Up to date", completed_reviews_pending: "Completed, reviews pending", completed_with_limitations: "Completed with limitations", incomplete_resumable: "Incomplete, resumable", failed: "Failed" };
-    el.createEl("p", { text: `Status: ${state.status === "failed" ? "Failed" : labels[state.syncStatus ?? ""] ?? state.status}`, cls: `research-vault-status status-${state.status}` });
+    const labels2 = { up_to_date: "Up to date", completed_reviews_pending: "Completed, reviews pending", completed_with_limitations: "Completed with limitations", incomplete_resumable: "Incomplete, resumable", failed: "Failed" };
+    el.createEl("p", { text: `Status: ${state.status === "failed" ? "Failed" : labels2[state.syncStatus ?? ""] ?? state.status}`, cls: `research-vault-status status-${state.status}` });
     el.createEl("p", { text: `Stage: ${redact(state.stage)}` });
     const stats = el.createEl("dl", { cls: "research-vault-stats" });
     for (const [label, value] of [
@@ -737,6 +981,14 @@ var ResearchView = class extends import_obsidian.ItemView {
       stats.createEl("dd", { text: typeof value === "number" || typeof value === "string" ? redact(String(value)) : "Not reported" });
     }
     const controls = el.createDiv({ cls: "research-vault-controls" });
+    if (state.resumeInstructions) el.createEl("p", { text: state.resumeInstructions });
+    if (state.taskCounts) el.createEl("p", { text: `Tasks: ${Object.entries(state.taskCounts).map(([name, count]) => `${name}: ${count}`).join(" \xB7 ")}` });
+    if (state.agentUsage && Object.keys(state.agentUsage).length) {
+      el.createEl("h3", { text: "Inference usage by agent" });
+      for (const [agent, usage] of Object.entries(state.agentUsage)) {
+        if (isRecord(usage)) el.createEl("p", { text: `${agent}: ${usage.requests ?? 0} requests, ${usage.cache_hits ?? 0} cache hits, ${usage.failures ?? 0} failures, ${usage.deferred ?? 0} deferred. Tokens: ${JSON.stringify(usage.tokens ?? {})}` });
+      }
+    }
     for (const [action, label] of [["sync", "Sync"], ["dry", "Dry Run Sync"], ["apply", "Apply Reviews"], ["doctor", "Doctor"], ["status", "Refresh Status"]]) {
       const button = controls.createEl("button", { text: label });
       button.disabled = this.plugin.runner.busy;
@@ -764,11 +1016,11 @@ var ResearchView = class extends import_obsidian.ItemView {
     try {
       await this.plugin.runner.interrupt();
     } catch (error) {
-      new import_obsidian.Notice(`Cannot interrupt synchronization: ${redact(String(error))}`);
+      new import_obsidian2.Notice(`Cannot interrupt synchronization: ${redact(String(error))}`);
     }
   }
 };
-var ResearchVaultPlugin = class extends import_obsidian.Plugin {
+var ResearchVaultPlugin = class extends import_obsidian2.Plugin {
   constructor() {
     super(...arguments);
     this.runner = new Runner(() => this.scheduleRender());
@@ -783,8 +1035,9 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
         if (id === "dashboard") void this.openDashboard();
         else if (id === "reviews") this.openReviews();
         else if (id === "review-history") this.openReviews(true);
+        else if (id === "agent-settings") void this.openAgentSettings();
         else if (id === "review-readiness") void this.previewReviews();
-        else if (id === "interrupt") void this.runner.interrupt().catch((error) => new import_obsidian.Notice(`Cannot interrupt synchronization: ${redact(String(error))}`));
+        else if (id === "interrupt") void this.runner.interrupt().catch((error) => new import_obsidian2.Notice(`Cannot interrupt synchronization: ${redact(String(error))}`));
         else this.request(id);
       } });
     }
@@ -793,7 +1046,7 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
     });
     this.app.workspace.onLayoutReady(() => {
       void this.ready().catch((error) => {
-        new import_obsidian.Notice(`Research Vault startup: ${redact(String(error)).slice(0, 500)}`);
+        new import_obsidian2.Notice(`Research Vault startup: ${redact(String(error)).slice(0, 500)}`);
       });
     });
   }
@@ -819,7 +1072,7 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
   }
   request(action) {
     if (this.runner.busy) {
-      new import_obsidian.Notice("A Research Vault command is already running.");
+      new import_obsidian2.Notice("A Research Vault command is already running.");
       return;
     }
     if (action === "apply") {
@@ -846,7 +1099,7 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
     const preview = await this.execute("preview", true, { proposalIds });
     if (!preview || this.runner.snapshot.status !== "completed" || this.runner.disposed) return;
     if (preview.can_apply !== true || typeof preview.plan_token !== "string" || !Array.isArray(preview.selected_ids) || preview.selected_ids.length !== proposalIds.length || preview.selected_ids.some((id) => typeof id !== "string" || !proposalIds.includes(id))) {
-      new import_obsidian.Notice("Selected reviews are no longer ready. Reopen Review Readiness.");
+      new import_obsidian2.Notice("Selected reviews are no longer ready. Reopen Review Readiness.");
       return;
     }
     const readinessItems = isRecord(preview.readiness) && Array.isArray(preview.readiness.items) ? preview.readiness.items.filter(isRecord) : [];
@@ -859,7 +1112,7 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
       deferred_approvals: Array.isArray(preview.skipped) ? preview.skipped.length : 0
     }, null, 2));
     if (details.length > 32e3) {
-      new import_obsidian.Notice("The approval preview is too large for this dialog. Review and apply using the terminal CLI.");
+      new import_obsidian2.Notice("The approval preview is too large for this dialog. Review and apply using the terminal CLI.");
       return;
     }
     new ConfirmModal(
@@ -875,22 +1128,22 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
   async refreshReview(id) {
     const result = await this.execute("refresh", false, { id });
     if (result?.outcome === "concept_comparison_needed") {
-      if (typeof result.message === "string") new import_obsidian.Notice(result.message);
+      if (typeof result.message === "string") new import_obsidian2.Notice(result.message);
       await this.previewReviews();
       return;
     }
-    if (result && (result.outcome === "already_represented" || result.outcome === "already_closed") && typeof result.message === "string") new import_obsidian.Notice(result.message);
+    if (result && (result.outcome === "already_represented" || result.outcome === "already_closed") && typeof result.message === "string") new import_obsidian2.Notice(result.message);
     const file = result && typeof result.path === "string" ? this.app.vault.getAbstractFileByPath(result.path) : void 0;
-    if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
+    if (file instanceof import_obsidian2.TFile) await this.app.workspace.getLeaf(false).openFile(file);
   }
   async suggestConsolidation(id, memberPaths) {
     const result = await this.execute("consolidate", false, memberPaths ? { memberPaths } : { id });
     const file = result && typeof result.path === "string" ? this.app.vault.getAbstractFileByPath(result.path) : void 0;
-    if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
+    if (file instanceof import_obsidian2.TFile) await this.app.workspace.getLeaf(false).openFile(file);
   }
   async execute(action, quiet = false, selection) {
     try {
-      if (!(this.app.vault.adapter instanceof import_obsidian.FileSystemAdapter)) throw new Error("Research Vault requires a local desktop filesystem vault.");
+      if (!(this.app.vault.adapter instanceof import_obsidian2.FileSystemAdapter)) throw new Error("Research Vault requires a local desktop filesystem vault.");
       const vault = this.app.vault.adapter.getBasePath();
       const settings = { ...this.settings };
       const result = await this.runner.run(vault, settings, process.platform, action, selection);
@@ -915,14 +1168,14 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
       }
       this.scheduleRender();
       if (!this.runner.disposed && (this.runner.snapshot.status === "failed" || this.settings.notifications && (!quiet || action === "startup"))) {
-        new import_obsidian.Notice(`Research Vault ${action}: ${this.runner.snapshot.status}. See the sidebar for details.`);
+        new import_obsidian2.Notice(`Research Vault ${action}: ${this.runner.snapshot.status}. See the sidebar for details.`);
       }
       return result;
     } catch (error) {
       if (!this.runner.disposed) {
         if (!this.runner.busy) this.runner.snapshot.diagnostics = [redact(String(error))];
         this.scheduleRender();
-        new import_obsidian.Notice(`Research Vault: ${redact(String(error)).slice(0, 500)}`);
+        new import_obsidian2.Notice(`Research Vault: ${redact(String(error)).slice(0, 500)}`);
       }
       return void 0;
     }
@@ -932,7 +1185,7 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
     if (!leaf) {
       const right = this.app.workspace.getRightLeaf(false);
       if (!right) {
-        new import_obsidian.Notice("Cannot open Research Vault sidebar.");
+        new import_obsidian2.Notice("Cannot open Research Vault sidebar.");
         return;
       }
       leaf = right;
@@ -942,8 +1195,8 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
   }
   async openDashboard() {
     const file = this.app.vault.getAbstractFileByPath("Home.md");
-    if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
-    else new import_obsidian.Notice("Home.md is missing from this vault.");
+    if (file instanceof import_obsidian2.TFile) await this.app.workspace.getLeaf(false).openFile(file);
+    else new import_obsidian2.Notice("Home.md is missing from this vault.");
   }
   async openReviews(history = false) {
     if (!history) {
@@ -956,17 +1209,41 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
   async openArchivedReview(id) {
     const result = await this.execute("history", true, { id });
     if (!result || typeof result.markdown !== "string" || this.runner.disposed) return;
-    const modal = new import_obsidian.Modal(this.app);
+    const modal = new import_obsidian2.Modal(this.app);
     modal.contentEl.createEl("h2", { text: "Archived review" });
     modal.contentEl.createEl("pre", { text: result.markdown, cls: "research-vault-diagnostic" });
     modal.contentEl.createEl("pre", { text: JSON.stringify(result.record, null, 2), cls: "research-vault-diagnostic" });
     modal.open();
   }
+  async openAgentSettings() {
+    const report = await this.execute("agentSettings", true);
+    if (report && !this.runner.disposed) new AgentSettingsModal(this.app, report, (request) => this.saveAgentConfiguration(request), () => this.execute("agentSettings", true)).open();
+  }
+  async saveAgentConfiguration(request) {
+    if (this.runner.busy) throw new Error("Wait for the current command before saving settings.");
+    if (!(this.app.vault.adapter instanceof import_obsidian2.FileSystemAdapter)) throw new Error("A local filesystem vault is required.");
+    const root = this.app.vault.adapter.getBasePath();
+    const directory = import_node_path2.default.join(root, ".pipeline");
+    await import_node_fs2.promises.mkdir(directory).catch((error) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+    const info = await import_node_fs2.promises.lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Settings requests require a local pipeline directory.");
+    const id = (0, import_node_crypto2.randomBytes)(16).toString("hex");
+    const file = import_node_path2.default.join(directory, `settings-request-${id}.json`);
+    await import_node_fs2.promises.writeFile(file, JSON.stringify(request), { flag: "wx" });
+    try {
+      const result = await this.execute("saveAgentSettings", false, { settingsRequestId: id });
+      return result && this.runner.snapshot.status === "completed" ? result : void 0;
+    } finally {
+      await import_node_fs2.promises.unlink(file).catch(() => void 0);
+    }
+  }
   async saveSettings() {
     await this.saveData(this.settings);
   }
 };
-var ResearchSettingTab = class extends import_obsidian.PluginSettingTab {
+var ResearchSettingTab = class extends import_obsidian2.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -975,9 +1252,19 @@ var ResearchSettingTab = class extends import_obsidian.PluginSettingTab {
     const el = this.containerEl;
     el.empty();
     el.createEl("h2", { text: "Research Vault" });
+    const agents = el.createDiv();
+    new import_obsidian2.Setting(agents).setName("Agent-specific models and reasoning").setDesc("Check CLI login status, then select provider, model and intensity for each agent here.").addButton((button) => button.setButtonText("Load agent settings").onClick(async () => {
+      button.setDisabled(true);
+      try {
+        const report = await this.plugin.execute("agentSettings", true);
+        if (report && !this.plugin.runner.disposed) new AgentSettingsEditor(agents, report, (request) => this.plugin.saveAgentConfiguration(request), () => this.plugin.execute("agentSettings", true));
+      } finally {
+        button.setDisabled(false);
+      }
+    }));
     el.createEl("p", { text: "Runs trusted local Python code. Zotero and LLM settings stay in config.yaml. Save settings before starting a command." });
     const settings = this.plugin.settings;
-    new import_obsidian.Setting(el).setName("Execution environment").setDesc("Windows defaults to WSL; Linux defaults to Native. The virtual environment must match the selected environment.").addDropdown((dropdown) => dropdown.addOption("native", "Native").addOption("wsl", "WSL").setValue(settings.mode).onChange(async (value) => {
+    new import_obsidian2.Setting(el).setName("Execution environment").setDesc("Windows defaults to WSL; Linux defaults to Native. The virtual environment must match the selected environment.").addDropdown((dropdown) => dropdown.addOption("native", "Native").addOption("wsl", "WSL").setValue(settings.mode).onChange(async (value) => {
       settings.mode = value === "wsl" ? "wsl" : "native";
       await this.plugin.saveSettings();
       this.display();
@@ -987,7 +1274,7 @@ var ResearchSettingTab = class extends import_obsidian.PluginSettingTab {
       ["python", "Python executable path", "Blank uses the project virtual environment. A path only, without arguments; in WSL use a Linux path.", defaultPython(settings, process.platform)],
       ["script", "Custom CLI script path", "Blank uses scripts/research.py. Custom scripts must support the same CLI, including --vault.", "scripts/research.py"]
     ]) {
-      new import_obsidian.Setting(el).setName(name).setDesc(description).addText((text) => text.setPlaceholder(placeholder).setValue(settings[key]).onChange(async (value) => {
+      new import_obsidian2.Setting(el).setName(name).setDesc(description).addText((text) => text.setPlaceholder(placeholder).setValue(settings[key]).onChange(async (value) => {
         settings[key] = value;
         await this.plugin.saveSettings();
       }));
@@ -998,19 +1285,19 @@ var ResearchSettingTab = class extends import_obsidian.PluginSettingTab {
       ["notifications", "Show completion notifications", "Errors are always reported."],
       ["ribbon", "Show ribbon icon", "Reload this plugin to apply this setting."]
     ]) {
-      new import_obsidian.Setting(el).setName(name).setDesc(description).addToggle((toggle) => toggle.setValue(settings[key]).onChange(async (value) => {
+      new import_obsidian2.Setting(el).setName(name).setDesc(description).addToggle((toggle) => toggle.setValue(settings[key]).onChange(async (value) => {
         settings[key] = value;
         await this.plugin.saveSettings();
       }));
     }
-    new import_obsidian.Setting(el).setName("Maximum displayed log lines").setDesc("20\u20132000 lines. Long lines and final reports are also bounded; full pipeline reports remain on disk.").addText((text) => text.setValue(String(settings.maxLogLines)).onChange(async (value) => {
+    new import_obsidian2.Setting(el).setName("Maximum displayed log lines").setDesc("20\u20132000 lines. Long lines and final reports are also bounded; full pipeline reports remain on disk.").addText((text) => text.setValue(String(settings.maxLogLines)).onChange(async (value) => {
       const max = Number(value);
       if (Number.isInteger(max) && max >= 20 && max <= 2e3) {
         settings.maxLogLines = max;
         await this.plugin.saveSettings();
       }
     }));
-    new import_obsidian.Setting(el).setName("Research Vault sidebar").addButton((button) => button.setButtonText("Open sidebar").onClick(() => {
+    new import_obsidian2.Setting(el).setName("Research Vault sidebar").addButton((button) => button.setButtonText("Open sidebar").onClick(() => {
       void this.plugin.openSidebar();
     }));
   }

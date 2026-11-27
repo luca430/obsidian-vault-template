@@ -2,6 +2,62 @@
 
 ## Verified in this workspace
 
+Login-aware agent selector follow-up (2026-11-27): plugin settings now load an
+inline editor for all seven agents. Provider login status gates selection; model
+and intensity dropdowns depend on provider/model metadata. The command dialog
+uses the same editor. Save rechecks changed providers, validates known model
+efforts and rejects concurrent edits. Refresh retains staged choices; explicit
+provider changes clear incompatible model/effort overrides. Consolidation keeps
+linking's inherited settings until edited and never shares mutable retry state.
+
+The focused Python suite passes **92 tests** across settings, checkpoints and
+both runtime adapters. **57 plugin tests**, TypeScript checking, bundle generation,
+Ruff checks, compilation and wheel build pass. Synthetic cases cover signed-out
+providers, auth-output redaction, read-only login checks, per-model effort lists,
+configured catalogs, incomplete local metadata, rejected saves, mixed providers,
+inline loading, staged edits, login refresh, inheritance and unsupported saved
+values. Live model inference and the desktop GUI remain untested. Login status
+does not establish model entitlement: Codex metadata may be stale, and Claude
+aliases expose conservative common effort levels unless an explicit catalog
+supplies capabilities. No credential contents or research material enter picker
+reports, and no inference or polling populates the selectors.
+
+Resumable operations and agent profiles follow-up (2026-11-27): operations now
+have atomic per-task receipts and validated outputs are saved before completion
+receipts or scientific integration. Synthetic regressions cover allowance
+exhaustion halfway through a collection, no additional requests to that provider,
+other providers continuing, and manual/startup resumption without repeating
+successful work. Shutdown between cache publication and completion, incomplete
+cache repair, finite startup budgets, rate-limit cooldowns and explicit retry
+limits are exercised independently of live services.
+
+All seven scientific agent profiles support inherited global defaults and explicit
+overrides. Tests cover exact model/effort catalogs, invalid profiles and token caps,
+CLI-specific effort/timeout/output-limit translation, model substitution refusal,
+unchanged incremental sync after settings edits, corrected failed profiles and
+legacy recipe upgrades that still detect changed scientific instructions.
+Claude error arrays without result text distinguish allowance exhaustion from
+invalid structured output. Existing human-approval and provenance tests remain.
+
+The plugin's dedicated settings dialog stages provider, model, effort, budgets,
+timeouts and retry edits until Save; Python rejects concurrent configuration edits
+and preserves unrelated YAML. Per-agent usage, persistent task counts and resume
+instructions appear in diagnostics. The 50 plugin tests and TypeScript/build
+checks pass. The full Python regression run passed 319 tests in 360.40 seconds,
+including the synthetic 200-paper scaling case. The final focused run passes 78
+checkpoint/provider tests, including two additional Claude error-envelope cases
+added after that full run (321 total collected cases). Ruff lint/format,
+compilation, CLI help, dependency checks and wheel build also pass.
+
+These tests use synthetic research data and mocked provider CLIs. No real provider
+request or desktop GUI was used. Account/model access and host-managed provider
+policy need live verification; explicit model catalogs and typed provider failures
+are validated locally. Codex's native output-token cap is rejected rather than
+claimed to be enforceable; character reserves remain request estimates. The agent
+audit in operations.md identifies deterministic Python work and the scientific
+judgment required by every remaining LLM role. No polling, provider fallback,
+approval bypass or automatic scientific-model downgrade was introduced.
+
 Incremental synchronization and review lifecycle follow-up (2026-11-27): root causes
 were whole-rendered-note graph hashes, unconditional graph selection for incomplete
 documents, proposal identities tied to excerpt/natural-language payloads, and review

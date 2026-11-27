@@ -9,7 +9,15 @@ from collections import Counter
 from .agents import fits, payload_budget, validate_note_evidence, validate_output, validate_summary
 from .cancellation import check_cancelled
 from .chunking import section_chunks
-from .recipes import NAMESPACES, stage_recipe
+from .inference_errors import (
+    AllowanceExhausted,
+    ContextExhausted,
+    InvalidOutput,
+    OperationDeferred,
+    RateLimited,
+)
+from .operations import OperationStore
+from .recipes import NAMESPACES, content_recipe, stage_recipe
 from .sources import extraction_complete, page_coverage, pdf, usable_pages
 from .storage import VaultError, atomic, digest, inside, read_json
 
@@ -27,7 +35,17 @@ def fragments(records: list[dict], chars: int):
 
 
 class Processor:
-    def __init__(self, config, agent, recipe, progress, full=False):
+    def __init__(
+        self,
+        config,
+        agent,
+        recipe,
+        progress,
+        full=False,
+        dry_run=False,
+        retry=False,
+        operation_budget=None,
+    ):
         self.config, self.agent, self.recipe = config, agent, recipe
         self.progress, self.full = progress, full
         self.hits = 0
@@ -38,38 +56,172 @@ class Processor:
         self.evaluation_failures = []
         self.last_cache_metadata = None
         self.extraction_recipe = stage_recipe(config, "extraction")
+        self.tasks = OperationStore(config.root, recover_running=not dry_run)
+        self.blocked_providers = {}
+        self.blocked_errors = {}
+        self.retry = retry
+        self.deferred_operations = []
+        self.task_context = None
+        self.operation_budget = operation_budget
+
+    def plan_inference(self, role, payload, provider=None, evaluation=False):
+        selected, settings = self.config.runtime(role, provider)
+        key = digest(
+            [
+                "evaluation" if evaluation else "inference",
+                role,
+                payload,
+                content_recipe(self.config, role),
+            ]
+        )
+        context = {
+            "id": key,
+            "kind": "inference",
+            "role": role,
+            "provider": selected,
+            "recipe": stage_recipe(self.config, role, provider),
+            "configuration": settings,
+            "input_fingerprint": digest(payload),
+            "evaluation_only": evaluation,
+        }
+        record = self.tasks.plan(key, **{k: v for k, v in context.items() if k != "id"})
+        if record["status"] != "completed" and record.get("recipe") != context["recipe"]:
+            self.tasks.update(
+                key,
+                "pending",
+                **{k: v for k, v in context.items() if k != "id"},
+                attempts=0,
+                eligible_after=None,
+                reason="Agent configuration changed for an unfinished operation",
+            )
+        return key, context
 
     def cached(self, namespace, key, operation, reusable=None, metadata=None):
         check_cancelled()
         path = inside(self.config.root, f".pipeline/cache/{namespace}/{digest(key)}.json")
-        cached = read_json(path) if path.exists() and not self.full else None
+        logical = self.task_context or {
+            "id": digest([namespace, key]),
+            "kind": "extraction",
+            "namespace": namespace,
+        }
+        task_id = logical["id"]
+        record = self.tasks.plan(task_id, **{k: v for k, v in logical.items() if k != "id"})
+        # Completed receipts pin the actual cache/recipe used for this scientific input.
+        if not self.full and record.get("cache_path"):
+            path = inside(self.config.root, record["cache_path"])
+        try:
+            cached = read_json(path) if path.exists() and not self.full else None
+        except VaultError:
+            cached = None
+        if cached is not None and (
+            not isinstance(cached, dict) or cached.get("value_hash") != digest(cached.get("value"))
+        ):
+            cached = None
         if cached is not None:
-            if (
-                not isinstance(cached, dict)
-                or cached.get("key") != digest(key)
-                or "value" not in cached
-                or cached.get("value_hash") != digest(cached["value"])
-                or (
-                    "metadata" in cached
-                    and cached.get("metadata_hash") != digest(cached["metadata"])
+            valid = (
+                isinstance(cached, dict)
+                and cached.get("key") == record.get("cache_key", digest(key))
+                and cached.get("value_hash") == digest(cached.get("value"))
+                and (
+                    "metadata" not in cached
+                    or cached.get("metadata_hash") == digest(cached["metadata"])
                 )
-            ):
-                raise VaultError(
-                    "Processing cache is damaged; restore or remove the affected cache file"
+            )
+            if valid and (reusable is None or reusable(cached["value"])):
+                self.tasks.update(
+                    task_id,
+                    "completed",
+                    cache_path=path.relative_to(self.config.root).as_posix(),
+                    cache_key=cached["key"],
+                    cache_hits=record.get("cache_hits", 0) + 1,
                 )
-            if reusable is None or reusable(cached["value"]):
                 self.hits += 1
                 self.last_cache_metadata = cached.get("metadata")
                 self.progress("cache", namespace=namespace, reused=self.hits)
                 return cached["value"]
-        result = operation()
-        check_cancelled()
+        provider = logical.get("provider")
+        if provider in self.blocked_providers:
+            reason = self.blocked_providers[provider]
+            self.tasks.update(
+                task_id, "deferred", reason=reason, error_type=self.blocked_errors[provider]
+            )
+            self.deferred_operations.append(task_id)
+            raise OperationDeferred(reason)
+        settings = logical.get("configuration", {})
+        max_attempts = settings.get("retry_policy", {}).get(
+            "max_attempts", self.config.processing("max_retry_attempts")
+        )
+        if not self.tasks.eligible(record, retry=self.retry) or (
+            record["status"] == "failed"
+            and record.get("attempts", 0) >= max_attempts
+            and not self.retry
+            and not self.full
+        ):
+            self.deferred_operations.append(task_id)
+            raise OperationDeferred(
+                "Task retry policy defers this operation; use the next eligible Sync or explicit --retry"
+            )
+        self.tasks.update(task_id, "running", attempts=record.get("attempts", 0) + 1)
+        try:
+            result = operation()
+            # A validated result is durable BEFORE observing a cancellation that
+            # arrived during inference. Integration remains a separate checkpoint.
+        except BaseException as exc:
+            status = (
+                "pending"
+                if isinstance(exc, KeyboardInterrupt)
+                else "deferred"
+                if isinstance(exc, (AllowanceExhausted, OperationDeferred))
+                else "failed"
+            )
+            details = {
+                "reason": str(exc),
+                "error_type": getattr(
+                    exc,
+                    "code",
+                    "invalid_output"
+                    if logical.get("kind") == "inference" and isinstance(exc, VaultError)
+                    else type(exc).__name__,
+                ),
+            }
+            delay = getattr(exc, "retry_after", None)
+            if isinstance(exc, RateLimited) and delay is None:
+                delay = settings.get("retry_policy", {}).get("retry_after_seconds", 60)
+            if delay:
+                from datetime import datetime, timedelta, timezone
+
+                details["eligible_after"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=delay)
+                ).isoformat()
+            self.tasks.update(task_id, status, **details)
+            if isinstance(exc, OperationDeferred):
+                self.deferred_operations.append(task_id)
+            if isinstance(exc, (AllowanceExhausted, RateLimited)):
+                self.blocked_providers[provider] = str(exc)
+                self.blocked_errors[provider] = exc.code
+                self.tasks.defer_provider(provider, str(exc), delay, error_type=exc.code)
+                self.deferred_operations.append(task_id)
+            raise
         self.last_cache_metadata = metadata() if metadata else None
+        resolved_recipe = (self.last_cache_metadata or {}).get(
+            "resolved_recipe", logical.get("recipe")
+        )
+        cache_key = digest([key, resolved_recipe]) if metadata else digest(key)
+        path = inside(self.config.root, f".pipeline/cache/{namespace}/{cache_key}.json")
+        self.tasks.update(
+            task_id,
+            "running",
+            cache_path=path.relative_to(self.config.root).as_posix(),
+            cache_key=cache_key,
+            configured_recipe=logical.get("recipe"),
+            recipe=resolved_recipe,
+            resolved_model=(self.last_cache_metadata or {}).get("resolved_model"),
+        )
         atomic(
             path,
             json.dumps(
                 {
-                    "key": digest(key),
+                    "key": cache_key,
                     "value_hash": digest(result),
                     "value": result,
                     **(
@@ -84,22 +236,46 @@ class Processor:
                 ensure_ascii=False,
             ),
         )
+        self.tasks.update(
+            task_id,
+            "completed",
+            cache_path=path.relative_to(self.config.root).as_posix(),
+            cache_key=cache_key,
+            recipe=resolved_recipe,
+            resolved_model=(self.last_cache_metadata or {}).get("resolved_model"),
+            reasoning_effort=(self.last_cache_metadata or {}).get("reasoning_effort"),
+            usage=(self.last_cache_metadata or {}).get("usage"),
+        )
+        check_cancelled()
         return result
 
     def run(self, role, payload, validator=None, *, provider=None, evaluation=False):
         selected, settings = self.config.runtime(role, provider)
-        if not fits(self.config, role, payload, provider):
-            raise VaultError(
-                f"{role} request cannot fit configured input/output budget; no truncation"
-            )
-
         metadata = {
             "role": role,
             "provider": selected,
             "model": settings.get("model"),
             "recipe": stage_recipe(self.config, role, provider),
             "evaluation_only": evaluation,
+            "reasoning_effort": settings.get("reasoning_effort"),
+            "configuration": settings,
         }
+        logical_id, self.task_context = self.plan_inference(role, payload, provider, evaluation)
+        if not fits(self.config, role, payload, provider):
+            error = ContextExhausted(
+                f"{role} request cannot fit configured input/output budget; no truncation"
+            )
+            self.tasks.update(logical_id, "failed", reason=str(error), error_type=error.code)
+            self.record_operation(
+                {
+                    **metadata,
+                    "cached": True,
+                    "validation_status": "failed",
+                    "error_type": error.code,
+                }
+            )
+            self.task_context = None
+            raise error
         if hasattr(self.agent, "identity"):
             identity = (
                 self.agent.identity(role, selected)
@@ -111,8 +287,14 @@ class Processor:
 
         def invoke():
             nonlocal reused
+            if self.operation_budget is not None and self.calls >= self.operation_budget:
+                raise OperationDeferred(
+                    "Startup inference budget reached; resume with manual or startup Sync"
+                )
             reused = False
             self.calls += 1
+            record = self.tasks.records[logical_id]
+            self.tasks.update(logical_id, "running", requests=record.get("requests", 0) + 1)
             self.progress(
                 "inference",
                 role=role,
@@ -124,13 +306,23 @@ class Processor:
                 raise VaultError(
                     "Injected LLM runtime does not support secondary provider execution"
                 )
-            result = validate_output(
-                role,
+            raw = (
                 self.agent.run_provider(role, payload, selected)
                 if provider is not None
-                else self.agent.run(role, payload),
+                else self.agent.run(role, payload)
             )
+            try:
+                result = validate_output(role, raw)
+            except VaultError as exc:
+                raise InvalidOutput(str(exc)) from exc
             metadata.update(getattr(self.agent, "last_metadata", {}))
+            metadata["resolved_recipe"] = digest(
+                [
+                    metadata["recipe"],
+                    metadata.get("resolved_model", metadata.get("model")),
+                    metadata.get("reasoning_effort"),
+                ]
+            )
             check(result)
             return result
 
@@ -163,11 +355,49 @@ class Processor:
                 validation_status="review_required" if warnings else "validated", warnings=warnings
             )
 
+        def reusable_result(value):
+            try:
+                validate_output(role, value)
+                check(value)
+                return True
+            except VaultError:
+                return False
+
+        if not self.full and not self.tasks.records[logical_id].get("cache_path"):
+            namespace = "evaluations" if evaluation else NAMESPACES[role]
+            legacy_key = digest(
+                [stage_recipe(self.config, role, provider, legacy=True), role, payload]
+            )
+            legacy_path = inside(self.config.root, f".pipeline/cache/{namespace}/{legacy_key}.json")
+            try:
+                legacy = read_json(legacy_path)
+                if (
+                    isinstance(legacy, dict)
+                    and legacy.get("key") == legacy_key
+                    and legacy.get("value_hash") == digest(legacy.get("value"))
+                    and (
+                        "metadata" not in legacy
+                        or legacy.get("metadata_hash") == digest(legacy["metadata"])
+                    )
+                    and reusable_result(legacy["value"])
+                ):
+                    self.tasks.plan(
+                        logical_id, **{k: v for k, v in self.task_context.items() if k != "id"}
+                    )
+                    self.tasks.update(
+                        logical_id,
+                        "completed",
+                        cache_path=legacy_path.relative_to(self.config.root).as_posix(),
+                        cache_key=legacy_key,
+                    )
+            except VaultError:
+                pass
         try:
             result = self.cached(
                 "evaluations" if evaluation else NAMESPACES[role],
                 [stage_recipe(self.config, role, provider), role, payload],
                 invoke,
+                reusable=reusable_result,
                 metadata=lambda: metadata,
             )
             if reused:
@@ -181,8 +411,13 @@ class Processor:
             metadata.update(
                 validation_status="failed", failure=str(exc), failure_type=type(exc).__name__
             )
+            metadata["error_type"] = getattr(
+                exc, "code", "invalid_output" if isinstance(exc, VaultError) else type(exc).__name__
+            )
             self.record_operation({**metadata, "cached": reused})
+            self.task_context = None
             raise
+        self.task_context = None
         self.record_operation({**metadata, "cached": reused})
         self.completed_operations += 1
         comparison = self.config.data.get("llm", {}).get("evaluation", {})
@@ -194,6 +429,28 @@ class Processor:
                     {"role": role, "provider": comparison["provider"], "error": str(exc)}
                 )
         return result
+
+    def usage_by_agent(self):
+        summary = {}
+        for op in self.operations:
+            role = op["role"]
+            row = summary.setdefault(
+                role, {"requests": 0, "cache_hits": 0, "failures": 0, "deferred": 0, "tokens": {}}
+            )
+            deferred = op.get("error_type") in {"allowance_exhausted", "deferred"}
+            if op.get("cached") and op.get("validation_status") != "failed":
+                row["cache_hits"] += 1
+            elif not op.get("cached"):
+                row["requests"] += 1
+            if deferred:
+                row["deferred"] += 1
+            elif op.get("validation_status") == "failed":
+                row["failures"] += 1
+            if not op.get("cached"):
+                for key, value in (op.get("usage") or {}).items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        row["tokens"][key] = row["tokens"].get(key, 0) + value
+        return summary
 
     def record_operation(self, metadata):
         self.operations.append(metadata)
@@ -212,6 +469,7 @@ class Processor:
         return self.summary_warnings.get(digest(result), [])
 
     def extract(self, path, source, sha256):
+        self.task_context = None
         key = [self.extraction_recipe, source, sha256]
 
         def page_cache(index, operation):

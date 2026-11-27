@@ -221,8 +221,9 @@ claude:
   output_reserve_chars: 16000
 ```
 
-Each role accepts either a provider name or a mapping containing `provider` and/or
-`model`. Supported provider names are `codex` and `claude`. Both providers use the
+Each role accepts either a provider name or a mapping with provider, model,
+reasoning effort, budgets, timeout and retry overrides. Supported provider names
+are `codex` and `claude`. Both providers use the
 same `AGENTS.md`, `agents/<role>.md`, scientific schemas and Python validators.
 Provider-specific configuration contains only execution settings. Character
 budgets and timeout settings have the same meanings for both providers.
@@ -277,12 +278,12 @@ The adapter checks required CLI flags and fails if isolation flags are unavailab
 it never retries with fewer restrictions. It uses safe mode rather than bare mode
 so normal CLI login remains available.
 
-Provider changes invalidate only affected inference stages. PDF extraction caches
-have no provider dependency. Switching back reuses the earlier provider's valid
-inference cache. Codex's existing cache-key contract and old cache envelopes are
-accepted; old entries are marked as legacy when metadata is unavailable. Updated
-global/role instruction files intentionally invalidate affected inference, as
-before. No state migration, review deletion or note renaming is required.
+Provider/model changes apply to future operations and explicit full reprocessing;
+completed scientific notes retain their results. PDF extraction caches have no
+provider dependency. Compatible legacy cache envelopes remain accepted after
+current validation. Updated global/role scientific instructions and source inputs
+intentionally invalidate affected operations. The first ordinary sync rebases
+matching legacy recipes without inference; it never deletes reviews or renames notes.
 
 Dual-provider evaluation is **off by default**. Enabling `llm.evaluation` runs the
 secondary runtime for scheduled inference jobs and stores its validated responses
@@ -377,7 +378,34 @@ Successful document notes/state commit individually using the existing write-ahe
 journal. An interruption resumes pending jobs without repeating completed inference.
 One missing PDF, offline cloud file, extraction error or invalid LLM response does
 not discard other completed papers. Parents with no successfully summarized attachment retain their older note.
-Partial parents keep successful attachment findings. Persistent coverage limitations wait for changed inputs/settings or explicit `sync --retry`; transient inference failures retry up to `processing.max_retry_attempts` (default 3). No full-text scientific claims are generated from metadata alone.
+Partial parents keep successful attachment findings. Persistent coverage limitations wait for changed inputs/settings or explicit `sync --retry`; transient inference failures retry up to the agent's `retry_policy.max_attempts` (otherwise `processing.max_retry_attempts`, default 3). No full-text scientific claims are generated from metadata alone.
+
+Each extraction and inference operation has an atomic receipt under
+`.pipeline/operations/` with pending/running/completed/failed/deferred status.
+Validated results are saved before integration. Ordinary Sync and eligible startup
+Sync resume unfinished work, including after shutdown; `--full` is unnecessary.
+Provider allowance exhaustion defers further requests to that provider for the
+current run. Other configured providers can continue. Status shows the reason and
+resume guidance: restore the allowance, then run Sync again. Rate limits honor a
+reported retry delay; there is no polling or automatic model downgrade.
+
+In **Settings → Research Vault**, click **Load agent settings**. Each agent has
+provider → model → reasoning intensity selectors directly on the settings page.
+Only providers with a successful CLI login check can be selected. **Refresh login
+and models** rechecks both Codex and Claude Code while preserving staged edits.
+The **Research: Agent Settings** command opens the same editor in a dialog.
+Global defaults, input/output budgets, timeouts and retry policies remain available.
+Explicit **Save agent settings** updates `config.yaml` without
+starting inference. Provider settings are inherited, then `llm.defaults`, then
+`llm.agents.<role>` overrides. Completed scientific notes retain their original
+results when these settings change; future tasks and explicit `--full` reprocessing
+use the new settings. See [runtime configuration and recovery](docs/operations.md).
+Diagnostics report per-agent requests, cache hits, failures, deferred operations
+and provider-reported token usage.
+Login checks do not verify individual model entitlements. Codex's local metadata
+and configured catalogs provide model-specific intensities; Claude's documented
+aliases provide conservative common options. Exact Claude capability catalogs
+can expose additional intensities. No inference requests populate the selectors.
 
 Coverage is separate from job status, at both parent and attachment levels:
 
@@ -745,10 +773,11 @@ confirmation never substitutes for an explicit approved/delete review decision.
 Vault settings only after a successful manual Doctor/Sync. Once the workspace is
 ready, the plugin runs `sync --startup` exactly once, asynchronously. This is the
 existing bounded incremental mode: it processes at most
-`processing.startup_max_documents` jobs (default 5), defers conceptual reasoning,
-and can finish incomplete until a manual Sync resumes the remaining work. It still
-scans the full membership and hashes sources. It never starts a full sync, retries
-expensive work automatically, or starts a watcher/daemon.
+`processing.startup_max_documents` jobs (default 5) and
+`processing.startup_max_operations` inference requests (default 20). Later ordinary
+or startup Sync resumes deferred document and graph tasks using successful receipts.
+It can finish incomplete when the budget is reached. It still scans full membership
+and hashes sources. It never starts a full sync or a watcher/daemon.
 
 Only one plugin command runs per vault at a time; Python's existing OS lock also
 protects against terminal runs and other Obsidian windows. A lock conflict is

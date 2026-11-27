@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument(
         "--startup",
         action="store_true",
-        help="Bounded incremental documents; defer conceptual reasoning",
+        help="Bounded incremental work; resume deferred document and graph operations",
     )
     sync.add_argument("--run-id", help=argparse.SUPPRESS)
     sync.add_argument(
@@ -79,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="Explicit concept paths to compare instead of a candidate ID",
     )
+    settings = commands.add_parser(
+        "settings", help="Inspect or explicitly update agent settings without inference"
+    )
+    settings.add_argument("action", choices=["show", "save"])
+    settings.add_argument("--request-id")
     commands.add_parser("status")
     commands.add_parser("doctor")
     args = parser.parse_args(argv)
@@ -117,6 +122,21 @@ def main(argv: list[str] | None = None) -> int:
             config,
             progress=progress,
         )
+        if args.command == "settings":
+            from .settings_service import inspect_settings, save_settings
+            from .storage import read_json
+
+            if args.action == "show":
+                result = inspect_settings(config, check_providers=True)
+            else:
+                if not args.request_id or not re.fullmatch(r"[a-f0-9]{32}", args.request_id):
+                    raise VaultError("Invalid settings request identifier")
+                path = inside(config.root, f".pipeline/settings-request-{args.request_id}.json")
+                with lock(config.root):
+                    result = save_settings(config, read_json(path))
+                path.unlink(missing_ok=True)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         dry = getattr(args, "dry_run", False)
 
         def synchronize():

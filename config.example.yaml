@@ -32,6 +32,7 @@ source_roots: []
 
 llm:
   default_provider: codex     # Existing vaults without llm settings continue to use Codex.
+  defaults: {}               # Override provider settings; agent settings override these defaults.
   agents: {}                 # Roles: literature, manuscript, concepts, linking, synthesis, maintenance, consolidation.
   # consolidation inherits linking's provider/model unless explicitly configured.
   # Example mixed workflow (instead of agents: {}):
@@ -39,6 +40,15 @@ llm:
   #   literature: codex
   #   linking: {provider: claude, model: sonnet}
   #   synthesis: claude
+  # Each agent also accepts reasoning_effort, timeout_seconds, max_input_chars,
+  # output_reserve_chars, max_output_tokens (Claude only), and retry_policy.
+  # Example: literature: {provider: codex, model: YOUR_MODEL, reasoning_effort: high,
+  #                       retry_policy: {max_attempts: 3, retry_after_seconds: 60}}
+  # Model/effort availability depends on your account; never silently substituted.
+  # Optional strict local catalog (omit to validate models on actual provider requests):
+  # model_catalog:
+  #   codex:
+  #     YOUR_MODEL: {reasoning_efforts: [low, medium, high]}
   evaluation:
     enabled: false           # Extra inference/cost; results stay private and never create proposals.
     provider: claude          # Secondary runtime for scheduled jobs; same-provider comparisons are skipped.
@@ -68,7 +78,8 @@ processing:
   chunk_context_chars: 600    # Adjacent explanatory text around section/math-aware source chunks.
   candidate_terms: 32        # Maximum rare query terms used per registry fragment.
   candidate_pool: 128        # Hard bound on candidate fragments scored per query.
-  startup_max_documents: 5   # --startup caps document work and defers concept/reasoning stages.
+  startup_max_documents: 5   # --startup caps document work; later runs resume unfinished tasks.
+  startup_max_operations: 20 # Maximum new inference requests per startup, including graph tasks.
   max_retry_attempts: 3      # Bound unchanged temporary failures; sync --retry overrides.
   # Persistent source-coverage limitations wait for changed inputs/settings or --retry.
   # Dry-run estimates never authenticate, invoke inference, or update research state.
