@@ -11,7 +11,11 @@ from collections import Counter
 from .agents import payload_budget, validate_note_evidence
 from .processing import fragments, size, terms
 from .recipes import stage_recipe
-from .storage import VaultError, digest
+from .storage import VaultError, digest, frontmatter
+
+
+def redirected(text):
+    return text.startswith("---\n") and frontmatter(text)[0].get("kind") == "concept-redirect"
 
 
 class Registry:
@@ -50,6 +54,9 @@ class Registry:
                     del self.data["concepts"][key]
 
     def update(self, config, name, text, provenance, processor):
+        if redirected(text):
+            self.remove(name)
+            return False
         old = self.data["documents"].get(name, {})
         signature = digest([text, provenance])
         concept_recipe = stage_recipe(config, "concepts")
@@ -145,11 +152,55 @@ class Registry:
         return True
 
     def reviewed(self, proposals):
-        self.data["reviewed_relationships"] = {
+        redirects = {}
+        rewritten = {}
+        for pid, record in proposals.items():
+            if (
+                record["kind"] == "consolidation"
+                and record.get("applied")
+                and record["payload"]["operation"] == "merge"
+            ):
+                payload = record["payload"]
+                redirects.update(
+                    {
+                        p: (payload["canonical"]["path"], pid)
+                        for p in payload["members"]
+                        if p != payload["canonical"]["path"]
+                    }
+                )
+                rewritten.update(
+                    {
+                        (r["source"], r["previous_target"]): (r["target"], pid)
+                        for r in record.get("rewritten_links", [])
+                    }
+                )
+        relationships = {
             pid: record["payload"]
             for pid, record in proposals.items()
-            if record["kind"] == "link" and record.get("applied")
+            if record["kind"] == "link"
+            and record.get("applied")
+            and record["payload"]["source"] not in redirects
         }
+        for pid, record in proposals.items():
+            if record["kind"] == "consolidation" and record.get("applied"):
+                for number, link in enumerate(record["payload"]["links"]):
+                    if link["source"] not in redirects:
+                        relationships[f"{pid}:{number}"] = link
+        for pid, payload in list(relationships.items()):
+            target = payload["target"]
+            seen = set()
+            approvals = []
+            while (payload["source"], target) in rewritten and target not in seen:
+                seen.add(target)
+                target, approval = rewritten[(payload["source"], target)]
+                approvals.append(approval)
+            if approvals:
+                relationships[pid] = {
+                    **payload,
+                    "target": target,
+                    "consolidation_approvals": approvals,
+                }
+        self.data["reviewed_relationships"] = relationships
 
     def batches(self, config, notes, changed, membership, passages, statuses):
         available = min(
@@ -167,6 +218,8 @@ class Registry:
         for name in sorted(changed & notes.keys()):
             document = self.data["documents"].get(name)
             if document is None:
+                if redirected(notes[name]):
+                    continue
                 raise VaultError(f"Concept indexing incomplete for {name}; retry sync")
             # Query the persistent postings, never compare each pair of documents.
             for focus in document["fragments"]:

@@ -262,7 +262,7 @@ test('WSL helper captures error exits, missing executable, and bounded output', 
   await assert.rejects(capture(command, launch(false), 32), /too much output/);
 });
 
-test('all eight commands register; no process runs before workspace readiness', async () => {
+test('all commands register; no process runs before workspace readiness', async () => {
   const plugin = new Plugin();
   const actions: string[] = [];
   plugin.execute = async action => { actions.push(action); return undefined; };
@@ -315,32 +315,168 @@ test('full sync requires confirmation and cancel launches nothing', async () => 
 test('apply previews exact Python changes before confirmation and never approves or deletes in TypeScript', async () => {
   const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
   const actions: string[] = [];
-  plugin.execute = async action => {
+  const selections: unknown[] = [];
+  plugin.execute = async (action, _quiet, selection) => {
     actions.push(action); plugin.runner.snapshot.status = 'completed';
-    return { changes: ['Literature/SYNTHETIC.md'], destructive: true, impact_previews: [{ decision: 'delete', note: 'Literature/SYNTHETIC.md' }] };
+    selections.push(selection);
+    return { can_apply: true, selected_ids: ['a'.repeat(24)], plan_token: 'b'.repeat(64), changes: ['Literature/SYNTHETIC.md'], destructive: true, impact_previews: [{ decision: 'delete', note: 'Literature/SYNTHETIC.md' }] };
   };
-  await plugin.previewReviews();
+  await plugin.previewReviews(['a'.repeat(24)]);
   assert.deepEqual(actions, ['preview']);
   assert.deepEqual(ACTION_ARGS.preview, ['apply', '--dry-run']);
   assert.ok(Modal.opened[0].contentEl.children.some(child => child.text.includes('Literature/SYNTHETIC.md')));
   Modal.opened[0].contentEl.children.find(child => child.text === 'Continue')!.events.get('click')!();
   assert.deepEqual(actions, ['preview', 'apply']);
+  assert.deepEqual(selections, [{ proposalIds: ['a'.repeat(24)] }, { proposalIds: ['a'.repeat(24)], planToken: 'b'.repeat(64) }]);
   assert.deepEqual(ACTION_ARGS.apply, ['apply']); plugin.onunload();
 });
 
 test('failed apply preview cannot launch actual apply', async () => {
   const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
   plugin.execute = async () => { plugin.runner.snapshot.status = 'failed'; return undefined; };
-  await plugin.previewReviews(); assert.equal(Modal.opened.length, 0); plugin.onunload();
+  await plugin.previewReviews(['a'.repeat(24)]); assert.equal(Modal.opened.length, 0); plugin.onunload();
 });
 
 test('oversized apply preview blocks application rather than hiding affected paths', async () => {
   const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
   plugin.execute = async () => {
     plugin.runner.snapshot.status = 'completed';
-    return { changes: ['x'.repeat(33000)] };
+    return { can_apply: true, selected_ids: ['a'.repeat(24)], plan_token: 'b'.repeat(64), changes: ['x'.repeat(33000)] };
   };
-  await plugin.previewReviews(); assert.equal(Modal.opened.length, 0); plugin.onunload();
+  await plugin.previewReviews(['a'.repeat(24)]); assert.equal(Modal.opened.length, 0); plugin.onunload();
+});
+
+test('readiness allows only ready selections and previews them before applying', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
+  const actions: { action: string; selection: unknown }[] = [];
+  const ready = 'a'.repeat(24), stale = 'b'.repeat(24);
+  plugin.execute = async (action, _quiet, selection) => {
+    actions.push({ action, selection }); plugin.runner.snapshot.status = 'completed';
+    if (action === 'readiness') return { items: [
+      { id: ready, path: 'Reviews/Links/ready.md', state: 'ready', reason: 'Validated.' },
+      { id: stale, path: 'Reviews/Links/stale.md', state: 'needs-revalidation', reason: 'Changed definition.', refreshable: true, differences: [{ note: 'Concepts/test.md', diff: '-old\n+new' }] },
+    ] };
+    return { can_apply: true, selected_ids: [ready], plan_token: 'c'.repeat(64), changes: ['Concepts/test.md'] };
+  };
+  await plugin.previewReviews();
+  assert.deepEqual(actions, [{ action: 'readiness', selection: undefined }]);
+  const walk = (el: Element): Element[] => [el, ...el.children.flatMap(walk)];
+  const elements = walk(Modal.opened[0].contentEl);
+  assert.ok(elements.some(el => el.text.includes('needs-revalidation')));
+  assert.ok(elements.some(el => el.text.includes('-old\n+new')));
+  assert.equal(elements.filter(el => el.events.has('change')).length, 1);
+  elements.find(el => el.text === 'Preview selected')!.events.get('click')!();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(actions[1], { action: 'preview', selection: { proposalIds: [ready] } });
+  assert.equal(actions.length, 2);
+  Modal.opened[1].contentEl.children.find(el => el.text === 'Continue')!.events.get('click')!();
+  assert.deepEqual(actions[2], { action: 'apply', selection: { proposalIds: [ready], planToken: 'c'.repeat(64) } });
+  plugin.onunload();
+});
+
+test('empty selections and changed selected previews cannot apply', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
+  const actions: string[] = [];
+  plugin.execute = async action => {
+    actions.push(action); plugin.runner.snapshot.status = 'completed';
+    if (action === 'readiness') return { items: [{ id: 'a'.repeat(24), state: 'ready', path: 'Reviews/Links/a.md' }] };
+    return { can_apply: false, selected_ids: [], plan_token: 'c'.repeat(64) };
+  };
+  await plugin.previewReviews();
+  const walk = (el: Element): Element[] => [el, ...el.children.flatMap(walk)];
+  const elements = walk(Modal.opened[0].contentEl);
+  const toggle = elements.find(el => el.events.has('change'))!;
+  toggle.checked = false; toggle.events.get('change')!();
+  elements.find(el => el.text === 'Preview selected')!.events.get('click')!();
+  assert.deepEqual(actions, ['readiness']);
+  Modal.opened = [];
+  await plugin.previewReviews(['a'.repeat(24)]);
+  assert.equal(Modal.opened.length, 0);
+  assert.deepEqual(actions, ['readiness', 'preview']);
+  plugin.onunload();
+});
+
+test('review refresh opens its new pending file without synchronization or apply', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
+  const id = 'd'.repeat(24), target = 'Reviews/Links/new.md';
+  plugin.app.files = [new TFile(target)];
+  const actions: unknown[] = [];
+  plugin.execute = async (action, _quiet, selection) => {
+    actions.push({ action, selection }); return { path: target, status: 'pending' };
+  };
+  await plugin.refreshReview(id);
+  assert.deepEqual(actions, [{ action: 'refresh', selection: { id } }]);
+  assert.deepEqual(plugin.app.opened, [target]);
+  plugin.onunload();
+});
+
+test('refresh of an existing relationship opens its source and keeps the closed review in history', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Modal.opened = []; Notice.messages = [];
+  const source = 'Literature/existing.md', review = 'Reviews/Links/closed.md';
+  plugin.app.files = [new TFile(source), new TFile(review)];
+  plugin.app.metadataCache.getFileCache = file => ({ frontmatter: { status: 'pending', ...(file.path === review ? { resolved: 'already_represented' } : {}) } });
+  const actions: string[] = [];
+  plugin.execute = async action => {
+    actions.push(action); return { outcome: 'already_represented', path: source, message: 'Existing relationship; review moved to history.' };
+  };
+  await plugin.refreshReview('a'.repeat(24));
+  assert.deepEqual(actions, ['refresh']);
+  assert.deepEqual(plugin.app.opened, [source]);
+  assert.ok(Notice.messages.some(message => message.includes('moved to history')));
+  type Picker = { getSuggestions(query: string): TFile[]; getSuggestionText(file: TFile): string };
+  plugin.openReviews();
+  assert.deepEqual((Modal.opened[0] as unknown as Picker).getSuggestions(''), []);
+  plugin.openReviews(true);
+  const history = Modal.opened[1] as unknown as Picker;
+  assert.deepEqual(history.getSuggestions('').map(file => file.path), [review]);
+  assert.equal(history.getSuggestionText(plugin.app.files[1]), review + ' (already represented)');
+  plugin.onunload();
+});
+
+test('refresh retains alternative definitions and opens readiness without starting inference', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Notice.messages = [];
+  const actions: string[] = [];
+  plugin.execute = async action => {
+    actions.push(action); return { outcome: 'concept_comparison_needed', message: 'Compare the definition text.' };
+  };
+  let opened = 0;
+  plugin.previewReviews = async () => { opened++; };
+  await plugin.refreshReview('b'.repeat(24));
+  assert.deepEqual(actions, ['refresh']);
+  assert.equal(opened, 1);
+  assert.ok(Notice.messages.includes('Compare the definition text.'));
+  plugin.onunload();
+});
+
+test('selected IDs, preview tokens and concept paths are literal validated arguments', async () => {
+  const id = 'e'.repeat(24), token = 'f'.repeat(64);
+  const command = await prepare('/synthetic-vault', native, 'linux', 'apply', neverSpawn, noCheck, { proposalIds: [id], planToken: token });
+  assert.deepEqual(command.args.slice(-4), ['--proposal', id, '--plan-token', token]);
+  const paths = ['Concepts/A $variable; name.md', 'Concepts/B.md'];
+  const comparison = await prepare('/synthetic-vault', native, 'linux', 'consolidate', neverSpawn, noCheck, { memberPaths: paths });
+  assert.deepEqual(comparison.args.slice(-4), ['--member', paths[0], '--member', paths[1]]);
+  assert.equal(comparison.options.shell, false);
+  await assert.rejects(prepare('/synthetic-vault', native, 'linux', 'apply', neverSpawn, noCheck, { proposalIds: ['--full'] }), /valid approved/);
+  await assert.rejects(prepare('/synthetic-vault', native, 'linux', 'refresh', neverSpawn, noCheck, { id: '../private' }), /valid review/);
+  await assert.rejects(prepare('/synthetic-vault', native, 'linux', 'consolidate', neverSpawn, noCheck, { memberPaths: ['Concepts/../private.md', paths[1]] }), /distinct concept/);
+});
+
+test('unrelated review metadata does not make a small selected preview too large', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
+  const id = 'a'.repeat(24);
+  plugin.execute = async () => {
+    plugin.runner.snapshot.status = 'completed';
+    return { can_apply: true, selected_ids: [id], plan_token: 'b'.repeat(64), changes: ['Concepts/selected.md'],
+      diffs: { 'Concepts/selected.md': '+A selected definition.' },
+      readiness: { items: [{ id, path: 'Reviews/Links/selected.md' }, { id: 'c'.repeat(24), path: 'Reviews/Links/other.md', reason: 'x'.repeat(40000) }] } };
+  };
+  await plugin.previewReviews([id]);
+  assert.equal(Modal.opened.length, 1);
+  const report = Modal.opened[0].contentEl.children.find(el => el.cls === 'research-vault-diagnostic')!.text;
+  assert.ok(report.includes('+A selected definition.'));
+  assert.ok(!report.includes('Reviews/Links/other.md'));
+  assert.ok(!report.includes('plan_token'));
+  plugin.onunload();
 });
 
 test('pipeline errors notify even when completion notifications are disabled', async () => {
@@ -402,6 +538,44 @@ test('dashboard and review navigation open existing files without modifying note
   assert.deepEqual(picker.getSuggestions('').map(file => file.path), ['Reviews/Links/synthetic.md']);
   picker.onChooseSuggestion(plugin.app.files[1]);
   assert.equal(plugin.app.opened[1], 'Reviews/Links/synthetic.md'); plugin.onunload();
+});
+
+test('pending review queue and decision history follow saved statuses without changing files', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const statuses: Record<string, string> = {
+    'Reviews/Links/pending.md': 'pending',
+    'Reviews/Revisions/claim.md': 'pending',
+    'Reviews/Removals/removal.md': 'pending',
+    'Reviews/Links/approved.md': 'approved',
+    'Reviews/Revisions/rejected.md': 'rejected',
+    'Reviews/Links/invalid.md': 'invalid',
+    'My Notes/personal.md': 'pending',
+  };
+  plugin.app.files = [...Object.keys(statuses), 'Reviews/Links/uncached.md'].map(name => new TFile(name));
+  plugin.app.metadataCache.getFileCache = file => ({ frontmatter: { status: statuses[file.path] } });
+  const originalFiles = [...plugin.app.files];
+  type Picker = { getSuggestions(query: string): TFile[]; getSuggestionText(file: TFile): string; onChooseSuggestion(file: TFile): void };
+  const paths = (picker: Picker, query = '') => picker.getSuggestions(query).map(file => file.path);
+  Modal.opened = []; plugin.openReviews();
+  const queue = Modal.opened[0] as unknown as Picker;
+  assert.deepEqual(paths(queue), ['Reviews/Links/pending.md', 'Reviews/Removals/removal.md', 'Reviews/Revisions/claim.md']);
+  assert.deepEqual(paths(queue, 'CLAIM'), ['Reviews/Revisions/claim.md']);
+
+  statuses['Reviews/Links/pending.md'] = 'approved';
+  assert.ok(!paths(queue).includes('Reviews/Links/pending.md'));
+  plugin.commands.find(command => command.id === 'review-history')!.callback();
+  const history = Modal.opened[1] as unknown as Picker;
+  assert.deepEqual(paths(history), ['Reviews/Links/approved.md', 'Reviews/Links/pending.md', 'Reviews/Revisions/rejected.md']);
+  const approved = history.getSuggestions('approved')[0];
+  assert.equal(history.getSuggestionText(approved), 'Reviews/Links/approved.md (approved)');
+  history.onChooseSuggestion(approved);
+  assert.deepEqual(plugin.app.opened, ['Reviews/Links/approved.md']);
+
+  statuses['Reviews/Links/approved.md'] = 'pending';
+  assert.ok(paths(queue).includes('Reviews/Links/approved.md'));
+  assert.ok(!paths(history).includes('Reviews/Links/approved.md'));
+  assert.deepEqual(plugin.app.files, originalFiles);
+  plugin.onunload();
 });
 
 test('sidebar renders status, counters, review counts, diagnostics and disabled controls', async () => {

@@ -32,7 +32,8 @@ source_roots: []
 
 llm:
   default_provider: codex     # Existing vaults without llm settings continue to use Codex.
-  agents: {}                 # Role names: literature, manuscript, concepts, linking, synthesis, maintenance.
+  agents: {}                 # Roles: literature, manuscript, concepts, linking, synthesis, maintenance, consolidation.
+  # consolidation inherits linking's provider/model unless explicitly configured.
   # Example mixed workflow (instead of agents: {}):
   # agents:
   #   literature: codex

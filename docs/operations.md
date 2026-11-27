@@ -68,6 +68,50 @@ new pending proposals without inheriting approval; apply alone integrates the
 exact reviewed replacement. Source hashes, ownership and stale-note checks still
 apply. Rejections persist through incremental and full syncs.
 
+Review Readiness validates active reviews independently and reports all blockers,
+dependency diffs and concept candidates. New note snapshots live in private state.
+Link dependencies ignore only recognized generated graph lines, YAML presentation
+and display-only cssclasses; scientific prose, mathematics, identity, provenance,
+aliases and user additions remain dependencies. Legacy matching hashes can gain
+snapshots; stale legacy hashes are never silently rebased. Targeted `review refresh`
+registers a new pending link/claim version without inference or a collection sync,
+and supersedes the old review without copying its decision. A changed original
+claim source still requires source synchronization.
+
+An exact existing typed source/target relationship is a successful Refresh no-op
+for scientific notes. Python records a protected already_represented resolution,
+preserves status/payload/applied=false, and removes that obsolete review from
+active counts/readiness while retaining it in history. A generic reference or a
+different relationship type cannot resolve it. Alternative concept definition
+text remains active and opens consolidation comparison. Resolution markers are
+integrity checked, and a resolved identity does not prevent a later newly pending
+proposal if the relationship disappears and is proposed again.
+
+Read-only apply previews return complete readiness and diffs. Default mutation
+remains strict; explicit proposal IDs or `--ready` opt into independent ready work.
+The GUI obtains a selected preview and sends only those IDs and its plan token on
+confirmation. Revalidation, current decisions, concurrency checks, removal backup
+and ownership validation run again before commit. Interacting definition changes
+and deletions require separate phases. A preview token cannot authorize a new or
+changed decision; it only requires an unchanged set of output changes.
+
+Concept candidates compare existing notes and pending/approved creation proposals.
+Title/alias similarity is a heuristic, never equivalence. Explicit member selection
+supports differently named concepts. The consolidation role inherits linking's
+runtime profile unless explicitly configured and can generate a
+bounded merge/keep-separate/relate suggestion only on explicit request. Python
+validates and registers a pending consolidation under Reviews/Concepts. Source
+quotes, prior names, source evidence and typed relationships must be preserved.
+Merge previews enumerate definitions and link impacts. Canonical IDs stay stable;
+alternative notes retain original text and additions as concept-redirect records.
+Only generated owned links are rewritten; other references retain their old
+targets and work through redirects. The retrieval registry records only actual
+rewrites and excludes retired concept notes. Scoped keep-separate decisions survive
+creation of the compared notes but expire when definitions/scope/aliases change.
+First registering a consolidation uses state schema 2 so older code refuses it.
+This release reads both schemas; installing code never applies or refreshes live
+reviews automatically.
+
 `completed_operations` counts validated inference jobs, including cached reuse;
 `completed_documents` counts documents retained as summaries or review drafts.
 `pending_claim_reviews`, `pending_link_reviews` and `processing_failures` are

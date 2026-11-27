@@ -187,7 +187,10 @@ var ACTION_ARGS = {
   apply: ["apply"],
   preview: ["apply", "--dry-run"],
   status: ["status"],
-  doctor: ["doctor"]
+  doctor: ["doctor"],
+  readiness: ["review", "status"],
+  refresh: ["review", "refresh"],
+  consolidate: ["concepts", "suggest"]
 };
 var nodeSpawn = (command, args, options) => (0, import_node_child_process.spawn)(command, args, options);
 function validText(value, label) {
@@ -234,7 +237,7 @@ async function capture(command, launch, limit = 128 * 1024) {
 async function prepare(vault, settings, platform, action, launch = nodeSpawn, checkFile = async (file, executable) => {
   if (!(await import_node_fs.promises.stat(file)).isFile()) throw new Error("not a regular file");
   await import_node_fs.promises.access(file, executable && platform !== "win32" ? import_node_fs.constants.X_OK : import_node_fs.constants.R_OK);
-}) {
+}, selection) {
   validText(vault, "Vault");
   validText(settings.distribution, "Distribution");
   if (settings.mode !== "native" && settings.mode !== "wsl") throw new Error("Invalid execution mode.");
@@ -265,6 +268,21 @@ async function prepare(vault, settings, platform, action, launch = nodeSpawn, ch
   const venvConfig = api.join(api.dirname(bin), "pyvenv.cfg");
   let isVenv = false;
   const args = ["-u", script, "--vault", root, ...ACTION_ARGS[action]];
+  if (action === "consolidate" && selection?.memberPaths) {
+    if (selection.id || selection.memberPaths.length < 2 || selection.memberPaths.some((p) => !/^Concepts\/[^\\\u0000-\u001f]+\.md$/.test(p) || p.split("/").includes(".."))) throw new Error("Select distinct concept paths.");
+    for (const member of selection.memberPaths) args.push("--member", member);
+  } else if (action === "refresh" || action === "consolidate") {
+    if (!selection?.id || !/^[a-f0-9]{24}$/.test(selection.id)) throw new Error("Select a valid review or candidate ID.");
+    args.push(selection.id);
+  }
+  if (selection?.proposalIds) {
+    if (!["apply", "preview"].includes(action) || !selection.proposalIds.length || selection.proposalIds.some((id) => !/^[a-f0-9]{24}$/.test(id))) throw new Error("Select valid approved proposal IDs.");
+    for (const id of selection.proposalIds) args.push("--proposal", id);
+  }
+  if (selection?.planToken) {
+    if (action !== "apply" || !/^[a-f0-9]{64}$/.test(selection.planToken)) throw new Error("Invalid review preview token.");
+    args.push("--plan-token", selection.planToken);
+  }
   const required = [[python, true], [script, false], [api.join(root, "config.yaml"), false]];
   if (settings.mode === "native") {
     for (const [file, executable] of required) {
@@ -340,7 +358,7 @@ var Runner = class {
     this.snapshot.logs.push(redact(line).slice(0, 4e3));
     if (this.snapshot.logs.length > max) this.snapshot.logs.splice(0, this.snapshot.logs.length - max);
   }
-  async run(vault, settings, platform, action) {
+  async run(vault, settings, platform, action, selection) {
     settings = { ...settings };
     const key = platform === "win32" ? import_node_path.default.win32.normalize(vault).toLowerCase() : import_node_path.default.posix.normalize(vault);
     if (this.disposed) throw new Error("Research Vault is unloaded.");
@@ -362,7 +380,7 @@ var Runner = class {
     this.changed();
     let result;
     try {
-      const command = await prepare(vault, settings, platform, action, this.launch);
+      const command = await prepare(vault, settings, platform, action, this.launch, void 0, selection);
       if (this.disposed) throw new Error("Plugin unloaded before the command started.");
       const code = await new Promise((resolve, reject) => {
         const child = this.launch(command.executable, command.args, command.options);
@@ -434,7 +452,9 @@ var COMMANDS = [
   ["status", "Research: Status"],
   ["doctor", "Research: Doctor"],
   ["dashboard", "Research: Open Dashboard"],
-  ["reviews", "Research: Open Review Queue"]
+  ["reviews", "Research: Open Review Queue"],
+  ["review-history", "Research: Open Review History"],
+  ["review-readiness", "Research: Review Readiness"]
 ];
 var ConfirmModal = class extends import_obsidian.Modal {
   constructor(app, title, message, proceed, details) {
@@ -457,16 +477,143 @@ var ConfirmModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
-var ReviewPicker = class extends import_obsidian.SuggestModal {
-  constructor(app) {
+var ReviewReadinessModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, report) {
     super(app);
-    this.setPlaceholder("Find links, claim drafts, removals or revisions");
+    this.plugin = plugin;
+    this.report = report;
+  }
+  onOpen() {
+    const el = this.contentEl;
+    el.createEl("h2", { text: "Review readiness" });
+    el.createEl("p", { text: "Select ready approvals to preview. Blocked reviews stay unchanged. Refresh creates a new pending review without running Sync." });
+    const selected = /* @__PURE__ */ new Set();
+    const priority = (item) => item.state === "ready" ? 0 : item.state === "needs-review" ? 2 : 1;
+    const items = Array.isArray(this.report.items) ? this.report.items.filter(isRecord).sort((a, b) => priority(a) - priority(b)) : [];
+    for (const item of items) {
+      const row = el.createDiv();
+      row.createEl("p", { text: `${item.state}: ${item.path}` });
+      row.createEl("p", { text: String(item.reason ?? "") });
+      const controls = new import_obsidian.Setting(row);
+      if (item.state === "ready" && typeof item.id === "string") {
+        selected.add(item.id);
+        controls.addToggle((toggle) => toggle.setValue(true).onChange((value) => {
+          if (value) selected.add(String(item.id));
+          else selected.delete(String(item.id));
+        }));
+      }
+      controls.addButton((button) => button.setButtonText("Open review").onClick(() => {
+        const file = this.app.vault.getAbstractFileByPath(String(item.path));
+        if (file instanceof import_obsidian.TFile) void this.app.workspace.getLeaf(false).openFile(file);
+      }));
+      if (item.state === "needs-revalidation" && item.refreshable === true && typeof item.id === "string") {
+        controls.addButton((button) => button.setButtonText("Refresh review").onClick(() => {
+          this.close();
+          void this.plugin.refreshReview(String(item.id));
+        }));
+      }
+      if (Array.isArray(item.differences)) {
+        for (const difference of item.differences.filter(isRecord)) {
+          const text = String(difference.diff ?? difference.reason ?? "");
+          row.createEl("pre", { text: `${difference.note}
+${text.slice(0, 16e3)}${text.length > 16e3 ? "\nDisplay truncated; use review status in the CLI for the full diff." : ""}`, cls: "research-vault-diagnostic" });
+        }
+      }
+    }
+    const groups = Array.isArray(this.report.concept_candidates) ? this.report.concept_candidates.filter(isRecord) : [];
+    for (const group of groups) {
+      const row = el.createDiv();
+      row.createEl("h3", { text: "Possible concept consolidation" });
+      row.createEl("p", { text: String(group.reason ?? "") });
+      if (Array.isArray(group.members)) for (const member of group.members.filter(isRecord)) {
+        row.createEl("p", { text: String(member.path) });
+      }
+      new import_obsidian.Setting(row).addButton((button) => button.setButtonText("Suggest consolidation").onClick(() => {
+        new ConfirmModal(
+          this.app,
+          "Prepare a consolidation suggestion",
+          "The configured consolidation agent will compare these candidates and propose merging, keeping them separate, or relating them. This uses inference and creates a pending review for your approval.",
+          () => {
+            this.close();
+            void this.plugin.suggestConsolidation(String(group.id));
+          }
+        ).open();
+      }));
+    }
+    if (Array.isArray(this.report.concept_catalog)) {
+      new import_obsidian.Setting(el).addButton((button) => button.setButtonText("Compare other concepts").onClick(() => {
+        new ConceptComparisonModal(this.app, this.plugin, this.report.concept_catalog.filter(isRecord)).open();
+      }));
+    }
+    new import_obsidian.Setting(el).addButton((button) => button.setButtonText("Preview selected").onClick(() => {
+      if (!selected.size) {
+        new import_obsidian.Notice("Select at least one ready approval.");
+        return;
+      }
+      this.close();
+      void this.plugin.previewReviews([...selected]);
+    }));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ConceptComparisonModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, catalog) {
+    super(app);
+    this.plugin = plugin;
+    this.catalog = catalog;
+  }
+  onOpen() {
+    const selected = /* @__PURE__ */ new Set();
+    this.contentEl.createEl("h2", { text: "Compare existing or proposed concepts" });
+    this.contentEl.createEl("p", { text: "Choose at least two concepts. This also supports differently named concepts that the name-based candidate search did not find." });
+    for (const member of this.catalog) {
+      const row = this.contentEl.createDiv();
+      row.createEl("p", { text: String(member.path) });
+      new import_obsidian.Setting(row).addToggle((toggle) => toggle.setValue(false).onChange((value) => {
+        if (value) selected.add(String(member.path));
+        else selected.delete(String(member.path));
+      }));
+    }
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Suggest consolidation").onClick(() => {
+      if (selected.size < 2) {
+        new import_obsidian.Notice("Select at least two concepts.");
+        return;
+      }
+      new ConfirmModal(
+        this.app,
+        "Prepare a consolidation suggestion",
+        "The configured consolidation agent will compare the selected definitions and source notes. This uses inference and creates a pending review; it does not change the graph.",
+        () => {
+          this.close();
+          void this.plugin.suggestConsolidation(void 0, [...selected]);
+        }
+      ).open();
+    }));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ReviewPicker = class extends import_obsidian.SuggestModal {
+  constructor(app, history = false) {
+    super(app);
+    this.history = history;
+    this.setPlaceholder(history ? "Find decided, superseded or resolved reviews" : "Find pending links, claim drafts, removals or revisions");
   }
   getSuggestions(query) {
-    return this.app.vault.getMarkdownFiles().filter((file) => /^Reviews\/(Links|Removals|Revisions)\//.test(file.path) && file.path.toLowerCase().includes(query.toLowerCase())).sort((a, b) => a.path.localeCompare(b.path));
+    return this.app.vault.getMarkdownFiles().filter((file) => /^Reviews\/(Links|Removals|Revisions|Concepts)\//.test(file.path) && file.path.toLowerCase().includes(query.toLowerCase())).filter((file) => {
+      const status = this.app.metadataCache.getFileCache(file)?.frontmatter?.status;
+      const superseded = this.app.metadataCache.getFileCache(file)?.frontmatter?.superseded_by;
+      const resolved = this.app.metadataCache.getFileCache(file)?.frontmatter?.resolved === "already_represented";
+      return this.history ? status === "approved" || status === "rejected" || typeof superseded === "string" || resolved : status === "pending" && !superseded && !resolved;
+    }).sort((a, b) => a.path.localeCompare(b.path));
   }
   getSuggestionText(file) {
     const status = this.app.metadataCache.getFileCache(file)?.frontmatter?.status;
+    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.resolved === "already_represented") return `${file.path} (already represented)`;
+    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.superseded_by) return `${file.path} (superseded)`;
     return `${file.path}${typeof status === "string" ? ` (${status})` : ""}`;
   }
   renderSuggestion(file, el) {
@@ -515,7 +662,8 @@ var ResearchView = class extends import_obsidian.ItemView {
       ["Pending claim drafts", state.pending?.claim],
       ["Pending removals", state.pending?.removal],
       ["Pending revisions", state.pending?.revision],
-      ["Last successful sync", state.lastSuccess]
+      ["Last successful sync", state.lastSuccess],
+      ["Pending concept decisions", state.pending?.consolidation]
     ]) {
       stats.createEl("dt", { text: String(label) });
       stats.createEl("dd", { text: typeof value === "number" || typeof value === "string" ? redact(String(value)) : "Not reported" });
@@ -527,6 +675,7 @@ var ResearchView = class extends import_obsidian.ItemView {
       button.addEventListener("click", () => this.plugin.request(action));
     }
     controls.createEl("button", { text: "Open Review Queue" }).addEventListener("click", () => this.plugin.openReviews());
+    controls.createEl("button", { text: "Review History" }).addEventListener("click", () => this.plugin.openReviews(true));
     controls.createEl("button", { text: "Open Dashboard" }).addEventListener("click", () => {
       void this.plugin.openDashboard();
     });
@@ -553,6 +702,8 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
       this.addCommand({ id, name, callback: () => {
         if (id === "dashboard") void this.openDashboard();
         else if (id === "reviews") this.openReviews();
+        else if (id === "review-history") this.openReviews(true);
+        else if (id === "review-readiness") void this.previewReviews();
         else this.request(id);
       } });
     }
@@ -605,10 +756,27 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
       ).open();
     } else void this.execute(action);
   }
-  async previewReviews() {
-    const preview = await this.execute("preview", true);
+  async previewReviews(proposalIds) {
+    if (!proposalIds) {
+      const report = await this.execute("readiness", true);
+      if (report && this.runner.snapshot.status === "completed" && !this.runner.disposed) new ReviewReadinessModal(this.app, this, report).open();
+      return;
+    }
+    const preview = await this.execute("preview", true, { proposalIds });
     if (!preview || this.runner.snapshot.status !== "completed" || this.runner.disposed) return;
-    const details = redact(JSON.stringify(preview, null, 2));
+    if (preview.can_apply !== true || typeof preview.plan_token !== "string" || !Array.isArray(preview.selected_ids) || preview.selected_ids.length !== proposalIds.length || preview.selected_ids.some((id) => typeof id !== "string" || !proposalIds.includes(id))) {
+      new import_obsidian.Notice("Selected reviews are no longer ready. Reopen Review Readiness.");
+      return;
+    }
+    const readinessItems = isRecord(preview.readiness) && Array.isArray(preview.readiness.items) ? preview.readiness.items.filter(isRecord) : [];
+    const details = redact(JSON.stringify({
+      reviews: readinessItems.filter((item) => proposalIds.includes(String(item.id))).map((item) => item.path),
+      changes: preview.changes,
+      diffs: preview.diffs,
+      removal_impacts: preview.impact_previews,
+      includes_deletion: preview.destructive,
+      deferred_approvals: Array.isArray(preview.skipped) ? preview.skipped.length : 0
+    }, null, 2));
     if (details.length > 32e3) {
       new import_obsidian.Notice("The approval preview is too large for this dialog. Review and apply using the terminal CLI.");
       return;
@@ -616,24 +784,40 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
     new ConfirmModal(
       this.app,
       "Apply reviewed decisions",
-      "Python preview of explicitly approved decisions, including any approved/delete removals. Continue only after reviewing these exact paths and impacts. Python revalidates approvals and requires a clean Git tree and a verified backup for deletion.",
+      "Review the selected note changes and removal impacts. Continue applies only these selected approvals. If the preview changes, review it again. Deletion requires current impact checks, a clean Git tree and a recoverable backup.",
       () => {
-        void this.execute("apply");
+        void this.execute("apply", false, { proposalIds, planToken: String(preview.plan_token) });
       },
       details
     ).open();
   }
-  async execute(action, quiet = false) {
+  async refreshReview(id) {
+    const result = await this.execute("refresh", false, { id });
+    if (result?.outcome === "concept_comparison_needed") {
+      if (typeof result.message === "string") new import_obsidian.Notice(result.message);
+      await this.previewReviews();
+      return;
+    }
+    if (result && (result.outcome === "already_represented" || result.outcome === "already_closed") && typeof result.message === "string") new import_obsidian.Notice(result.message);
+    const file = result && typeof result.path === "string" ? this.app.vault.getAbstractFileByPath(result.path) : void 0;
+    if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
+  }
+  async suggestConsolidation(id, memberPaths) {
+    const result = await this.execute("consolidate", false, memberPaths ? { memberPaths } : { id });
+    const file = result && typeof result.path === "string" ? this.app.vault.getAbstractFileByPath(result.path) : void 0;
+    if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
+  }
+  async execute(action, quiet = false, selection) {
     try {
       if (!(this.app.vault.adapter instanceof import_obsidian.FileSystemAdapter)) throw new Error("Research Vault requires a local desktop filesystem vault.");
       const vault = this.app.vault.adapter.getBasePath();
       const settings = { ...this.settings };
-      const result = await this.runner.run(vault, settings, process.platform, action);
+      const result = await this.runner.run(vault, settings, process.platform, action, selection);
       if (action === "status" && result && this.runner.snapshot.status !== "failed") {
         statusDetails(this.runner.snapshot, result);
         if (isRecord(result.last_report)) this.runner.snapshot.status = outcome(0, result.last_report);
         else this.runner.snapshot.status = "idle";
-      } else if (["sync", "full", "startup", "apply"].includes(action) && !this.runner.disposed) {
+      } else if (["sync", "full", "startup", "apply", "refresh", "consolidate"].includes(action) && !this.runner.disposed) {
         const finished = { ...this.runner.snapshot };
         try {
           const status = await this.runner.run(vault, settings, process.platform, "status");
@@ -680,8 +864,8 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
     if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
     else new import_obsidian.Notice("Home.md is missing from this vault.");
   }
-  openReviews() {
-    new ReviewPicker(this.app).open();
+  openReviews(history = false) {
+    new ReviewPicker(this.app, history).open();
   }
   async saveSettings() {
     await this.saveData(this.settings);

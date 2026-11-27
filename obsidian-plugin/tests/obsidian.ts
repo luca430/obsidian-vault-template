@@ -4,6 +4,7 @@ export class Element {
   text = '';
   cls = '';
   disabled = false;
+  checked = false;
   scrollTop = 0;
   scrollHeight = 0;
   clientHeight = 0;
@@ -77,9 +78,17 @@ class Button {
   setWarning(): this { return this; }
   onClick(callback: () => void): this { this.el.events.set('click', callback); return this; }
 }
+class Toggle {
+  constructor(private el: Element) {}
+  setValue(value: boolean): this { this.el.checked = value; return this; }
+  onChange(callback: (value: boolean) => void): this {
+    this.el.events.set('change', () => callback(this.el.checked)); return this;
+  }
+}
 export class Setting {
   constructor(private el: Element) {}
   addButton(callback: (button: Button) => void): this { callback(new Button(this.el.createEl('button'))); return this; }
+  addToggle(callback: (toggle: Toggle) => void): this { callback(new Toggle(this.el.createEl('input'))); return this; }
 }
 export class PluginSettingTab {
   containerEl = new Element();

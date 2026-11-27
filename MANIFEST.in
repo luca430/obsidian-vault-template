@@ -4,7 +4,7 @@ recursive-include Templates *.md
 recursive-include scripts *.py
 recursive-include tests *.py
 recursive-include docs *.md
-include .obsidian/app.json .obsidian/core-plugins.json
+include .obsidian/app.json .obsidian/core-plugins.json .obsidian/graph.json
 include .obsidian/plugins/research-vault/manifest.json
 include .obsidian/plugins/research-vault/main.js .obsidian/plugins/research-vault/styles.css
 include obsidian-plugin/package.json obsidian-plugin/package-lock.json
@@ -16,4 +16,5 @@ include .github/workflows/tests.yml
 include Literature/.gitkeep Concepts/.gitkeep
 include My?Work/.gitkeep My?Notes/.gitkeep
 include Reviews/Links/.gitkeep Reviews/Removals/.gitkeep Reviews/Revisions/.gitkeep
+include Reviews/Concepts/.gitkeep
 include .pipeline/.gitkeep

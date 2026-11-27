@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import importlib.util
 import json
 import subprocess
@@ -13,12 +14,14 @@ from .agents import (
     payload_budget,
     validate_note_evidence,
 )
-from .config import Config
+from .config import ROLES, Config
 from .notes import diagnostics, impact, read_notes, summary_content, update_note
 from .paths import environment
 from .processing import Processor
 from .recipes import reasoning_recipe, stage_recipe
 from .registry import Registry
+from .review_state import candidate_groups, concept_catalog, migrate_matching_dependencies
+from .review_workflow import readiness, select_reviews
 from .reviews import (
     apply_decisions,
     checkpoint,
@@ -47,6 +50,7 @@ from .storage import (
     file_hash,
     frontmatter,
     inside,
+    markdown,
     now,
     read_json,
     replace_section,
@@ -85,7 +89,7 @@ class Pipeline:
 
     def state(self) -> dict:
         state = read_json(inside(self.root, STATE), initial_state())
-        if not isinstance(state, dict) or state.get("schema") != 1:
+        if not isinstance(state, dict) or state.get("schema") not in (1, 2):
             raise VaultError(
                 "Unsupported state schema; restore matching code or migrate explicitly"
             )
@@ -131,6 +135,7 @@ class Pipeline:
             f"Pending claim reviews: {pending['claim']}",
             f"Pending removals: {pending['removal']}",
             f"Pending revisions: {pending['revision']}",
+            f"Pending concept decisions: {pending['consolidation']}",
             f"Errors: {1 if error else 0}",
         ]
         for status in ("pending", "skipped", "failed"):
@@ -201,14 +206,7 @@ class Pipeline:
                 "AGENTS.md",
                 *[
                     f"agents/{r}.md"
-                    for r in (
-                        "literature",
-                        "manuscript",
-                        "concepts",
-                        "linking",
-                        "synthesis",
-                        "maintenance",
-                    )
+                    for r in ROLES
                 ],
                 *[r["path"] for r in state["proposals"].values()],
             ]
@@ -986,6 +984,8 @@ class Pipeline:
 
     def reasoning_changes(self, result, payload, state, notes):
         """Validate against both the retrieved context and current full notes before caching."""
+        if result.get("consolidations"):
+            raise VaultError("Consolidations require an explicit concept review request")
         registry, changes = deepcopy(state["proposals"]), {}
         for candidate in result.get("links", []):
             warnings = validate_note_evidence(candidate["evidence"], payload["notes"])
@@ -1026,28 +1026,282 @@ class Pipeline:
                 raise VaultError(f"Review path already exists: {name}")
         commit(self.root, changes)
 
-    def apply(self, dry_run: bool = False) -> dict:
+    def review_status(self) -> dict:
         state = deepcopy(self.state())
         reviews = read_reviews(self.root, state["proposals"])
         notes = read_notes(self.root)
-        for pid, record in state["proposals"].items():
+        migrate_matching_dependencies(state["proposals"], notes)
+        return readiness(self.root, state, notes, reviews, self.config)
+
+    def refresh_review(self, pid: str) -> dict:
+        """Register a new pending version; never copy an earlier approval."""
+        state = deepcopy(self.state())
+        self.baseline(state)
+        reviews = read_reviews(self.root, state["proposals"])
+        notes = read_notes(self.root)
+        record = state["proposals"].get(pid)
+        if record and record.get("resolution"):
+            return {
+                "outcome": "already_closed",
+                "review": record["path"],
+                "path": record["payload"]["source"],
+                "status": reviews[pid]["status"],
+                "message": "This review is already closed. Its original decision remains in Review History.",
+            }
+        if not record or record["applied"] or record.get("superseded_by"):
+            raise VaultError("Choose an active, unapplied review to refresh")
+        if reviews[pid]["status"] == "rejected":
+            raise VaultError("Rejected reviews are not refreshed automatically")
+        changes = {}
+        if record["kind"] == "link":
+            payload = {
+                k: v
+                for k, v in record["payload"].items()
+                if k not in {"revised_from", "validation_warnings"}
+            }
+            replacement = link_proposal(
+                {**payload, "revised_from": pid}, state["proposals"], notes, changes
+            )
+            if replacement is None:
+                concept = payload.get("target_concept")
+                if concept:
+                    catalog = concept_catalog(notes, state["proposals"], reviews)
+                    current = catalog.get(payload["target"])
+                    if (
+                        not current
+                        or not current["existing"]
+                        or current["variants"][0] != concept
+                        or current.get("scope_additions")
+                    ):
+                        return {
+                            "outcome": "concept_comparison_needed",
+                            "review": record["path"],
+                            "path": record["path"],
+                            "target": payload["target"],
+                            "status": reviews[pid]["status"],
+                            "message": "The relationship already exists, but this review proposes different concept definition text. It remains active: use Suggest consolidation in Review Readiness to compare the definitions.",
+                        }
+                record["resolution"] = {
+                    "code": "already_represented",
+                    "resolved_at": now(),
+                    "source": payload["source"],
+                    "target": payload["target"],
+                    "relationship": payload["relationship"],
+                    "observed_source_hash": digest(notes[payload["source"]]),
+                }
+                meta, body = frontmatter(
+                    inside(self.root, record["path"]).read_text(encoding="utf-8")
+                )
+                changes[record["path"]] = markdown(
+                    {**meta, "resolved": "already_represented"},
+                    body
+                    + "\n\n## Resolution\n\nThe exact source, target and relationship type are already represented in the source note. "
+                    "Refresh closed this duplicate without applying or approving its draft. The original decision and proposal remain in history.\n",
+                )
+                self.save(state, changes)
+                return {
+                    "outcome": "already_represented",
+                    "review": record["path"],
+                    "path": payload["source"],
+                    "source": payload["source"],
+                    "target": payload["target"],
+                    "relationship": payload["relationship"],
+                    "status": reviews[pid]["status"],
+                    "applied": False,
+                    "message": "This relationship already exists. The duplicate review moved to history; no scientific notes or approval decisions were changed.",
+                }
+        elif record["kind"] == "claim":
+            context = record["claim_context"]
+            for path, expected in context["files"].items():
+                if file_hash(self.config.authorized(path)) != expected:
+                    raise VaultError(
+                        "Claim source changed; synchronize it before refreshing its draft"
+                    )
+            current = state[context["category"]].get(context["key"], {})
             if (
-                record["kind"] == "claim"
+                current.get("claim_review") != pid
+                or current.get("fingerprint") != context["fingerprint"]
+            ):
+                raise VaultError("A newer source draft exists; review that draft instead")
+            replacement = claim_proposal(
+                record["payload"]["draft"],
+                record["payload"]["validation_warnings"],
+                context,
+                state["proposals"],
+                notes,
+                changes,
+                pid,
+            )
+            current["claim_review"] = replacement
+        else:
+            raise VaultError(
+                "Only link and claim reviews can be refreshed; request a new consolidation for changed concepts"
+            )
+        record["superseded_by"] = replacement
+        meta, body = frontmatter(inside(self.root, record["path"]).read_text(encoding="utf-8"))
+        changes[record["path"]] = markdown({**meta, "superseded_by": replacement}, body)
+        self.save(state, changes)
+        return {
+            "superseded": pid,
+            "replacement": replacement,
+            "path": state["proposals"][replacement]["path"],
+            "status": "pending",
+        }
+
+    def suggest_consolidation(self, group_id: str | None = None, members=None) -> dict:
+        from .consolidations import register_consolidation
+
+        state = deepcopy(self.state())
+        self.baseline(state)
+        notes = read_notes(self.root)
+        reviews = read_reviews(self.root, state["proposals"])
+        if members:
+            catalog = concept_catalog(notes, state["proposals"], reviews)
+            paths = sorted(set(members))
+            if len(paths) < 2 or any(p not in catalog for p in paths):
+                raise VaultError("Select at least two distinct existing or proposed concept paths")
+            chosen = [catalog[p] for p in paths]
+            group = {
+                "id": digest(sorted(m["signature"] for m in chosen))[:24],
+                "members": chosen,
+                "reason": "Explicitly selected for comparison; selection does not establish equivalence.",
+            }
+        else:
+            groups = candidate_groups(
+                notes, state["proposals"], reviews, state.get("concept_distinctions")
+            )
+            group = next((g for g in groups if g["id"] == group_id), None)
+        if group is None:
+            raise VaultError("Concept candidates changed; reopen Review Readiness")
+        sources = {
+            state["proposals"][pid]["payload"]["source"]
+            for m in group["members"]
+            for pid in m["proposals"]
+        }
+        context = {m["path"] for m in group["members"] if m["existing"]} | sources
+        payload = {
+            "consolidation_request": group,
+            "notes": {p: notes[p] for p in sorted(context)},
+            "related_links": [
+                state["proposals"][pid]["payload"]
+                for m in group["members"]
+                for pid in m["proposals"]
+            ],
+        }
+        processor = Processor(self.config, self.agent, reasoning_recipe(self.config), self.progress)
+        if isinstance(self.agent, LLMRunner):
+            self.agent.authenticate(["consolidation"])
+        elif hasattr(self.agent, "authenticate"):
+            self.agent.authenticate()
+
+        def check(result):
+            suggestions = result.get("consolidations", [])
+            if len(suggestions) != 1:
+                raise VaultError("Return exactly one consolidation suggestion")
+            # Validation uses a temporary registry; a rejected result never reaches the queue.
+            register_consolidation(suggestions[0], group, deepcopy(state), notes, {})
+
+        result = processor.run("consolidation", payload, check)
+        changes = {}
+        pid = register_consolidation(result["consolidations"][0], group, state, notes, changes)
+        if pid in reviews and (
+            reviews[pid]["status"] != "pending" or state["proposals"][pid]["applied"]
+        ):
+            raise VaultError(
+                "This exact consolidation has already been decided; inspect its history before requesting a different proposal"
+            )
+        for other, record in state["proposals"].items():
+            if (
+                other != pid
+                and record["kind"] == "consolidation"
                 and not record["applied"]
                 and not record.get("superseded_by")
-                and reviews[pid]["status"] == "approved"
+                and reviews.get(other, {}).get("status") != "rejected"
+                and record["payload"]["members"] == state["proposals"][pid]["payload"]["members"]
             ):
-                for path, expected in record["claim_context"]["files"].items():
-                    if file_hash(self.config.authorized(path)) != expected:
-                        raise VaultError(
-                            "Stale claim approval: source file changed; sync and review again"
-                        )
-        changes, previews, destructive = apply_decisions(self.root, state, notes, reviews)
+                record["superseded_by"] = pid
+                meta, body = frontmatter(
+                    inside(self.root, record["path"]).read_text(encoding="utf-8")
+                )
+                changes[record["path"]] = markdown({**meta, "superseded_by": pid}, body)
+        self.save(state, changes)
+        return {"proposal": pid, "path": state["proposals"][pid]["path"], "status": "pending"}
+
+    def apply(
+        self, dry_run: bool = False, proposal_ids=None, ready_only=False, plan_token=None
+    ) -> dict:
+        state = deepcopy(self.state())
+        self.baseline(state)
+        reviews = read_reviews(self.root, state["proposals"])
+        notes = read_notes(self.root)
+        migrate_matching_dependencies(state["proposals"], notes)
+        report = readiness(self.root, state, notes, reviews, self.config)
+        approved = {
+            p
+            for p, r in state["proposals"].items()
+            if not r["applied"]
+            and not r.get("superseded_by")
+            and not r.get("resolution")
+            and reviews[p]["status"] == "approved"
+        }
+        selected = set(report["ready_ids"]) if ready_only else approved
+        if ready_only and not selected and approved and not dry_run:
+            raise VaultError(
+                "No approved reviews are ready; inspect Review Readiness before applying"
+            )
+        if proposal_ids is not None:
+            selected = set(proposal_ids)
+            if not selected or not selected.issubset(approved):
+                raise VaultError("Select only active, explicitly approved proposal IDs")
+        blocked = [i for i in report["blocked"] if i["id"] in selected]
+        can_apply = not blocked
+        if blocked and not dry_run:
+            raise VaultError(
+                "Reviews need attention:\n"
+                + "\n".join(f"{i['path']}: {i['reason']}" for i in blocked)
+            )
+        selected -= {i["id"] for i in blocked}
+        changes, previews, destructive = apply_decisions(
+            self.root, state, notes, select_reviews(reviews, selected)
+        )
+        token = digest(
+            {
+                "selected": sorted(selected),
+                "changes": changes,
+                "decisions": {p: reviews[p] for p in sorted(selected)},
+            }
+        )
+        if plan_token is not None and token != plan_token:
+            raise VaultError("Review preview changed; preview this selection again before applying")
         result = {
             "changes": sorted(changes),
             "impact_previews": previews,
             "destructive": destructive,
             "dry_run": dry_run,
+            "readiness": report,
+            "selected_ids": sorted(selected),
+            "can_apply": can_apply,
+            "plan_token": token,
+            "skipped": [
+                i
+                for i in report["items"]
+                if i["decision"] == "approved" and i["id"] not in selected
+            ],
+            "diffs": {
+                name: "".join(
+                    difflib.unified_diff(
+                        (
+                            inside(self.root, name).read_text(encoding="utf-8")
+                            if inside(self.root, name).exists()
+                            else ""
+                        ).splitlines(True),
+                        (text or "").splitlines(True),
+                        fromfile="before/" + name,
+                        tofile="after/" + name,
+                    )
+                )
+                for name, text in changes.items()
+            },
         }
         if dry_run:
             return result
@@ -1063,7 +1317,7 @@ class Pipeline:
             result["backup"] = checkpoint(self.root, changes)
             # Persist the exact preview before deleting any note.
             atomic(inside(self.root, ".pipeline/last-impact.json"), json.dumps(result, indent=2))
-        commit(self.root, changes)
+        self._commit_checked(changes)
         self.log("apply", result)
         return result
 

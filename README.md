@@ -26,7 +26,7 @@ managed and user-editable sections.
 - [Configure Zotero](#configure-zotero)
 - [Register personal manuscripts](#register-personal-manuscripts)
 - [Running the pipeline from Obsidian](#running-the-pipeline-from-obsidian)
-- [Graph colors](#graph-colors)
+- [Scientific graph and node colors](#scientific-graph-and-node-colors)
 - [Review conceptual relationships](#review-conceptual-relationships)
 - [Removed papers](#removed-papers)
 - [Initial sync, incremental work and request budgets](#initial-sync-incremental-work-and-request-budgets)
@@ -680,11 +680,13 @@ plugin name). Commands use the existing Python CLI, without changing its semanti
 | Research: Sync | `sync`, incremental |
 | Research: Full Sync | `sync --full`, after a warning and confirmation |
 | Research: Dry Run | `sync --dry-run`, inspect changes without inference or research writes |
-| Research: Apply Reviews | `apply --dry-run` preview, confirmation, then `apply` |
+| Research: Apply Reviews | Readiness, explicit selection, selected preview, confirmation, selected apply |
 | Research: Status | `status` |
 | Research: Doctor | `doctor` |
 | Research: Open Dashboard | Open existing `Home.md` |
-| Research: Open Review Queue | Search existing links, removals and revisions |
+| Research: Open Review Queue | Search pending links, claim drafts, removals and revisions |
+| Research: Open Review History | Search approved and rejected review records |
+| Research: Review Readiness | Ready approvals, stale diffs, refresh actions and concept consolidation candidates |
 
 Click the **microscope ribbon icon** or **Settings → Research Vault → Open sidebar**
 to open the Research Vault sidebar. The ribbon can be disabled in settings (reload
@@ -716,12 +718,23 @@ not paste sensitive logs into public issues. Change **Maximum displayed log line
 never as executable content or HTML from scientific sources.
 
 Use **Open Review Queue** to search paths in `Reviews/Links/`,
-`Reviews/Removals/` and `Reviews/Revisions/`; results include the note's current
-status. This includes existing approved/rejected artifacts so they remain
-inspectable. Review the actual evidence and edit decisions in Obsidian Properties
-or source mode. Claim drafts also reside in `Reviews/Revisions/`. The plugin
+`Reviews/Removals/`, `Reviews/Revisions/` and `Reviews/Concepts/`; results include the note's current
+status. Only active `status: pending` files appear in the active queue. Once a saved
+decision becomes approved or rejected, the file leaves that view. Use the sidebar's
+**Review History** button or **Research: Open Review History** command to inspect
+approved/rejected, superseded and resolved reviews, including approvals that have not been applied yet.
+Approved decisions still require **Apply Reviews**; changing the status alone
+does not integrate a proposal. Ordinary unapplied decisions can return to the
+queue by setting their status back to pending. Superseded and resolved records
+stay in history; their Python-managed markers must not be edited. Files stay at their registered paths to preserve
+the evidence, integrity checks, rejection memory and audit trail; they are not
+deleted or moved. Review the actual evidence and edit decisions in Obsidian
+Properties or source mode. Claim drafts also reside in `Reviews/Revisions/`. The plugin
 never writes approvals or scientific notes directly. Apply Reviews first displays
-Python's exact dry-run changes and removal impacts. Cancel leaves them unapplied;
+**Review Readiness**. Select the ready approvals you want, click **Preview selected**,
+and inspect Python's exact changes, text diffs and removal impacts. The final
+confirmation applies only those IDs with a token binding the displayed changes;
+new approvals or changed output cannot silently join that apply. Cancel leaves them unapplied;
 a failed/oversized preview blocks the GUI apply. Python rechecks approvals, stale
 sources, ownership, removal impacts, clean Git state and recoverable backups. A
 confirmation never substitutes for an explicit approved/delete review decision.
@@ -817,33 +830,50 @@ included by `.gitignore` and the Python source-distribution manifest. GitHub's
 **Use this template** therefore carries a ready-to-enable plugin to each new
 independent project without user-specific settings.
 
-## Graph colors
+## Scientific graph and node colors
 
-Use Obsidian's core **Graph view: Open graph view** command. Open the graph settings
-(cog icon). In **Filters → Search files**, enter:
+New vaults include `.obsidian/graph.json` with a scientific graph preset. It shows
+only notes under `Literature/`, `Concepts/`, `My Notes/` and `My Work/`, with a
+different node color for each folder. Review files (including history), templates,
+instructions, documentation, code and the dashboard stay outside this view.
+Tags, attachments and unresolved targets are hidden. Isolated scientific notes
+remain visible: lacking an approved relationship does not exclude a paper or
+personal note from the graph. Filtering changes the display only; it does not
+delete notes, establish scientific equivalence or create any relationships.
+
+Use Obsidian's core **Graph view: Open graph view** command. Open its settings
+(cog icon) to customize **Filters** and **Groups**. In an existing vault, configure
+the following through that UI, or back up its `.obsidian/graph.json` and copy the
+template preset while Obsidian is closed. Copying the preset replaces existing
+graph preferences; other Obsidian settings and notes do not need replacement.
+To preserve custom graph layout/physics settings, change only the filters and
+groups in the UI. In **Filters → Search files**, enter:
 
 ```text
--path:"Reviews/" -path:"agents/" -path:"Templates/" -path:"docs/" -file:README -file:AGENTS -file:Home
+(path:"Literature/" OR path:"Concepts/" OR path:"My Notes/" OR path:"My Work/") -path:"Reviews/" -[kind:concept-redirect]
 ```
 
-This excludes the review queue and instruction/template nodes from the main
-scientific graph. Enable **Existing files only** and turn off **Tags** and
-**Attachments** if you only want note nodes. Under **Groups**, add these filters
-and colors in order:
+The explicit Reviews exclusion also hides `Reviews/Concepts/`, whose path would
+otherwise match the Concepts group. Enable **Existing files only**, turn off **Tags** and **Attachments**, and keep
+**Orphans** on to see isolated scientific notes. Under **Groups**, use:
 
 | Filter | Category | Color |
 | --- | --- | --- |
 | `path:"Literature/"` | External literature | Blue `#3B82F6` |
-| `path:"My Work/"` | Personal manuscripts | Orange `#F59E0B` |
-| `path:"My Notes/"` | Personal hypotheses | Green `#22C55E` |
-| `path:"Concepts/"` | Concepts | Purple `#A855F7` |
-| `path:"Reviews/"` | Review queue, when shown | Gray `#9CA3AF` |
+| `path:"Concepts/"` | Concepts created from approved agent proposals | Purple `#A855F7` |
+| `path:"My Notes/"` | Personal notes and hypotheses | Green `#22C55E` |
+| `path:"My Work/"` | Personal manuscripts and other works | Orange `#F59E0B` |
 
-Temporarily remove the Reviews filter to inspect its gray nodes. Pending proposals
-contain no wikilinks, so they do not introduce proposed edges even when visible.
-The settings are configured through the supported UI instead of committing an
-undocumented `graph.json` schema. No extra graph plugin is needed. See the
-[official Graph view instructions](https://help.obsidian.md/plugins/graph).
+Colors follow folders, not a judgment about scientific validity or authorship.
+Manual notes placed in `Concepts/` share that folder's color; retrieval-only agent
+annotations in `.pipeline/` never become graph nodes. Customize the group queries
+if your own folder structure differs. If an existing graph tab retains its old
+filter, close and reopen it, then check its settings; local graphs have their own
+settings and may need the same filters/groups applied separately. Obsidian can
+rewrite its saved graph preferences, so use the UI if a future version changes
+the preset format. No extra graph plugin is needed. See the official
+[Graph view](https://help.obsidian.md/plugins/graph) and
+[Search operators](https://help.obsidian.md/plugins/search) instructions.
 
 ## Review conceptual relationships
 
@@ -875,7 +905,7 @@ and replace `revision: null` with a complete replacement object: the summary fie
 Use source mode for nested objects. Run `sync` to validate the revision and register
 a separate pending review. The original review names its replacement and records
 `superseded_by` in private state; it cannot apply. Open and approve or reject the new review. A revision never
-inherits approval. This also allows a corrected justification with the same evidence.
+inherits approval. Superseded originals move to Review History. This also allows a corrected justification with the same evidence.
 
 Original proposal payload fields remain immutable; the separate `revision` field
 requests a new proposal. The local registry records their digest and rejects edits
@@ -883,11 +913,95 @@ outside the documented decision/revision fields. The LLM cannot set
 status or approval fields. Do not manually copy template review layouts into the
 queue; only registered proposals can be applied.
 
-If a source changes after you approve it, apply refuses the stale decision. Reset
-its status to `pending`, run `sync`, review the current sources/evidence again and
-then approve. If the evidence no longer exists, reject the old proposal. Changed
-removal impact creates a fresh review; reject older obsolete removal proposals.
-A returned collection member invalidates old removal decisions.
+### Review readiness and targeted refresh
+
+**Apply Reviews** or **Research: Review Readiness** shows every active review with
+its decision, readiness, file path and reason. Ready approvals have checkboxes;
+stale or conflicting reviews stay unapplied while you explicitly select independent
+ready work. The CLI equivalent is `review status`, followed by selected
+`apply --proposal ID` or the explicit `apply --ready` option. Plain `apply` still
+refuses a batch containing blocked approvals. Read-only previews return the full
+readiness report, including `can_apply: false` and all blockers, rather than failing
+at the first conflict. Removing a checkbox does not change that review's decision.
+
+New proposals save before-snapshots of referenced notes in private state. For link
+approvals, recognized generated relationship lines, YAML presentation changes and
+`cssclasses` changes do not invalidate scientific content. Definitions, source
+text, identifiers, provenance, aliases, user additions and unrecognized changes
+remain dependencies. Mathematical text is not whitespace-normalized or declared
+equivalent by an LLM. Claims, removals and consolidations retain exact note/impact
+checks because their operations replace content or change identities/links.
+
+For **needs-revalidation**, inspect the displayed before/after diff and click
+**Refresh review**. Python registers a separately identifiable **pending** link or
+claim replacement against the current notes, supersedes the original and opens
+the new review. This performs no collection sync and no inference. Inspect its
+current evidence before approving it. Refreshing one review does not rebase other
+stale approvals. If source PDF bytes changed, synchronize the source first; a note
+refresh cannot pretend an old extraction is current. Missing evidence or a changed
+target identity may require an explicit revision rather than an unchanged refresh.
+
+If the exact source, target and relationship type already exist, Refresh succeeds
+without creating a duplicate proposal. It records an `already_represented`
+resolution, removes the obsolete review from the active queue/readiness and opens
+the source note for inspection. The original payload and decision remain in
+history, with `applied: false`; closing a duplicate does not approve its draft or
+claim to have scientifically revalidated it. A plain reference or another
+relationship type does not count as this exact match. If the review also proposes
+different concept definition text, it stays active and Refresh opens Readiness
+for a consolidation comparison instead. No definition is silently discarded.
+
+Existing reviews lacking historical snapshots remain readable. Matching original
+hashes can acquire snapshots during normal writes; already stale legacy reviews
+require one explicit refresh, and report that an old diff is unavailable. Pending
+plus Sync no longer silently replaces an old scientific baseline. Removed items
+still require their explicit removal decision, current impact check and backup.
+
+### Concept consolidation
+
+Readiness compares both existing concept notes and unapplied concept proposals.
+Conflicting definitions for one target are grouped together. Similar names and
+aliases are **candidates**, not established scientific equivalence; new duplicate
+candidates are held for review. Use **Suggest consolidation** to ask the configured
+consolidation role for one proposed decision. It inherits the linking provider and
+model unless `llm.agents.consolidation` explicitly overrides them. This is an explicit inference operation;
+it creates a pending review in `Reviews/Concepts/` and never changes the graph.
+**Compare other concepts** lets you select differently named existing/proposed
+concepts that the name-based matcher missed. Matching is not an exhaustive semantic
+search. Context exceeding the configured budget is refused, not silently truncated.
+
+The suggestion can propose **merge**, **keep-separate**, or **relate**. Inspect the
+original definitions, proposed definition, assumptions, distinctions, evidence,
+aliases, affected notes and proposed typed relationships in its review file.
+Relations require existing endpoints and evidence from both. Differing definitions
+using one identical path require a merge or revisions giving them distinct paths.
+For the latter, use each original link review's `revision` field and Sync.
+Consolidation output is immutable; to change a suggestion, request a replacement
+comparison against the current notes and review the new pending result.
+
+After you approve a merge, select that consolidation in Readiness and inspect its
+exact preview. The canonical concept keeps its stable ID; new concepts receive a
+stable ID when created. The proposal must explicitly retain prior titles/aliases,
+source evidence and distinct relationship types such as method and assumption.
+Existing alternative concept files keep their definitions and user additions as
+`kind: concept-redirect` notes linked to the canonical note. They are excluded by
+the supplied graph filter and from future concept retrieval. A merge deletes no
+notes. Only Python-owned generated links are rewritten; personal notes and other
+links keep working through retained redirects. Review the displayed impact and
+diffs before confirming. Original source proposals are superseded, not silently
+marked approved/rejected or reused as approvals of a new definition.
+
+Keeping concepts separate records the exact compared definitions so the same
+candidate is not repeatedly offered as notes are created. A scope/definition or
+alias change can require a new comparison. The relate option additionally applies
+only the exact evidenced relationships in the approved proposal. Both decisions
+preserve the original definitions. A rejected suggestion is retained in history;
+an identical rejected result is not resurrected as a pending proposal.
+
+The first consolidation review upgrades private state from schema 1 to schema 2.
+This version reads both. Older code rejects schema 2, so copy the matching Python
+modules, agent instructions and bundled plugin together; do not downgrade code or
+edit the state version to bypass that protection.
 
 Rejected links are retained. The same endpoints, relationship and evidence produce
 the same identity even if the LLM rephrases its justification. New evidence can
@@ -1052,7 +1166,15 @@ The wrapper script selects its own vault directory, even when called from elsewh
 | `sync --startup --background` | Bounded startup document jobs; defer concept extraction and reasoning |
 | `sync --full` | Reprocess all active papers/available works and reconsider graph context |
 | `sync --dry-run` | Inspect metadata, fingerprints and text availability; show operations/skip reasons; no writes or inference |
-| `apply --dry-run` | Validate approvals and print affected paths/removal impact; no writes |
+| `review status` | Read-only readiness, before/after diffs and concept candidates; no inference |
+| `review refresh ID` | Create a pending replacement, close an already represented duplicate, or direct alternative definitions to comparison; no Sync or inference |
+| `concepts candidates` | Read-only duplicate/conflicting concept candidate groups |
+| `concepts suggest GROUP_ID` | Use configured linking inference to create one pending consolidation |
+| `concepts suggest --member "Concepts/A.md" --member "Concepts/B.md"` | Explicitly compare differently named existing/proposed concepts |
+| `apply --dry-run` | Complete readiness report, selected ready paths/diffs and removal impact; no writes |
+| `apply --proposal ID --dry-run` | Preview only exact selected approved IDs; repeat `--proposal` for more |
+| `apply --proposal ID --plan-token TOKEN` | Revalidate and apply the unchanged selected preview |
+| `apply --ready` | Explicitly apply independent ready approvals; report skipped blockers |
 | `apply` | Deterministically apply validated user decisions |
 | `status` | Report counts, last success, warnings and pending transaction status |
 | `doctor` | Check config, packages, Zotero snapshot, native PDF page coverage, OCR availability, source authorization and both LLM runtimes' versions/login/flags |
@@ -1093,7 +1215,7 @@ the cause. The next normal mutation recovers an interrupted file transaction fir
 | Plugin command does not run | Enable Research Vault, check execution mode/distribution and Python path in its settings, then inspect sidebar output and run Doctor |
 | Another run holds lock | Wait for that process or stop it; the lock releases when the process exits, regardless of the lock file's presence |
 | Malformed/missing review | Restore the file from your backup, correct only status/decision; apply refuses the batch |
-| Stale approval/changed impact | Reset pending and sync to re-review, or reject an obsolete removal proposal |
+| Stale approval/changed impact | Inspect Readiness diffs; refresh link/claim to a new pending review, or re-sync changed sources/removal impact |
 | Dirty Git tree blocks delete | Review and commit/stash tracked changes, including the dashboard, then preview/apply again |
 
 ## Git, privacy and template updates
@@ -1134,9 +1256,12 @@ ignored research/configuration files.
    only their relevant stages and changed downstream inputs. Each completed parent is
    durable, and rerunning ordinary sync resumes interruptions. Do not delete state
    to force migration and do not use `--full` merely to retry.
-5. Re-review approvals whose source notes changed. Approved/rejected review files
-   remain intact; pending reviews can refresh expected hashes. Apply continues to
-   refuse stale approvals; reset them to pending and sync before approving again.
+5. Re-review approvals whose scientific dependencies changed. Review Readiness
+   shows all blockers and available diffs; targeted Refresh creates pending
+   replacements without a full Sync. Historical decisions remain intact. Legacy
+   stale hashes without snapshots need one explicit refresh. Copy all review
+   workflow/consolidation modules and the matching plugin together; the first
+   consolidation registers state schema 2 and requires this newer code thereafter.
 
 For a native Windows → WSL move, replace the Windows virtual environment with a
 new Linux environment after backing it up, sign into Linux Codex, and use the WSL

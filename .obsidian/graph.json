@@ -1,0 +1,40 @@
+{
+  "collapse-filter": false,
+  "search": "(path:\"Literature/\" OR path:\"Concepts/\" OR path:\"My Notes/\" OR path:\"My Work/\") -path:\"Reviews/\" -[kind:concept-redirect]",
+  "showTags": false,
+  "showAttachments": false,
+  "hideUnresolved": true,
+  "showOrphans": true,
+  "collapse-color-groups": false,
+  "colorGroups": [
+    {
+      "query": "path:\"Literature/\"",
+      "color": {
+        "a": 1,
+        "rgb": 3900150
+      }
+    },
+    {
+      "query": "path:\"Concepts/\"",
+      "color": {
+        "a": 1,
+        "rgb": 11032055
+      }
+    },
+    {
+      "query": "path:\"My Notes/\"",
+      "color": {
+        "a": 1,
+        "rgb": 2278750
+      }
+    },
+    {
+      "query": "path:\"My Work/\"",
+      "color": {
+        "a": 1,
+        "rgb": 16096779
+      }
+    }
+  ],
+  "showArrow": false
+}

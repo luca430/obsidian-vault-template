@@ -9,8 +9,10 @@ export const ACTION_ARGS = {
   sync: ['sync'], full: ['sync', '--full'], dry: ['sync', '--dry-run'],
   startup: ['sync', '--startup'], apply: ['apply'], preview: ['apply', '--dry-run'],
   status: ['status'], doctor: ['doctor'],
+  readiness: ['review', 'status'], refresh: ['review', 'refresh'], consolidate: ['concepts', 'suggest'],
 } as const;
 export type Action = keyof typeof ACTION_ARGS;
+export interface ReviewSelection { proposalIds?: string[]; planToken?: string; id?: string; memberPaths?: string[] }
 export interface Command { executable: string; args: string[]; options: SpawnOptions }
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
 export const nodeSpawn: Spawn = (command, args, options) => spawn(command, args, options);
@@ -60,6 +62,7 @@ export async function prepare(
     if (!(await fs.stat(file)).isFile()) throw new Error('not a regular file');
     await fs.access(file, executable && platform !== 'win32' ? constants.X_OK : constants.R_OK);
   },
+  selection?: ReviewSelection,
 ): Promise<Command> {
   validText(vault, 'Vault'); validText(settings.distribution, 'Distribution');
   if (settings.mode !== 'native' && settings.mode !== 'wsl') throw new Error('Invalid execution mode.');
@@ -89,6 +92,21 @@ export async function prepare(
   const venvConfig = api.join(api.dirname(bin), 'pyvenv.cfg');
   let isVenv = false;
   const args = ['-u', script, '--vault', root, ...ACTION_ARGS[action]];
+  if (action === 'consolidate' && selection?.memberPaths) {
+    if (selection.id || selection.memberPaths.length < 2 || selection.memberPaths.some(p => !/^Concepts\/[^\\\u0000-\u001f]+\.md$/.test(p) || p.split('/').includes('..'))) throw new Error('Select distinct concept paths.');
+    for (const member of selection.memberPaths) args.push('--member', member);
+  } else if (action === 'refresh' || action === 'consolidate') {
+    if (!selection?.id || !/^[a-f0-9]{24}$/.test(selection.id)) throw new Error('Select a valid review or candidate ID.');
+    args.push(selection.id);
+  }
+  if (selection?.proposalIds) {
+    if (!['apply', 'preview'].includes(action) || !selection.proposalIds.length || selection.proposalIds.some(id => !/^[a-f0-9]{24}$/.test(id))) throw new Error('Select valid approved proposal IDs.');
+    for (const id of selection.proposalIds) args.push('--proposal', id);
+  }
+  if (selection?.planToken) {
+    if (action !== 'apply' || !/^[a-f0-9]{64}$/.test(selection.planToken)) throw new Error('Invalid review preview token.');
+    args.push('--plan-token', selection.planToken);
+  }
   const required = [[python, true], [script, false], [api.join(root, 'config.yaml'), false]] as const;
   if (settings.mode === 'native') {
     for (const [file, executable] of required) {
@@ -145,7 +163,7 @@ export class Runner {
     if (this.snapshot.logs.length > max) this.snapshot.logs.splice(0, this.snapshot.logs.length - max);
   }
 
-  async run(vault: string, settings: ResearchSettings, platform: string, action: Action): Promise<RecordValue | undefined> {
+  async run(vault: string, settings: ResearchSettings, platform: string, action: Action, selection?: ReviewSelection): Promise<RecordValue | undefined> {
     settings = { ...settings };
     const key = platform === 'win32' ? path.win32.normalize(vault).toLowerCase() : path.posix.normalize(vault);
     if (this.disposed) throw new Error('Research Vault is unloaded.');
@@ -159,7 +177,7 @@ export class Runner {
     this.log(`Starting ${action}`, settings.maxLogLines); this.changed();
     let result: RecordValue | undefined;
     try {
-      const command = await prepare(vault, settings, platform, action, this.launch);
+      const command = await prepare(vault, settings, platform, action, this.launch, undefined, selection);
       if (this.disposed) throw new Error('Plugin unloaded before the command started.');
       const code = await new Promise<number | null>((resolve, reject) => {
         const child = this.launch(command.executable, command.args, command.options);

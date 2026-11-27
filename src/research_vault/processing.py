@@ -148,6 +148,8 @@ class Processor:
                     if role == "linking"
                     else "concepts"
                     if role == "concepts"
+                    else "consolidations"
+                    if role == "consolidation"
                     else "revisions"
                 )
                 for item in result[key]:

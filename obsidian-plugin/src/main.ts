@@ -2,7 +2,7 @@ import {
   App, FileSystemAdapter, ItemView, Modal, Notice, Plugin, PluginSettingTab,
   Setting, SuggestModal, TFile, WorkspaceLeaf,
 } from 'obsidian';
-import { Action, Runner } from './execution';
+import { Action, ReviewSelection, Runner } from './execution';
 import { RecordValue, isRecord, outcome, redact, statusDetails } from './protocol';
 import { ResearchSettings, defaultPython, loadSettings } from './settings';
 
@@ -12,6 +12,8 @@ export const COMMANDS = [
   ['dry', 'Research: Dry Run'], ['apply', 'Research: Apply Reviews'],
   ['status', 'Research: Status'], ['doctor', 'Research: Doctor'],
   ['dashboard', 'Research: Open Dashboard'], ['reviews', 'Research: Open Review Queue'],
+  ['review-history', 'Research: Open Review History'],
+  ['review-readiness', 'Research: Review Readiness'],
 ] as const;
 
 class ConfirmModal extends Modal {
@@ -29,15 +31,112 @@ class ConfirmModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
+class ReviewReadinessModal extends Modal {
+  constructor(app: App, private plugin: ResearchVaultPlugin, private report: RecordValue) { super(app); }
+  onOpen(): void {
+    const el = this.contentEl;
+    el.createEl('h2', { text: 'Review readiness' });
+    el.createEl('p', { text: 'Select ready approvals to preview. Blocked reviews stay unchanged. Refresh creates a new pending review without running Sync.' });
+    const selected = new Set<string>();
+    const priority = (item: RecordValue) => item.state === 'ready' ? 0 : item.state === 'needs-review' ? 2 : 1;
+    const items = Array.isArray(this.report.items) ? this.report.items.filter(isRecord).sort((a, b) => priority(a) - priority(b)) : [];
+    for (const item of items) {
+      const row = el.createDiv();
+      row.createEl('p', { text: `${item.state}: ${item.path}` });
+      row.createEl('p', { text: String(item.reason ?? '') });
+      const controls = new Setting(row);
+      if (item.state === 'ready' && typeof item.id === 'string') {
+        selected.add(item.id);
+        controls.addToggle(toggle => toggle.setValue(true).onChange(value => {
+          if (value) selected.add(String(item.id)); else selected.delete(String(item.id));
+        }));
+      }
+      controls.addButton(button => button.setButtonText('Open review').onClick(() => {
+        const file = this.app.vault.getAbstractFileByPath(String(item.path));
+        if (file instanceof TFile) void this.app.workspace.getLeaf(false).openFile(file);
+      }));
+      if (item.state === 'needs-revalidation' && item.refreshable === true && typeof item.id === 'string') {
+        controls.addButton(button => button.setButtonText('Refresh review').onClick(() => {
+          this.close(); void this.plugin.refreshReview(String(item.id));
+        }));
+      }
+      if (Array.isArray(item.differences)) {
+        for (const difference of item.differences.filter(isRecord)) {
+          const text = String(difference.diff ?? difference.reason ?? '');
+          row.createEl('pre', { text: `${difference.note}\n${text.slice(0, 16000)}${text.length > 16000 ? '\nDisplay truncated; use review status in the CLI for the full diff.' : ''}`, cls: 'research-vault-diagnostic' });
+        }
+      }
+    }
+    const groups = Array.isArray(this.report.concept_candidates) ? this.report.concept_candidates.filter(isRecord) : [];
+    for (const group of groups) {
+      const row = el.createDiv();
+      row.createEl('h3', { text: 'Possible concept consolidation' });
+      row.createEl('p', { text: String(group.reason ?? '') });
+      if (Array.isArray(group.members)) for (const member of group.members.filter(isRecord)) {
+        row.createEl('p', { text: String(member.path) });
+      }
+      new Setting(row).addButton(button => button.setButtonText('Suggest consolidation').onClick(() => {
+        new ConfirmModal(this.app, 'Prepare a consolidation suggestion',
+          'The configured consolidation agent will compare these candidates and propose merging, keeping them separate, or relating them. This uses inference and creates a pending review for your approval.',
+          () => { this.close(); void this.plugin.suggestConsolidation(String(group.id)); }).open();
+      }));
+    }
+    if (Array.isArray(this.report.concept_catalog)) {
+      new Setting(el).addButton(button => button.setButtonText('Compare other concepts').onClick(() => {
+        new ConceptComparisonModal(this.app, this.plugin, (this.report.concept_catalog as unknown[]).filter(isRecord)).open();
+      }));
+    }
+    new Setting(el).addButton(button => button.setButtonText('Preview selected').onClick(() => {
+      if (!selected.size) { new Notice('Select at least one ready approval.'); return; }
+      this.close(); void this.plugin.previewReviews([...selected]);
+    }));
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+class ConceptComparisonModal extends Modal {
+  constructor(app: App, private plugin: ResearchVaultPlugin, private catalog: RecordValue[]) { super(app); }
+  onOpen(): void {
+    const selected = new Set<string>();
+    this.contentEl.createEl('h2', { text: 'Compare existing or proposed concepts' });
+    this.contentEl.createEl('p', { text: 'Choose at least two concepts. This also supports differently named concepts that the name-based candidate search did not find.' });
+    for (const member of this.catalog) {
+      const row = this.contentEl.createDiv();
+      row.createEl('p', { text: String(member.path) });
+      new Setting(row).addToggle(toggle => toggle.setValue(false).onChange(value => {
+        if (value) selected.add(String(member.path)); else selected.delete(String(member.path));
+      }));
+    }
+    new Setting(this.contentEl).addButton(button => button.setButtonText('Suggest consolidation').onClick(() => {
+      if (selected.size < 2) { new Notice('Select at least two concepts.'); return; }
+      new ConfirmModal(this.app, 'Prepare a consolidation suggestion',
+        'The configured consolidation agent will compare the selected definitions and source notes. This uses inference and creates a pending review; it does not change the graph.',
+        () => { this.close(); void this.plugin.suggestConsolidation(undefined, [...selected]); }).open();
+    }));
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
 class ReviewPicker extends SuggestModal<TFile> {
-  constructor(app: App) { super(app); this.setPlaceholder('Find links, claim drafts, removals or revisions'); }
+  constructor(app: App, private history = false) {
+    super(app);
+    this.setPlaceholder(history ? 'Find decided, superseded or resolved reviews' : 'Find pending links, claim drafts, removals or revisions');
+  }
   getSuggestions(query: string): TFile[] {
     return this.app.vault.getMarkdownFiles()
-      .filter(file => /^Reviews\/(Links|Removals|Revisions)\//.test(file.path) && file.path.toLowerCase().includes(query.toLowerCase()))
+      .filter(file => /^Reviews\/(Links|Removals|Revisions|Concepts)\//.test(file.path) && file.path.toLowerCase().includes(query.toLowerCase()))
+      .filter(file => {
+        const status: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.status;
+        const superseded: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.superseded_by;
+        const resolved = this.app.metadataCache.getFileCache(file)?.frontmatter?.resolved === 'already_represented';
+        return this.history ? status === 'approved' || status === 'rejected' || typeof superseded === 'string' || resolved : status === 'pending' && !superseded && !resolved;
+      })
       .sort((a, b) => a.path.localeCompare(b.path));
   }
   getSuggestionText(file: TFile): string {
     const status: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.status;
+    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.resolved === 'already_represented') return `${file.path} (already represented)`;
+    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.superseded_by) return `${file.path} (superseded)`;
     return `${file.path}${typeof status === 'string' ? ` (${status})` : ''}`;
   }
   renderSuggestion(file: TFile, el: HTMLElement): void { el.setText(this.getSuggestionText(file)); }
@@ -68,6 +167,7 @@ export class ResearchView extends ItemView {
       ['Cache hits', state.cacheHits], ['Pending conceptual links', state.pending?.link],
       ['Pending claim drafts', state.pending?.claim], ['Pending removals', state.pending?.removal],
       ['Pending revisions', state.pending?.revision], ['Last successful sync', state.lastSuccess],
+      ['Pending concept decisions', state.pending?.consolidation],
     ]) {
       stats.createEl('dt', { text: String(label) });
       stats.createEl('dd', { text: typeof value === 'number' || typeof value === 'string' ? redact(String(value)) : 'Not reported' });
@@ -79,6 +179,7 @@ export class ResearchView extends ItemView {
       button.addEventListener('click', () => this.plugin.request(action));
     }
     controls.createEl('button', { text: 'Open Review Queue' }).addEventListener('click', () => this.plugin.openReviews());
+    controls.createEl('button', { text: 'Review History' }).addEventListener('click', () => this.plugin.openReviews(true));
     controls.createEl('button', { text: 'Open Dashboard' }).addEventListener('click', () => { void this.plugin.openDashboard(); });
     el.createEl('h3', { text: 'Warnings and errors' });
     if (!state.diagnostics.length) el.createEl('p', { text: 'No diagnostics reported for this command.' });
@@ -104,6 +205,8 @@ export default class ResearchVaultPlugin extends Plugin {
       this.addCommand({ id, name, callback: () => {
         if (id === 'dashboard') void this.openDashboard();
         else if (id === 'reviews') this.openReviews();
+        else if (id === 'review-history') this.openReviews(true);
+        else if (id === 'review-readiness') void this.previewReviews();
         else this.request(id);
       } });
     }
@@ -148,30 +251,61 @@ export default class ResearchVaultPlugin extends Plugin {
     } else void this.execute(action);
   }
 
-  async previewReviews(): Promise<void> {
-    const preview = await this.execute('preview', true);
+  async previewReviews(proposalIds?: string[]): Promise<void> {
+    if (!proposalIds) {
+      const report = await this.execute('readiness', true);
+      if (report && this.runner.snapshot.status === 'completed' && !this.runner.disposed) new ReviewReadinessModal(this.app, this, report).open();
+      return;
+    }
+    const preview = await this.execute('preview', true, { proposalIds });
     if (!preview || this.runner.snapshot.status !== 'completed' || this.runner.disposed) return;
-    const details = redact(JSON.stringify(preview, null, 2));
+    if (preview.can_apply !== true || typeof preview.plan_token !== 'string' || !Array.isArray(preview.selected_ids) || preview.selected_ids.length !== proposalIds.length || preview.selected_ids.some(id => typeof id !== 'string' || !proposalIds.includes(id))) {
+      new Notice('Selected reviews are no longer ready. Reopen Review Readiness.'); return;
+    }
+    const readinessItems = isRecord(preview.readiness) && Array.isArray(preview.readiness.items) ? preview.readiness.items.filter(isRecord) : [];
+    const details = redact(JSON.stringify({
+      reviews: readinessItems.filter(item => proposalIds.includes(String(item.id))).map(item => item.path),
+      changes: preview.changes, diffs: preview.diffs, removal_impacts: preview.impact_previews,
+      includes_deletion: preview.destructive,
+      deferred_approvals: Array.isArray(preview.skipped) ? preview.skipped.length : 0,
+    }, null, 2));
     if (details.length > 32000) {
       new Notice('The approval preview is too large for this dialog. Review and apply using the terminal CLI.');
       return;
     }
     new ConfirmModal(this.app, 'Apply reviewed decisions',
-      'Python preview of explicitly approved decisions, including any approved/delete removals. Continue only after reviewing these exact paths and impacts. Python revalidates approvals and requires a clean Git tree and a verified backup for deletion.',
-      () => { void this.execute('apply'); }, details).open();
+      'Review the selected note changes and removal impacts. Continue applies only these selected approvals. If the preview changes, review it again. Deletion requires current impact checks, a clean Git tree and a recoverable backup.',
+      () => { void this.execute('apply', false, { proposalIds, planToken: String(preview.plan_token) }); }, details).open();
   }
 
-  async execute(action: Action, quiet = false): Promise<RecordValue | undefined> {
+  async refreshReview(id: string): Promise<void> {
+    const result = await this.execute('refresh', false, { id });
+    if (result?.outcome === 'concept_comparison_needed') {
+      if (typeof result.message === 'string') new Notice(result.message);
+      await this.previewReviews(); return;
+    }
+    if (result && (result.outcome === 'already_represented' || result.outcome === 'already_closed') && typeof result.message === 'string') new Notice(result.message);
+    const file = result && typeof result.path === 'string' ? this.app.vault.getAbstractFileByPath(result.path) : undefined;
+    if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  async suggestConsolidation(id?: string, memberPaths?: string[]): Promise<void> {
+    const result = await this.execute('consolidate', false, memberPaths ? { memberPaths } : { id });
+    const file = result && typeof result.path === 'string' ? this.app.vault.getAbstractFileByPath(result.path) : undefined;
+    if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  async execute(action: Action, quiet = false, selection?: ReviewSelection): Promise<RecordValue | undefined> {
     try {
       if (!(this.app.vault.adapter instanceof FileSystemAdapter)) throw new Error('Research Vault requires a local desktop filesystem vault.');
       const vault = this.app.vault.adapter.getBasePath();
       const settings = { ...this.settings };
-      const result = await this.runner.run(vault, settings, process.platform, action);
+      const result = await this.runner.run(vault, settings, process.platform, action, selection);
       if (action === 'status' && result && this.runner.snapshot.status !== 'failed') {
         statusDetails(this.runner.snapshot, result);
         if (isRecord(result.last_report)) this.runner.snapshot.status = outcome(0, result.last_report);
         else this.runner.snapshot.status = 'idle';
-      } else if (['sync', 'full', 'startup', 'apply'].includes(action) && !this.runner.disposed) {
+      } else if (['sync', 'full', 'startup', 'apply', 'refresh', 'consolidate'].includes(action) && !this.runner.disposed) {
         // Ask Python for authoritative pending counts and last_success; never read
         // or interpret state.json/review approval rules in TypeScript.
         const finished = { ...this.runner.snapshot };
@@ -220,7 +354,7 @@ export default class ResearchVaultPlugin extends Plugin {
     if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
     else new Notice('Home.md is missing from this vault.');
   }
-  openReviews(): void { new ReviewPicker(this.app).open(); }
+  openReviews(history = false): void { new ReviewPicker(this.app, history).open(); }
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
 }
 

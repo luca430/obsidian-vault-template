@@ -36,7 +36,7 @@ OCR_DEFAULTS = {
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
 PROVIDERS = ("codex", "claude")
-ROLES = ("literature", "manuscript", "concepts", "linking", "synthesis", "maintenance")
+ROLES = ("literature", "manuscript", "concepts", "linking", "synthesis", "maintenance", "consolidation")
 
 
 def load_yaml(path: Path) -> dict:
@@ -200,6 +200,8 @@ class Config:
             raise VaultError(f"Unknown agent role: {role}")
         llm = self.data.get("llm", {})
         override = llm.get("agents", {}).get(role, {})
+        if role == "consolidation" and role not in llm.get("agents", {}):
+            override = llm.get("agents", {}).get("linking", {})
         if isinstance(override, str):
             override = {"provider": override}
         configured = override.get("provider", llm.get("default_provider", "codex"))

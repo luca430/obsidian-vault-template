@@ -64,6 +64,28 @@ LINK = obj(
     }
 )
 LINKS = obj({"links": array(LINK)})
+CONSOLIDATION = obj(
+    {
+        "operation": {"enum": ["merge", "keep-separate", "relate"]},
+        "canonical": {
+            "anyOf": [
+                obj(
+                    {
+                        "path": STRING,
+                        "title": STRING,
+                        "body": STRING,
+                        "aliases": array(STRING),
+                    }
+                ),
+                {"type": "null"},
+            ]
+        },
+        "explanation": STRING,
+        "distinctions": STRING,
+        "evidence": array(NOTE_EVIDENCE, 1),
+        "links": array(LINK),
+    }
+)
 REVISION = obj(
     {"note": STRING, "reason": STRING, "suggestion": STRING, "evidence": array(NOTE_EVIDENCE)}
 )
@@ -75,6 +97,7 @@ SCHEMAS = {
     "linking": LINKS,
     "synthesis": REVISIONS,
     "maintenance": REVISIONS,
+    "consolidation": obj({"consolidations": {**array(CONSOLIDATION, 1), "maxItems": 1}}),
 }
 
 PROMPT_SUFFIX = (

@@ -18,6 +18,7 @@ VERSIONS = {
     "synthesis": 3,
     "maintenance": 3,
     "retrieval": 3,
+    "consolidation": 1,
 }
 NAMESPACES = {
     "literature": "document_summaries",
@@ -26,6 +27,7 @@ NAMESPACES = {
     "linking": "relationship_proposals",
     "synthesis": "high_level_synthesis",
     "maintenance": "maintenance",
+    "consolidation": "concept_consolidation",
 }
 
 

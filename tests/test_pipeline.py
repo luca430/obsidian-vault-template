@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from copy import deepcopy
 
 import pytest
 import yaml
@@ -580,7 +581,79 @@ def test_appeared_concept_invalidates_unseen_target_approval(vault):
     decide(root, pipeline.state(), pid)
     target = root / "Concepts/mechanism.md"
     target.write_text("# User-defined concept with different scientific scope.\n")
-    with pytest.raises(VaultError, match="already appeared"):
+    with pytest.raises(VaultError, match="already appeared") as exc:
         pipeline.apply()
+    assert "Concepts/mechanism.md" in str(exc.value)
+    assert proposals(pipeline, "link")[pid]["path"] in str(exc.value)
+    assert "Literature/PAPER001.md" in str(exc.value)
     assert "[[Concepts/mechanism]]" not in (root / "Literature/PAPER001.md").read_text()
     assert "User-defined concept" in target.read_text()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_concept_conflict_lists_all_reviews_and_notes_without_writes(vault, dry_run):
+    root, _, _, agent, pipeline = vault
+    add_paper(vault)
+    add_paper(vault, "PAPER002")
+    first = link()
+    second = link(source="Literature/PAPER002.md")
+    second["target_concept"]["body"] = "A different definition requiring a user decision."
+    third = deepcopy(first)
+    third["relationship"] = "method"
+    other_first = link(target="Concepts/another.md")
+    other_second = link(source="Literature/PAPER002.md", target="Concepts/another.md")
+    other_second["target_concept"]["title"] = "A different title"
+    agent.links = [first, second, third, other_first, other_second]
+    pipeline.sync()
+    registered = proposals(pipeline, "link")
+    assert len(registered) == 5
+    for pid in registered:
+        decide(root, pipeline.state(), pid)
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    if dry_run:
+        preview = pipeline.apply(dry_run=True)
+        assert not preview["can_apply"]
+        message = "\n".join(item["reason"] for item in preview["readiness"]["blocked"])
+    else:
+        with pytest.raises(VaultError, match="Conflicting definitions") as exc:
+            pipeline.apply()
+        message = str(exc.value)
+    for record in registered.values():
+        assert record["path"] in message
+        assert record["payload"]["source"] in message
+        assert record["payload"]["target"] in message
+        assert f"relationship: {record['payload']['relationship']}" in message
+    assert "status: pending" in message
+    assert "revision field" in message
+    after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert after == before
+
+
+@pytest.mark.parametrize("other_review", ["identical", "pending", "rejected"])
+def test_concept_conflict_check_allows_matching_or_deferred_definitions(vault, other_review):
+    root, _, _, agent, pipeline = vault
+    add_paper(vault)
+    add_paper(vault, "PAPER002")
+    first = link()
+    second = link(source="Literature/PAPER002.md")
+    if other_review != "identical":
+        second["target_concept"]["body"] = "A different definition awaiting a decision."
+    agent.links = [first, second]
+    pipeline.sync()
+    registered = proposals(pipeline, "link")
+    assert len(registered) == 2
+    for pid, record in registered.items():
+        status = (
+            other_review
+            if record["payload"]["source"] == second["source"] and other_review != "identical"
+            else "approved"
+        )
+        decide(root, pipeline.state(), pid, status)
+
+    assert "Concepts/mechanism.md" in pipeline.apply(dry_run=True)["changes"]
+    pipeline.apply()
+    assert (root / "Concepts/mechanism.md").exists()
+    assert sum(r["applied"] for r in proposals(pipeline, "link").values()) == (
+        2 if other_review == "identical" else 1
+    )
