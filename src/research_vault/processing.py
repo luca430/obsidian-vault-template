@@ -7,6 +7,7 @@ import re
 from collections import Counter
 
 from .agents import fits, payload_budget, validate_note_evidence, validate_output, validate_summary
+from .cancellation import check_cancelled
 from .chunking import section_chunks
 from .recipes import NAMESPACES, stage_recipe
 from .sources import extraction_complete, page_coverage, pdf, usable_pages
@@ -39,6 +40,7 @@ class Processor:
         self.extraction_recipe = stage_recipe(config, "extraction")
 
     def cached(self, namespace, key, operation, reusable=None, metadata=None):
+        check_cancelled()
         path = inside(self.config.root, f".pipeline/cache/{namespace}/{digest(key)}.json")
         cached = read_json(path) if path.exists() and not self.full else None
         if cached is not None:
@@ -61,6 +63,7 @@ class Processor:
                 self.progress("cache", namespace=namespace, reused=self.hits)
                 return cached["value"]
         result = operation()
+        check_cancelled()
         self.last_cache_metadata = metadata() if metadata else None
         atomic(
             path,
@@ -171,7 +174,7 @@ class Processor:
                 metadata.update(self.last_cache_metadata or {"legacy_cache": True})
             validate_output(role, result)
             check(result)
-        except (VaultError, OSError) as exc:
+        except (VaultError, OSError, KeyboardInterrupt) as exc:
             latest = getattr(self.agent, "last_metadata", {})
             if not reused and latest.get("provider") == selected and latest.get("role") == role:
                 metadata.update(latest)

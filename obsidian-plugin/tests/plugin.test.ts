@@ -417,6 +417,7 @@ test('refresh of an existing relationship opens its source and keeps the closed 
   plugin.app.metadataCache.getFileCache = file => ({ frontmatter: { status: 'pending', ...(file.path === review ? { resolved: 'already_represented' } : {}) } });
   const actions: string[] = [];
   plugin.execute = async action => {
+    if (action === 'history') return { history: [{ id: 'a'.repeat(24), path: '.pipeline/review_history/resolved/closed.md', decision: 'pending', outcome: 'resolved' }] };
     actions.push(action); return { outcome: 'already_represented', path: source, message: 'Existing relationship; review moved to history.' };
   };
   await plugin.refreshReview('a'.repeat(24));
@@ -426,10 +427,9 @@ test('refresh of an existing relationship opens its source and keeps the closed 
   type Picker = { getSuggestions(query: string): TFile[]; getSuggestionText(file: TFile): string };
   plugin.openReviews();
   assert.deepEqual((Modal.opened[0] as unknown as Picker).getSuggestions(''), []);
-  plugin.openReviews(true);
+  await plugin.openReviews(true);
   const history = Modal.opened[1] as unknown as Picker;
-  assert.deepEqual(history.getSuggestions('').map(file => file.path), [review]);
-  assert.equal(history.getSuggestionText(plugin.app.files[1]), review + ' (already represented)');
+  assert.deepEqual(history.getSuggestions('').map(file => file.path), ['.pipeline/review_history/resolved/closed.md']);
   plugin.onunload();
 });
 
@@ -540,41 +540,31 @@ test('dashboard and review navigation open existing files without modifying note
   assert.equal(plugin.app.opened[1], 'Reviews/Links/synthetic.md'); plugin.onunload();
 });
 
-test('pending review queue and decision history follow saved statuses without changing files', async () => {
-  const plugin = new Plugin(); await plugin.onload();
+test('active queue retains unapplied approvals and history is read through Python', async () => {
+  const plugin = new Plugin(); await plugin.onload(); Modal.opened = [];
   const statuses: Record<string, string> = {
-    'Reviews/Links/pending.md': 'pending',
-    'Reviews/Revisions/claim.md': 'pending',
-    'Reviews/Removals/removal.md': 'pending',
-    'Reviews/Links/approved.md': 'approved',
-    'Reviews/Revisions/rejected.md': 'rejected',
-    'Reviews/Links/invalid.md': 'invalid',
-    'My Notes/personal.md': 'pending',
+    'Reviews/Links/pending.md': 'pending', 'Reviews/Links/blocked.md': 'approved',
+    'Reviews/Revisions/rejected.md': 'rejected', 'My Notes/personal.md': 'pending',
   };
-  plugin.app.files = [...Object.keys(statuses), 'Reviews/Links/uncached.md'].map(name => new TFile(name));
+  plugin.app.files = Object.keys(statuses).map(name => new TFile(name));
   plugin.app.metadataCache.getFileCache = file => ({ frontmatter: { status: statuses[file.path] } });
-  const originalFiles = [...plugin.app.files];
-  type Picker = { getSuggestions(query: string): TFile[]; getSuggestionText(file: TFile): string; onChooseSuggestion(file: TFile): void };
-  const paths = (picker: Picker, query = '') => picker.getSuggestions(query).map(file => file.path);
-  Modal.opened = []; plugin.openReviews();
+  await plugin.openReviews();
+  type Picker = { getSuggestions(query: string): { path: string; id: string }[]; onChooseSuggestion(record: unknown): void };
   const queue = Modal.opened[0] as unknown as Picker;
-  assert.deepEqual(paths(queue), ['Reviews/Links/pending.md', 'Reviews/Removals/removal.md', 'Reviews/Revisions/claim.md']);
-  assert.deepEqual(paths(queue, 'CLAIM'), ['Reviews/Revisions/claim.md']);
-
-  statuses['Reviews/Links/pending.md'] = 'approved';
-  assert.ok(!paths(queue).includes('Reviews/Links/pending.md'));
-  plugin.commands.find(command => command.id === 'review-history')!.callback();
+  assert.deepEqual(queue.getSuggestions('').map(file => file.path), ['Reviews/Links/blocked.md', 'Reviews/Links/pending.md']);
+  const id = 'a'.repeat(24), archive = '.pipeline/review_history/rejected/' + id + '.md';
+  const calls: unknown[] = [];
+  plugin.execute = async (action, _quiet, selection) => {
+    calls.push({ action, selection });
+    return selection?.id ? { markdown: 'Original rejected scientific proposal', record: { id, outcome: 'rejected' } } : { history: [{ id, path: archive, decision: 'rejected', outcome: 'rejected' }] };
+  };
+  await plugin.openReviews(true);
   const history = Modal.opened[1] as unknown as Picker;
-  assert.deepEqual(paths(history), ['Reviews/Links/approved.md', 'Reviews/Links/pending.md', 'Reviews/Revisions/rejected.md']);
-  const approved = history.getSuggestions('approved')[0];
-  assert.equal(history.getSuggestionText(approved), 'Reviews/Links/approved.md (approved)');
-  history.onChooseSuggestion(approved);
-  assert.deepEqual(plugin.app.opened, ['Reviews/Links/approved.md']);
-
-  statuses['Reviews/Links/approved.md'] = 'pending';
-  assert.ok(paths(queue).includes('Reviews/Links/approved.md'));
-  assert.ok(!paths(history).includes('Reviews/Links/approved.md'));
-  assert.deepEqual(plugin.app.files, originalFiles);
+  assert.deepEqual(history.getSuggestions('').map(record => record.path), [archive]);
+  await plugin.openArchivedReview(id);
+  assert.deepEqual(calls, [{ action: 'history', selection: undefined }, { action: 'history', selection: { id } }]);
+  assert.ok(Modal.opened[2].contentEl.children.some(child => child.text.includes('Original rejected scientific proposal')));
+  assert.deepEqual(plugin.app.opened, []);
   plugin.onunload();
 });
 
@@ -603,5 +593,58 @@ test('bundled distribution contains no settings and matches build inputs', async
   const generated = await readFile('../.obsidian/plugins/research-vault/main.js', 'utf8');
   assert.ok(generated.includes('Generated from obsidian-plugin/src'));
   assert.ok(!generated.includes('shell: true'));
-  assert.ok(!generated.includes('unlink('));
+  assert.ok(generated.includes('".pipeline", "cancel"')); // Only per-run cancellation markers are removed.
+  assert.ok(!generated.includes('.vault.delete('));
+});
+
+test('interrupt uses a per-run marker, preserves the child for cleanup, and ends failed', async () => {
+  let child: Child | undefined;
+  let launchedArgs: string[] = [];
+  const launch: Spawn = (_command, args) => {
+    launchedArgs = args; child = new Child();
+    return child as unknown as ReturnType<Spawn>;
+  };
+  const runner = new Runner(() => {}, launch);
+  const pending = runner.run(fixture, fixtureSettings, process.platform, 'sync');
+  while (!child) await new Promise(resolve => setImmediate(resolve));
+  const index = launchedArgs.indexOf('--control-id');
+  assert.ok(index > 0);
+  const id = launchedArgs[index + 1];
+  assert.match(id, /^[a-f0-9]{32}$/);
+  assert.equal(runner.canInterrupt, true);
+  await runner.interrupt();
+  assert.equal(await readFile(path.join(fixture, '.pipeline/cancel', id), 'utf8'), 'interrupt\n');
+  assert.equal(child.killed, false);
+  assert.equal(runner.canInterrupt, false);
+  child.stdout.write(JSON.stringify({ status: 'failed', complete: false, error: 'Synchronization interrupted' }));
+  child.emit('close', 130, null);
+  await pending;
+  assert.equal(runner.snapshot.status, 'failed');
+  assert.equal(runner.busy, false);
+  await assert.rejects(readFile(path.join(fixture, '.pipeline/cancel', id)), /ENOENT/);
+});
+
+test('dry-run sidebar control and interrupt command are available; only sync can be interrupted', async () => {
+  const plugin = new Plugin(); await plugin.onload();
+  const view = new ResearchView(new WorkspaceLeaf(), plugin); view.render();
+  const controls = (view.contentEl as unknown as Element).children.find(child => child.cls === 'research-vault-controls')!;
+  assert.ok(controls.children.some(child => child.text === 'Dry Run Sync'));
+  assert.ok(controls.children.find(child => child.text === 'Interrupt Sync')?.disabled);
+  assert.ok(plugin.commands.some(command => command.id === 'interrupt'));
+  let child: Child | undefined;
+  const runner = new Runner(() => {}, (() => { child = new Child(); return child; }) as unknown as Spawn);
+  const pending = runner.run(fixture, fixtureSettings, process.platform, 'apply');
+  while (!child) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(runner.canInterrupt, false);
+  await runner.interrupt();
+  child.stdout.write('{}'); child.emit('close', 0, null); await pending;
+  plugin.onunload();
+});
+
+test('technical completion, source limitations and interruption have distinct presentation', () => {
+  assert.equal(outcome(2, { status: 'completed_with_limitations', technical_complete: true, complete: false }), 'completed');
+  assert.equal(outcome(0, { status: 'failed', complete: true }), 'failed');
+  const snapshot: Snapshot = { status: 'completed', stage: '', logs: [], diagnostics: [] };
+  statusDetails(snapshot, { status: 'completed_reviews_pending', pending: { link: 1 } });
+  assert.equal(snapshot.syncStatus, 'completed_reviews_pending');
 });

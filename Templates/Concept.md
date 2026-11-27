@@ -14,6 +14,7 @@ kind: concept
 
 Keep these evidence categories distinct. New concepts are created only when an
 associated link proposal is approved. Subsequent prose changes are advisory revisions.
+Mathematics: inline `$...$`; display `$$...$$`. Preserve exact evidence excerpts and disclose unreliable extraction.
 <!-- managed:end -->
 
 ## Approved conceptual relationships

@@ -2,6 +2,7 @@ import { spawn, SpawnOptions, ChildProcess } from 'node:child_process';
 import { promises as fs, constants } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { randomBytes } from 'node:crypto';
 import { ResearchSettings, defaultPython } from './settings';
 import { OutputParser, RecordValue, Snapshot, isRecord, outcome, progress, redact } from './protocol';
 
@@ -10,9 +11,10 @@ export const ACTION_ARGS = {
   startup: ['sync', '--startup'], apply: ['apply'], preview: ['apply', '--dry-run'],
   status: ['status'], doctor: ['doctor'],
   readiness: ['review', 'status'], refresh: ['review', 'refresh'], consolidate: ['concepts', 'suggest'],
+  history: ['review', 'history'],
 } as const;
 export type Action = keyof typeof ACTION_ARGS;
-export interface ReviewSelection { proposalIds?: string[]; planToken?: string; id?: string; memberPaths?: string[] }
+export interface ReviewSelection { proposalIds?: string[]; planToken?: string; id?: string; memberPaths?: string[]; controlId?: string }
 export interface Command { executable: string; args: string[]; options: SpawnOptions }
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
 export const nodeSpawn: Spawn = (command, args, options) => spawn(command, args, options);
@@ -92,10 +94,14 @@ export async function prepare(
   const venvConfig = api.join(api.dirname(bin), 'pyvenv.cfg');
   let isVenv = false;
   const args = ['-u', script, '--vault', root, ...ACTION_ARGS[action]];
+  if (selection?.controlId) {
+    if (!['sync', 'full', 'startup', 'dry'].includes(action) || !/^[a-f0-9]{32}$/.test(selection.controlId)) throw new Error('Invalid sync control identifier.');
+    args.push('--control-id', selection.controlId);
+  }
   if (action === 'consolidate' && selection?.memberPaths) {
     if (selection.id || selection.memberPaths.length < 2 || selection.memberPaths.some(p => !/^Concepts\/[^\\\u0000-\u001f]+\.md$/.test(p) || p.split('/').includes('..'))) throw new Error('Select distinct concept paths.');
     for (const member of selection.memberPaths) args.push('--member', member);
-  } else if (action === 'refresh' || action === 'consolidate') {
+  } else if (action === 'refresh' || action === 'consolidate' || (action === 'history' && selection?.id)) {
     if (!selection?.id || !/^[a-f0-9]{24}$/.test(selection.id)) throw new Error('Select a valid review or candidate ID.');
     args.push(selection.id);
   }
@@ -156,6 +162,27 @@ export class Runner {
   snapshot: Snapshot = { status: 'idle', stage: 'Ready', logs: [], diagnostics: [] };
   busy = false;
   disposed = false;
+  private control?: { vault: string; id: string; interrupted: boolean };
+  private interrupting?: Promise<void>;
+  get canInterrupt(): boolean { return this.busy && !!this.control && !this.control.interrupted; }
+  async interrupt(): Promise<void> {
+    const control = this.control;
+    if (!this.canInterrupt || !control) return;
+    control.interrupted = true;
+    try {
+      this.interrupting = (async () => {
+        for (const directory of [path.join(control.vault, '.pipeline'), path.join(control.vault, '.pipeline', 'cancel')]) {
+          await fs.mkdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
+          const info = await fs.lstat(directory);
+          if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('Cancellation directory must be a local directory, without symlinks.');
+        }
+        await fs.writeFile(path.join(control.vault, '.pipeline', 'cancel', control.id), 'interrupt\n', { flag: 'wx' });
+        this.snapshot.stage = 'Stopping synchronization at a safe boundary';
+        this.changed();
+      })();
+      await this.interrupting;
+    } catch (error) { control.interrupted = false; throw error; }
+  }
   constructor(private changed: () => void, private launch: Spawn = nodeSpawn) {}
 
   log(line: string, max: number): void {
@@ -169,16 +196,22 @@ export class Runner {
     if (this.disposed) throw new Error('Research Vault is unloaded.');
     if (this.busy || activeVaults.has(key)) throw new Error('A Research Vault command is already running in this vault.');
     activeVaults.add(key); this.busy = true;
+    if (['sync', 'full', 'startup', 'dry'].includes(action)) {
+      this.control = { vault, id: randomBytes(16).toString('hex'), interrupted: false };
+      selection = { ...selection, controlId: this.control.id };
+    }
     this.snapshot = {
       ...this.snapshot, status: 'running', stage: `Starting ${action}`,
       processed: undefined, remaining: undefined, skipped: undefined, failed: undefined,
       cacheHits: undefined, diagnostics: [],
+      syncStatus: undefined,
     };
     this.log(`Starting ${action}`, settings.maxLogLines); this.changed();
     let result: RecordValue | undefined;
     try {
       const command = await prepare(vault, settings, platform, action, this.launch, undefined, selection);
       if (this.disposed) throw new Error('Plugin unloaded before the command started.');
+      if (this.control?.interrupted) throw new Error('Synchronization interrupted before launch.');
       const code = await new Promise<number | null>((resolve, reject) => {
         const child = this.launch(command.executable, command.args, command.options);
         const consume = (value: RecordValue, stdout: boolean) => {
@@ -204,7 +237,8 @@ export class Runner {
           resolve(exitCode);
         });
       });
-      this.snapshot.status = outcome(code, result);
+      this.snapshot.status = this.control?.interrupted ? 'failed' : outcome(code, result);
+      if (typeof result?.status === 'string') this.snapshot.syncStatus = result.status;
       this.snapshot.stage = `${action}: ${this.snapshot.status}`;
       if (!result) this.log('No final JSON report was available; inspect logs and run Research: Status.', settings.maxLogLines);
       if (result) {
@@ -225,6 +259,10 @@ export class Runner {
       this.snapshot.diagnostics.push(redact(String(error)).slice(0, 4000));
       throw error;
     } finally {
+      await this.interrupting?.catch(() => undefined);
+      if (this.control) await fs.unlink(path.join(this.control.vault, '.pipeline', 'cancel', this.control.id)).catch(() => undefined);
+      this.interrupting = undefined;
+      this.control = undefined;
       this.busy = false; activeVaults.delete(key); this.changed();
     }
   }

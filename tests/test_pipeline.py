@@ -39,14 +39,14 @@ def test_add_update_stable_id_and_user_additions(vault):
     root, _, z, agent, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    note = root / "Literature/PAPER001.md"
+    note = root / "Literature/Synthetic item — PAPER001.md"
     note.write_text(note.read_text() + "\nUSER ADDITION\n")
     add_paper(vault, version=2)
     pipeline.sync()
     assert "USER ADDITION" in note.read_text()
     assert frontmatter(note.read_text())[0]["id"] == "zotero:PAPER001"
     assert len(list((root / "Literature").glob("*.md"))) == 1
-    assert sum(r == "literature" for r, _ in agent.calls) == 2
+    assert sum(r == "literature" for r, _ in agent.calls) == 1  # Zotero version alone is metadata.
     before = len(agent.calls)
     pipeline.sync()
     assert len(agent.calls) == before
@@ -95,15 +95,21 @@ def test_removed_member_review_and_restoration(vault):
     pipeline.sync()
     pending = proposals(pipeline, "removal")
     assert len(pending) == 1
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
     pipeline.sync()
     assert len(proposals(pipeline, "removal")) == 1
     decide(root, pipeline.state(), next(iter(pending)), decision="flag")
     pipeline.apply()
-    assert "removed from the active collection" in (root / "Literature/PAPER001.md").read_text()
+    assert (
+        "removed from the active collection"
+        in (root / "Literature/Synthetic item — PAPER001.md").read_text()
+    )
     z.items = original
     pipeline.sync()
-    assert "removed from the active collection" not in (root / "Literature/PAPER001.md").read_text()
+    assert (
+        "removed from the active collection"
+        not in (root / "Literature/Synthetic item — PAPER001.md").read_text()
+    )
     assert pipeline.state()["papers"]["PAPER001"]["disposition"] == "active"
     assert len(list((root / "Literature").glob("*.md"))) == 1
 
@@ -118,12 +124,14 @@ def test_links_require_approval_and_apply_idempotently(vault):
     assert len(pending) == 1
     path = root / next(iter(pending.values()))["path"]
     assert "[[" not in path.read_text()
-    assert "[[" not in (root / "Literature/PAPER001.md").read_text()
+    assert "[[" not in (root / "Literature/Synthetic item — PAPER001.md").read_text()
     decide(root, pipeline.state(), next(iter(pending)))
     pipeline.apply()
     pipeline.apply()
     assert (root / "Concepts/mechanism.md").exists()
-    assert (root / "Literature/PAPER001.md").read_text().count("[[Concepts/mechanism]]") == 1
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_text().count(
+        "[[Concepts/mechanism]]"
+    ) == 1
 
 
 def test_rejected_links_not_repeated_without_evidence_change(vault):
@@ -142,17 +150,22 @@ def test_rejected_links_not_repeated_without_evidence_change(vault):
     assert not (root / "Concepts/mechanism.md").exists()
 
 
-def test_changed_evidence_can_generate_new_proposal(vault):
+def test_changed_evidence_requires_explicit_reconsideration(vault):
     root, _, _, agent, pipeline = vault
     add_paper(vault)
     agent.links = [link()]
     pipeline.sync()
     pid = next(iter(proposals(pipeline, "link")))
     decide(root, pipeline.state(), pid, "rejected")
-    source = root / "Literature/PAPER001.md"
+    source = root / "Literature/Synthetic item — PAPER001.md"
     source.write_text(source.read_text() + "\nAdditional scientific evidence.\n")
     agent.links[0]["evidence"][0]["quote"] = "Additional scientific evidence."
     pipeline.sync()
+    assert len(proposals(pipeline, "link")) == 1
+    replacement = pipeline.reconsider_review(
+        pid, agent.links[0]["source"], "Additional scientific evidence."
+    )
+    assert replacement["status"] == "pending"
     assert len(proposals(pipeline, "link")) == 2
 
 
@@ -208,7 +221,7 @@ def test_failed_reasoning_preserves_documents_and_retries(vault):
     assert not result["complete"]
     assert "agent failure" in result["graph_error"]
     assert pipeline.state()["membership"] == ["PAPER001"]
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert pipeline.state()["last_success"] is None
     agent.fail_role = None
     pipeline.sync()
@@ -222,7 +235,7 @@ def test_no_citation_based_links(vault):
     z.paper("PAPER001", [("PDF00001", main, "main")], relations={"dc:relation": "PAPER002"})
     pipeline.sync()
     assert not proposals(pipeline, "link")
-    assert "[[" not in (root / "Literature/PAPER001.md").read_text()
+    assert "[[" not in (root / "Literature/Synthetic item — PAPER001.md").read_text()
 
 
 def test_dry_run_no_writes_or_llm_calls(vault):
@@ -281,14 +294,15 @@ def test_deletion_backup_cleanup_and_personal_note_preserved(vault):
     add_paper(vault)
     pipeline.sync()
     personal = root / "My Notes/idea.md"
-    personal.write_text("User hypothesis refers to [[Literature/PAPER001]].")
+    personal.write_text("User hypothesis refers to [[Literature/Synthetic item — PAPER001]].")
     # An approved relationship is in a Python-owned links region.
     from research_vault.notes import new_note
 
     concept = root / "Concepts/existing.md"
     concept.write_text(
         new_note("concept:existing", "concept", "Existing", "Synthetic concept.").replace(
-            "<!-- links:start -->", "<!-- links:start -->\n- [[Literature/PAPER001]]"
+            "<!-- links:start -->",
+            "<!-- links:start -->\n- [[Literature/Synthetic item — PAPER001]]",
         )
     )
     git_init(root)
@@ -299,13 +313,13 @@ def test_deletion_backup_cleanup_and_personal_note_preserved(vault):
     before = personal.read_bytes()
     preview = pipeline.apply(dry_run=True)
     assert "My Notes/idea.md" in preview["impact_previews"][0]["incoming"]
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
     result = pipeline.apply()
     assert result["destructive"]
     assert (root / result["backup"]).exists()
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert personal.read_bytes() == before
-    assert "[[Literature/PAPER001]]" not in concept.read_text()
+    assert "[[Literature/Synthetic item — PAPER001]]" not in concept.read_text()
     assert any(
         "Source removed" in r["payload"].get("reason", "")
         for r in proposals(pipeline, "revision").values()
@@ -313,7 +327,7 @@ def test_deletion_backup_cleanup_and_personal_note_preserved(vault):
     import zipfile
 
     with zipfile.ZipFile(root / result["backup"]) as archive:
-        assert "Literature/PAPER001.md" in archive.namelist()
+        assert "Literature/Synthetic item — PAPER001.md" in archive.namelist()
     pipeline.apply()  # Applied removal is idempotent.
 
 
@@ -326,12 +340,12 @@ def test_deletion_refused_without_git_or_dirty_tree(vault):
     decide(root, pipeline.state(), next(iter(proposals(pipeline, "removal"))), decision="delete")
     with pytest.raises(VaultError, match="requires Git"):
         pipeline.apply()
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
     git_init(root)
     (root / "AGENTS.md").write_text("Tracked change")
     with pytest.raises(VaultError, match="Commit or stash"):
         pipeline.apply()
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
 def test_tampered_and_stale_approval_rejected(vault):
@@ -341,7 +355,7 @@ def test_tampered_and_stale_approval_rejected(vault):
     pipeline.sync()
     pid = next(iter(proposals(pipeline, "link")))
     decide(root, pipeline.state(), pid)
-    source = root / "Literature/PAPER001.md"
+    source = root / "Literature/Synthetic item — PAPER001.md"
     source.write_text(source.read_text() + "\nChanged user material.\n")
     with pytest.raises(VaultError, match="Stale approval"):
         pipeline.apply()
@@ -405,13 +419,16 @@ def test_multiple_parents_are_distinct_even_with_same_filename(vault):
         path = write_pdf(directory / "same-name.pdf")
         z.paper(key, [(attachment, path, "main")])
     pipeline.sync()
-    assert set(p.name for p in (root / "Literature").glob("*.md")) == {"PAPER001.md", "PAPER002.md"}
+    assert set(p.name for p in (root / "Literature").glob("*.md")) == {
+        "Synthetic item — PAPER001.md",
+        "Synthetic item — PAPER002.md",
+    }
 
 
 def test_unknown_summary_ownership_prevents_overwrite(vault):
     root, _, _, _, pipeline = vault
     add_paper(vault)
-    note = root / "Literature/PAPER001.md"
+    note = root / "Literature/Synthetic item — PAPER001.md"
     note.write_text("User text without generated ownership markers.")
     with pytest.raises(VaultError, match="frontmatter"):
         pipeline.sync()
@@ -422,17 +439,17 @@ def test_keep_removal_and_explicit_approval_required(vault):
     root, _, z, _, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    original = (root / "Literature/PAPER001.md").read_bytes()
+    original = (root / "Literature/Synthetic item — PAPER001.md").read_bytes()
     z.items.clear()
     pipeline.sync()
     pid = next(iter(proposals(pipeline, "removal")))
     decide(root, pipeline.state(), pid, "pending", decision="delete")
     pipeline.apply()
-    assert (root / "Literature/PAPER001.md").read_bytes() == original
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_bytes() == original
     decide(root, pipeline.state(), pid, decision="keep")
     pipeline.apply()
     assert pipeline.state()["papers"]["PAPER001"]["disposition"] == "kept"
-    assert (root / "Literature/PAPER001.md").read_bytes() == original
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_bytes() == original
 
 
 def test_user_approved_personal_link_only_appends(vault):
@@ -484,7 +501,7 @@ def test_missing_pdf_no_fabricated_summary(vault):
     assert not result["complete"]
     assert "no readable" in result["skipped"]["PAPER001"]
     assert not agent.calls
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert pipeline.state()["membership"] == ["PAPER001"]
     assert pipeline.state()["papers"]["PAPER001"]["status"] == "skipped"
 
@@ -493,7 +510,7 @@ def test_revised_summary_title_is_managed_and_user_area_preserved(vault):
     root, _, _, agent, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    note = root / "Literature/PAPER001.md"
+    note = root / "Literature/Synthetic item — PAPER001.md"
     note.write_text(note.read_text() + "\nUser-authored continuation.\n")
     original = agent.run
 
@@ -505,7 +522,7 @@ def test_revised_summary_title_is_managed_and_user_area_preserved(vault):
 
     agent.run = rename
     pipeline.sync(full=True)
-    assert "# Updated scientific title" in note.read_text()
+    assert "# Synthetic item" in note.read_text()  # Heading comes from Zotero, never inference.
     assert "User-authored continuation." in note.read_text()
 
 
@@ -585,8 +602,11 @@ def test_appeared_concept_invalidates_unseen_target_approval(vault):
         pipeline.apply()
     assert "Concepts/mechanism.md" in str(exc.value)
     assert proposals(pipeline, "link")[pid]["path"] in str(exc.value)
-    assert "Literature/PAPER001.md" in str(exc.value)
-    assert "[[Concepts/mechanism]]" not in (root / "Literature/PAPER001.md").read_text()
+    assert "Literature/Synthetic item — PAPER001.md" in str(exc.value)
+    assert (
+        "[[Concepts/mechanism]]"
+        not in (root / "Literature/Synthetic item — PAPER001.md").read_text()
+    )
     assert "User-defined concept" in target.read_text()
 
 
@@ -596,12 +616,14 @@ def test_concept_conflict_lists_all_reviews_and_notes_without_writes(vault, dry_
     add_paper(vault)
     add_paper(vault, "PAPER002")
     first = link()
-    second = link(source="Literature/PAPER002.md")
+    second = link(source="Literature/Synthetic item — PAPER002.md")
     second["target_concept"]["body"] = "A different definition requiring a user decision."
     third = deepcopy(first)
     third["relationship"] = "method"
     other_first = link(target="Concepts/another.md")
-    other_second = link(source="Literature/PAPER002.md", target="Concepts/another.md")
+    other_second = link(
+        source="Literature/Synthetic item — PAPER002.md", target="Concepts/another.md"
+    )
     other_second["target_concept"]["title"] = "A different title"
     agent.links = [first, second, third, other_first, other_second]
     pipeline.sync()
@@ -636,7 +658,7 @@ def test_concept_conflict_check_allows_matching_or_deferred_definitions(vault, o
     add_paper(vault)
     add_paper(vault, "PAPER002")
     first = link()
-    second = link(source="Literature/PAPER002.md")
+    second = link(source="Literature/Synthetic item — PAPER002.md")
     if other_review != "identical":
         second["target_concept"]["body"] = "A different definition awaiting a decision."
     agent.links = [first, second]

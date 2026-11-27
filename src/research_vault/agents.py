@@ -12,6 +12,7 @@ from pathlib import Path
 
 from jsonschema import ValidationError, validate
 
+from .cancellation import run_process
 from .config import Config
 from .paths import is_wsl
 from .storage import VaultError, atomic, digest, file_hash, inside, now
@@ -299,7 +300,7 @@ class CLIAdapter:
             result = self._run(role, payload)
             self.last_metadata["validation_status"] = "schema_valid"
             return result
-        except (VaultError, OSError, subprocess.TimeoutExpired) as exc:
+        except (VaultError, OSError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
             self.last_metadata.update(
                 validation_status="failed", failure=str(exc), failure_type=type(exc).__name__
             )
@@ -387,7 +388,7 @@ class Codex(CLIAdapter):
         if model:
             command[command.index("--cd") : command.index("--cd")] = ["--model", model]
         try:
-            process = subprocess.run(
+            process = run_process(
                 command,
                 input=prompt,
                 text=True,

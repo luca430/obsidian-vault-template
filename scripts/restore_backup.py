@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -22,9 +23,14 @@ def restore(root: Path, backup: Path) -> None:
             manifest = json.loads(archive.read("MANIFEST.json"))
             for name, expected in manifest["files"].items():
                 inside(root, name)
-                if not name.startswith(
-                    ("Literature/", "Concepts/", "My Work/", "Reviews/")
-                ) and name not in {"Home.md", ".pipeline/state.json"}:
+                if (
+                    not name.startswith(("Literature/", "Concepts/", "My Work/", "Reviews/"))
+                    and name not in {"Home.md", ".pipeline/state.json"}
+                    and not re.fullmatch(
+                        r"\.pipeline/review_history/(?:approved|rejected|superseded|resolved)/[a-f0-9]{24}\.md",
+                        name,
+                    )
+                ):
                     raise VaultError(f"Unsupported checkpoint path: {name}")
                 if expected is None:
                     changes[name] = None

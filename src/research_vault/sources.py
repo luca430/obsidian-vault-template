@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
+from .cancellation import run_process
 from .config import OCR_DEFAULTS, Config
 from .paths import local_path
 from .storage import VaultError, digest, file_hash
@@ -35,7 +35,7 @@ def ocr_page(page, settings: dict) -> str:
     if not executable:
         raise VaultError("OCR unavailable: configured Tesseract executable was not found")
     image = page.get_pixmap(dpi=settings["dpi"], colorspace=pymupdf.csRGB, alpha=False)
-    result = subprocess.run(
+    result = run_process(
         [executable, "stdin", "stdout", "-l", settings["language"], "--dpi", str(settings["dpi"])],
         input=image.tobytes("png"),
         capture_output=True,

@@ -78,6 +78,8 @@ export class OutputParser {
 
 export type PipelineStatus = 'idle' | 'running' | 'completed' | 'incomplete' | 'failed';
 export function outcome(code: number | null, result?: RecordValue): PipelineStatus {
+  if (result?.status === 'failed') return 'failed';
+  if ((code === 0 || code === 2) && result?.technical_complete === true && result?.status === 'completed_with_limitations') return 'completed';
   if (code === 2) return 'incomplete';
   if (code !== 0) return 'failed';
   if (Array.isArray(result?.blocking_errors) && result.blocking_errors.length) return 'failed';
@@ -88,6 +90,7 @@ export function outcome(code: number | null, result?: RecordValue): PipelineStat
 export interface Snapshot {
   status: PipelineStatus;
   stage: string;
+  syncStatus?: string;
   processed?: number;
   remaining?: number;
   skipped?: number;
@@ -110,6 +113,7 @@ export function progress(snapshot: Snapshot, value: RecordValue): void {
 }
 
 export function statusDetails(snapshot: Snapshot, value: RecordValue): void {
+  if (typeof value.status === 'string') snapshot.syncStatus = value.status;
   if (isRecord(value.pending)) snapshot.pending = value.pending;
   if ('last_success' in value) snapshot.lastSuccess = typeof value.last_success === 'string' ? value.last_success : undefined;
   if (isRecord(value.progress)) progress(snapshot, value.progress);

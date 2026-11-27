@@ -8,6 +8,7 @@ import re
 import sys
 from pathlib import Path
 
+from .cancellation import cancellation
 from .config import PROVIDERS, Config
 from .execution import finish, launch, running
 from .pipeline import Pipeline
@@ -23,6 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     sync = commands.add_parser("sync", help="Synchronize; never apply pending reviews")
     sync.add_argument("--full", action="store_true")
     sync.add_argument("--dry-run", action="store_true")
+    sync.add_argument(
+        "--retry", action="store_true", help="Retry unchanged failures and extraction limitations"
+    )
+    sync.add_argument("--control-id", help=argparse.SUPPRESS)
     sync.add_argument(
         "--background",
         action="store_true",
@@ -43,16 +48,37 @@ def main(argv: list[str] | None = None) -> int:
     apply.add_argument(
         "--dry-run", action="store_true", help="Show exact affected paths and removal impact"
     )
-    apply.add_argument("--ready", action="store_true", help="Explicitly apply only independently ready approvals")
-    apply.add_argument("--proposal", action="append", help="Apply only these exact approved proposal IDs")
+    apply.add_argument(
+        "--ready", action="store_true", help="Explicitly apply only independently ready approvals"
+    )
+    apply.add_argument(
+        "--proposal", action="append", help="Apply only these exact approved proposal IDs"
+    )
     apply.add_argument("--plan-token", help="Require an unchanged selected preview")
-    review = commands.add_parser("review", help="Inspect or refresh reviews without synchronization")
-    review.add_argument("action", choices=["status", "refresh"])
+    review = commands.add_parser(
+        "review", help="Inspect or refresh reviews without synchronization"
+    )
+    review.add_argument("action", choices=["status", "refresh", "history", "reconsider"])
     review.add_argument("id", nargs="?")
-    concepts = commands.add_parser("concepts", help="Inspect concept candidates or request a pending consolidation")
+    review.add_argument("--evidence-note")
+    review.add_argument("--evidence-quote")
+    migration = commands.add_parser(
+        "migrate",
+        help="Preview title filenames, bibliography and finalized review archiving; no inference",
+    )
+    migration.add_argument("--execute", action="store_true")
+    migration.add_argument("--plan-token")
+    migration.add_argument("--authorize-note", action="append", default=[])
+    concepts = commands.add_parser(
+        "concepts", help="Inspect concept candidates or request a pending consolidation"
+    )
     concepts.add_argument("action", choices=["candidates", "suggest"])
     concepts.add_argument("id", nargs="?")
-    concepts.add_argument("--member", action="append", help="Explicit concept paths to compare instead of a candidate ID")
+    concepts.add_argument(
+        "--member",
+        action="append",
+        help="Explicit concept paths to compare instead of a candidate ID",
+    )
     commands.add_parser("status")
     commands.add_parser("doctor")
     args = parser.parse_args(argv)
@@ -62,10 +88,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--member is only supported for concepts suggest")
     if getattr(args, "plan_token", None) and not re.fullmatch(r"[a-f0-9]{64}", args.plan_token):
         parser.error("Invalid preview token")
-    for value in [*(getattr(args, "proposal", None) or []), *([args.id] if getattr(args, "id", None) else [])]:
+    for value in [
+        *(getattr(args, "proposal", None) or []),
+        *([args.id] if getattr(args, "id", None) else []),
+    ]:
         if not re.fullmatch(r"[a-f0-9]{24}", value):
             parser.error("Review and candidate IDs must contain 24 hexadecimal characters")
     run_id = getattr(args, "run_id", None)
+    control_id = getattr(args, "control_id", None)
+    if control_id and not re.fullmatch(r"[a-f0-9]{32}", control_id):
+        parser.error("Invalid sync control identifier")
     if run_id and not re.fullmatch(r"[a-f0-9]{32}", run_id):
         parser.error("Invalid background run identifier")
 
@@ -86,10 +118,66 @@ def main(argv: list[str] | None = None) -> int:
             progress=progress,
         )
         dry = getattr(args, "dry_run", False)
+
+        def synchronize():
+            marker = inside(pipeline.root, f".pipeline/cancel/{control_id}") if control_id else None
+            with cancellation(marker):
+                return pipeline.sync(
+                    full=args.full, dry_run=dry, startup=args.startup, retry=args.retry
+                )
+
+        if args.command == "migrate":
+            from .migrations import migrate
+
+            if args.execute:
+                with lock(pipeline.root):
+                    recover(pipeline.root)
+                    result = migrate(pipeline, True, args.plan_token, args.authorize_note)
+            else:
+                if inside(pipeline.root, ".pipeline/transaction.json").exists():
+                    raise VaultError("Recover the interrupted transaction before migration")
+                result = migrate(pipeline, authorize_notes=args.authorize_note)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
         def apply_selected():
-            return pipeline.apply(dry_run=dry, proposal_ids=args.proposal, ready_only=args.ready, plan_token=args.plan_token)
+            return pipeline.apply(
+                dry_run=dry,
+                proposal_ids=args.proposal,
+                ready_only=args.ready,
+                plan_token=args.plan_token,
+            )
+
         if args.command in {"review", "concepts"}:
-            if args.action in {"status", "candidates"}:
+            if args.action == "history":
+                state = pipeline.state()
+                from .reviews import read_reviews
+
+                reviews = read_reviews(pipeline.root, state["proposals"])
+                result = [
+                    {
+                        "id": p,
+                        "path": r["path"],
+                        "kind": r["kind"],
+                        "decision": reviews[p]["status"],
+                        "outcome": r.get("application_outcome"),
+                    }
+                    for p, r in state["proposals"].items()
+                    if r.get("archived_at")
+                ]
+                if args.id:
+                    record = state["proposals"].get(args.id)
+                    if not record or not record.get("archived_at"):
+                        raise VaultError("Choose an archived review")
+                    result = {
+                        "record": record,
+                        "markdown": inside(pipeline.root, record["path"]).read_text(
+                            encoding="utf-8"
+                        ),
+                    }
+                else:
+                    result = {"history": result}
+            elif args.action in {"status", "candidates"}:
                 report = pipeline.review_status()
                 result = report if args.action == "status" else report["concept_candidates"]
             else:
@@ -99,7 +187,13 @@ def main(argv: list[str] | None = None) -> int:
                     raise VaultError("Choose a candidate ID or explicit members, not both")
                 with lock(pipeline.root):
                     recover(pipeline.root)
-                    result = pipeline.refresh_review(args.id) if args.command == "review" else pipeline.suggest_consolidation(args.id, args.member)
+                    result = (
+                        pipeline.reconsider_review(args.id, args.evidence_note, args.evidence_quote)
+                        if args.action == "reconsider"
+                        else pipeline.refresh_review(args.id)
+                        if args.command == "review"
+                        else pipeline.suggest_consolidation(args.id, args.member)
+                    )
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         if args.command == "sync":
@@ -108,7 +202,11 @@ def main(argv: list[str] | None = None) -> int:
                     "Use --startup without --full, and --background without --dry-run/--run-id"
                 )
             if args.background:
-                print(json.dumps(launch(pipeline.config, args.full, args.startup), indent=2))
+                print(
+                    json.dumps(
+                        launch(pipeline.config, args.full, args.startup, args.retry), indent=2
+                    )
+                )
                 return 0
         if dry or args.command in {"status", "doctor"}:
             if dry and inside(pipeline.root, ".pipeline/transaction.json").exists():
@@ -116,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
                     "Interrupted transaction exists; run sync/apply without --dry-run to recover first"
                 )
             result = (
-                pipeline.sync(full=args.full, dry_run=True, startup=args.startup)
+                synchronize()
                 if args.command == "sync"
                 else apply_selected()
                 if args.command == "apply"
@@ -128,18 +226,16 @@ def main(argv: list[str] | None = None) -> int:
                     running(pipeline.root, run_id)
                 recover(pipeline.root)
                 try:
-                    result = (
-                        pipeline.sync(full=args.full, startup=args.startup)
-                        if args.command == "sync"
-                        else apply_selected()
-                    )
+                    result = synchronize() if args.command == "sync" else apply_selected()
                 except (VaultError, OSError, ValueError, KeyboardInterrupt) as exc:
-                    pipeline.report_error(str(exc) or "Interrupted execution; run again to retry")
+                    if not isinstance(exc, KeyboardInterrupt):
+                        pipeline.report_error(str(exc))
                     raise
         print(json.dumps(result, ensure_ascii=False, indent=2))
         exit_code = (
             1
-            if args.command in {"doctor", "sync"} and result.get("blocking_errors")
+            if args.command in {"doctor", "sync"}
+            and (result.get("blocking_errors") or result.get("status") == "failed")
             else 2
             if args.command == "sync" and not dry and not result.get("complete", True)
             else 0
@@ -153,6 +249,13 @@ def main(argv: list[str] | None = None) -> int:
             finish(args.vault.resolve(), run_id, {"error": str(exc)}, 1)
         return 1
     except KeyboardInterrupt:
+        if (
+            args.command == "sync"
+            and not args.dry_run
+            and "pipeline" in locals()
+            and not getattr(pipeline, "_interruption_reported", False)
+        ):
+            pipeline.report_error("Synchronization interrupted; completed work remains resumable")
         if run_id:
             finish(
                 args.vault.resolve(),

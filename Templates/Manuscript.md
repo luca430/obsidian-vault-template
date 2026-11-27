@@ -17,6 +17,7 @@ kind: manuscript
 ## Limitations and open questions
 
 ## Source location and evidence
+Mathematics: inline `$...$`; display `$$...$$`. Preserve exact evidence excerpts and disclose unreliable extraction.
 <!-- managed:end -->
 
 ## Approved conceptual relationships

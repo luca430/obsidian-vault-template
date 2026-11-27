@@ -32,3 +32,5 @@ This result is a new pending review, never an approval. Do not include status,
 approval fields, wikilinks, Markdown links, HTML comments, frontmatter, executable
 code or file-operation instructions. No scientific note or graph edge changes
 until the user approves this exact proposal and Python applies it.
+
+Use inline LaTeX mathematics with `$...$` and display mathematics with `$$...$$` in generated scientific prose. Preserve original evidence excerpts exactly. Do not invent or repair equations that cannot be reliably extracted.

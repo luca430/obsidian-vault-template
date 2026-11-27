@@ -41,14 +41,14 @@ def test_applying_another_link_preserves_other_approval_and_relationship_type(va
     assert second in report["ready_ids"]
     preview = pipeline.apply(dry_run=True, proposal_ids=[second])
     pipeline.apply(proposal_ids=[second], plan_token=preview["plan_token"])
-    text = (root / "Literature/PAPER001.md").read_text()
+    text = (root / "Literature/Synthetic item — PAPER001.md").read_text()
     assert " — method:" in text and " — mechanism:" in text
 
 
 def test_scientific_change_shows_diff_and_refresh_creates_pending_without_inference(vault):
     root, _, _, agent, pipeline = vault
     pid, _ = two_links(vault)
-    path = root / "Literature/PAPER001.md"
+    path = root / "Literature/Synthetic item — PAPER001.md"
     path.write_text(path.read_text() + "\nScientific limitation: only condition A was measured.\n")
     before = snapshot(root)
     item = next(i for i in pipeline.review_status()["items"] if i["id"] == pid)
@@ -76,7 +76,7 @@ def test_legacy_stale_review_is_not_silently_rebased(vault):
     state = pipeline.state()
     del state["proposals"][pid]["expected_notes"]
     (root / ".pipeline/state.json").write_text(json.dumps(state))
-    source = root / "Literature/PAPER001.md"
+    source = root / "Literature/Synthetic item — PAPER001.md"
     source.write_text(source.read_text() + "\nChanged scientific conclusion.\n")
     report = pipeline.review_status()
     item = next(i for i in report["items"] if i["id"] == pid)
@@ -161,7 +161,7 @@ def prepare_merge(vault, operation="merge"):
         )
         + "\nPersonal qualification remains.\n"
     )
-    source = "Literature/PAPER001.md"
+    source = "Literature/Synthetic item — PAPER001.md"
     (root / source).write_text(
         new_note("zotero:PAPER001", "literature", "Synthetic", "Synthetic scientific evidence.")
     )
@@ -358,7 +358,7 @@ def test_keep_separate_pending_concepts_stays_valid_as_notes_are_created(vault):
 def test_refresh_does_not_erase_other_stale_approvals(vault):
     root, _, _, _, pipeline = vault
     first, second = two_links(vault)
-    source = root / "Literature/PAPER001.md"
+    source = root / "Literature/Synthetic item — PAPER001.md"
     source.write_text(source.read_text() + "\nChanged scope for both proposals.\n")
     old_baseline = deepcopy(pipeline.state()["proposals"][second]["expected"])
     pipeline.refresh_review(first)
@@ -372,7 +372,7 @@ def test_corrupt_dependency_snapshot_is_detected(vault):
     import json
 
     state = pipeline.state()
-    state["proposals"][first]["expected_notes"]["Literature/PAPER001.md"] = (
+    state["proposals"][first]["expected_notes"]["Literature/Synthetic item — PAPER001.md"] = (
         "Wrong historical content."
     )
     (root / ".pipeline/state.json").write_text(json.dumps(state))

@@ -2,6 +2,58 @@
 
 ## Verified in this workspace
 
+Incremental synchronization and review lifecycle follow-up (2026-11-27): root causes
+were whole-rendered-note graph hashes, unconditional graph selection for incomplete
+documents, proposal identities tied to excerpt/natural-language payloads, and review
+files without an archival lifecycle. Scientific fingerprints now exclude presentation
+and graph bookkeeping; source signatures, recipes, unfinished jobs, human decisions
+and canonical relationship identities have separate records. Registered endpoint IDs
+are retained so a different note reusing an old path cannot inherit approval.
+Successful reasoning batches are checkpointed independently of their review proposals.
+
+The migration previews deterministic Zotero-title filenames and bibliography,
+preserves user additions and aliases/comments, rewrites managed references and
+registered dependency paths, and retains original review bytes/records in a private
+audit history. Unmanaged reference edits require exact-note authorization and an
+unchanged preview token. Finalized reviews archive transactionally with application;
+restore checkpoints now allow the narrowly scoped archive paths as well.
+
+The bundled plugin exposes Dry Run Sync and Interrupt Sync. Interruption is
+cooperative, records Failed and preserves completed work; Python stops its own
+inference/OCR child tree without killing the WSL launcher. No provider tools,
+external integration permissions, shell permissions or source-upload destinations
+were expanded. An unchanged sync, including after ordinary approval/application or
+rejection, performs zero inference and creates no proposals.
+
+Validation uses synthetic PDFs/notes and mocked Zotero/LLM services. Native text
+extraction and a local synthetic cancellable subprocess are exercised; live Zotero,
+real Codex/Claude inference, a desktop Obsidian GUI and native Windows/WSL process
+execution are not certified by these tests. Windows/WSL command construction and
+plugin APIs are mocked. No real research material was added or uploaded.
+
+Known limits: canonical identity/type and evidence-paragraph revision deduplication
+are structural safeguards rather than semantic-equivalence proofs; authored notes
+without explicit IDs use their stable paths as identity. Native extraction and API
+reads stop at the next safe boundary/timeout. Forced OS termination cannot guarantee
+a final report, but journal recovery remains available on the next mutating command.
+
+Final validation for this follow-up:
+
+- Full Python regression suite: **283 passed** in **253.68 seconds**.
+- Plugin suite: **48 passed**; strict TypeScript checking and `npm run build` passed,
+  regenerating the bundled `.obsidian/plugins/research-vault/main.js`.
+- Ruff lint/format checks, Python compilation, CLI/migration help, Git whitespace
+  checks, wheel build without isolation and installed-dependency checks passed.
+- The 35 new lifecycle cases cover zero-inference repeated syncs after decisions,
+  symmetric/inverse/alias relationship identities, immutable IDs when paths are
+  reused, acknowledged/rejected revisions, partial coverage, bounded/explicit
+  retries, annotation ordering/timestamps, interruption/resumption and subprocess
+  cleanup, targeted updates, previewed migration of pending/applied/withheld reviews,
+  transaction rollback, original history, aliases/comments, portable filenames,
+  LaTeX delimiters with verbatim evidence, and read-only dry runs. Existing full
+  synchronization, review refresh, both provider adapters and backup restore cases
+  remain in the passing suite.
+
 Native Obsidian plugin follow-up (2026-11-25): TypeScript build/strict type checking
 passed and the bundled desktop distribution was generated under
 `.obsidian/plugins/research-vault/`. The plugin suite passed **37 tests**, covering
@@ -182,9 +234,11 @@ collection, manuscript or personal research note was added to this template.
 - Character budgets include instructions/schema/output reserve, not exact model
   tokens. Consolidation failure is explicit; it leaves validated chunks cached.
   No runtime garbage collector is included for caches/staging.
-- Rejected relationships deduplicate by endpoints/type/normalized supporting quotes.
-  Materially different quoted evidence permits reconsideration. There is no
-  automated semantic test for whether two different excerpts mean the same thing.
+- Relationship deduplication uses persistent endpoint identities and canonical types,
+  independently of wording or excerpt selection. Rejected relationships require
+  explicit reconsideration with a new verified excerpt. Advisory revision deduplication
+  uses issue categories and supporting paragraphs; it is a conservative structural
+  safeguard rather than an automated scientific-equivalence classifier.
 - A clean Git repository plus verified local ZIP is required for deletion. Backups
   are local, ignored by Git and need an independent backup strategy. Local OS locks
   do not coordinate multiple computers or cloud-synchronized replicas.

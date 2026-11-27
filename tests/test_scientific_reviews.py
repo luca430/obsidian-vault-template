@@ -50,8 +50,8 @@ def test_uncertain_summary_is_successful_quarantined_cached_and_isolated(vault):
     assert report["pending_claim_reviews"] == 1
     assert report["processing_failures"] == 0
     assert report["failed"] == {}
-    assert (root / "Literature/PAPER002.md").exists()
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER002.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     pid, record = next(iter(proposals(pipeline, "claim").items()))
     review = (root / record["path"]).read_text()
     assert "UNVERIFIED DRAFT" in review
@@ -68,7 +68,7 @@ def test_uncertain_summary_is_successful_quarantined_cached_and_isolated(vault):
     assert pipeline.status()["pending_claim_reviews"] == 1
     assert "Pending claim reviews: 1" in (root / "Home.md").read_text()
     pipeline.apply()
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert not pipeline.state()["proposals"][pid]["applied"]
 
 
@@ -85,23 +85,26 @@ def test_uncertain_update_preserves_established_note_and_user_additions(vault):
     root, _, _, agent, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    path = root / "Literature/PAPER001.md"
+    path = root / "Literature/Synthetic item — PAPER001.md"
     path.write_text(path.read_text() + "\nUSER SCIENCE\n")
     previous = path.read_text()
+    source_pdf = vault[1] / "PAPER001.pdf"
+    source_pdf.unlink()
+    write_pdf(source_pdf, "Changed synthetic scientific evidence.")
     add_paper(vault, version=2)
     uncertain_summaries(agent)
     assert pipeline.sync()["complete"]
     assert path.read_text() == previous
     pid = next(iter(proposals(pipeline, "claim")))
     decide(root, pipeline.state(), pid)
-    assert "Literature/PAPER001.md" in pipeline.apply(dry_run=True)["changes"]
+    assert "Literature/Synthetic item — PAPER001.md" in pipeline.apply(dry_run=True)["changes"]
     assert path.read_text() == previous
     pipeline.apply()
     assert "UNCERTAIN SCIENTIFIC CLAIM" in path.read_text()
     assert "Human-reviewed draft" in path.read_text()
     assert "USER SCIENCE" in path.read_text()
     assert pipeline.state()["proposals"][pid]["applied"]
-    assert "Literature/PAPER001.md" not in pipeline.apply()["changes"]
+    assert "Literature/Synthetic item — PAPER001.md" not in pipeline.apply()["changes"]
 
 
 def test_rejected_claims_do_not_publish_or_reappear_on_full_sync(vault):
@@ -115,7 +118,7 @@ def test_rejected_claims_do_not_publish_or_reappear_on_full_sync(vault):
     assert pipeline.sync(full=True)["complete"]
     assert len(proposals(pipeline, "claim")) == 1
     assert pipeline.status()["pending_claim_reviews"] == 0
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
 @pytest.mark.parametrize("timestamp_style", ["iso", "space", "utc_suffix"])
@@ -135,25 +138,34 @@ def test_claim_approval_accepts_unquoted_yaml_timestamp(vault, timestamp_style):
         "utc_suffix": timestamp.replace("+00:00", "Z"),
     }[timestamp_style]
     lines = text.splitlines(keepends=True)
-    path.write_text("".join(
-        f"proposed_at: {rendered}\n" if line.startswith("proposed_at:") else line
-        for line in lines
-    ))
+    path.write_text(
+        "".join(
+            f"proposed_at: {rendered}\n" if line.startswith("proposed_at:") else line
+            for line in lines
+        )
+    )
     assert isinstance(frontmatter(path.read_text())[0]["proposed_at"], datetime)
 
     preview = pipeline.apply(dry_run=True)
-    assert "Literature/PAPER001.md" in preview["changes"]
+    assert "Literature/Synthetic item — PAPER001.md" in preview["changes"]
     assert not pipeline.state()["proposals"][pid]["applied"]
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     pipeline.apply()
     assert pipeline.state()["proposals"][pid]["applied"]
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
-@pytest.mark.parametrize("change", [
-    "changed_timestamp", "naive_timestamp", "date_only", "changed_payload",
-    "extra_field", "missing_field",
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "changed_timestamp",
+        "naive_timestamp",
+        "date_only",
+        "changed_payload",
+        "extra_field",
+        "missing_field",
+    ],
+)
 def test_yaml_timestamp_normalization_preserves_review_integrity(vault, change):
     root, _, _, agent, pipeline = vault
     add_paper(vault)
@@ -182,7 +194,7 @@ def test_yaml_timestamp_normalization_preserves_review_integrity(vault, change):
     with pytest.raises(VaultError, match="Review payload was changed"):
         pipeline.apply(dry_run=True)
     assert not pipeline.state()["proposals"][pid]["applied"]
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
 @pytest.mark.parametrize("change", ["source", "note"])
@@ -196,7 +208,9 @@ def test_claim_approval_rejects_stale_source_or_destination(vault, change):
     if change == "source":
         write_pdf(source, "Different scientific source content.")
     else:
-        (root / "Literature/PAPER001.md").write_text("Personal content must survive.")
+        (root / "Literature/Synthetic item — PAPER001.md").write_text(
+            "Personal content must survive."
+        )
     with pytest.raises(VaultError, match="Stale claim approval"):
         pipeline.apply()
     assert not pipeline.state()["proposals"][pid]["applied"]
@@ -216,14 +230,17 @@ def test_claim_revision_is_separately_pending_before_approval(vault):
     assert pipeline.sync()["complete"]
     replacement = pipeline.state()["proposals"][pid]["superseded_by"]
     new = pipeline.state()["proposals"][replacement]
-    assert new["path"] in (root / record["path"]).read_text()
+    assert new["path"] in (root / pipeline.state()["proposals"][pid]["path"]).read_text()
     assert new["payload"]["validation_warnings"] == []
     assert frontmatter((root / new["path"]).read_text())[0]["status"] == "pending"
     pipeline.apply()
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     decide(root, pipeline.state(), replacement)
     pipeline.apply()
-    assert "Human corrected scientific summary." in (root / "Literature/PAPER001.md").read_text()
+    assert (
+        "Human corrected scientific summary."
+        in (root / "Literature/Synthetic item — PAPER001.md").read_text()
+    )
 
 
 def uncertain_links(agent, candidate):
@@ -321,7 +338,7 @@ def test_genuinely_invalid_summaries_fail_and_other_documents_continue(vault, in
     assert report["processing_failures"] == 1
     assert report["completed_documents"] == 1
     assert "PAPER001" in report["failed"]
-    assert (root / "Literature/PAPER002.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER002.md").exists()
     assert not proposals(pipeline, "claim")
 
 
@@ -366,7 +383,7 @@ def test_uncertainty_survives_parent_consolidation(vault, stage):
         stage="consolidation" if stage == "consolidation" else None,
     )
     assert pipeline.sync()["complete"]
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     record = next(iter(proposals(pipeline, "claim").values()))
     assert record["payload"]["validation_warnings"]
     assert {e["source"] for e in record["payload"]["draft"]["evidence"]} == {"PDF00001", "PDF00002"}
@@ -387,7 +404,7 @@ def test_user_revision_cannot_waive_provenance_or_self_approve(vault, invalid):
     edit_revision(root, pipeline.state(), pid, revised)
     with pytest.raises(VaultError, match="absent|Invalid"):
         pipeline.sync()
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert not pipeline.state()["proposals"][pid].get("superseded_by")
 
 
@@ -401,7 +418,7 @@ def test_revision_cannot_be_approved_without_registration(vault):
     decide(root, pipeline.state(), pid)
     with pytest.raises(VaultError, match="registered replacement"):
         pipeline.apply()
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
 def test_claim_update_and_link_approval_cannot_change_reviewed_endpoints_in_same_apply(vault):
@@ -410,6 +427,9 @@ def test_claim_update_and_link_approval_cannot_change_reviewed_endpoints_in_same
     agent.links = [link()]
     pipeline.sync()
     link_id = next(iter(proposals(pipeline, "link")))
+    source_pdf = vault[1] / "PAPER001.pdf"
+    source_pdf.unlink()
+    write_pdf(source_pdf, "Changed synthetic scientific evidence.")
     add_paper(vault, version=2)
     uncertain_summaries(agent)
     pipeline.sync()

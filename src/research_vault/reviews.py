@@ -10,7 +10,21 @@ from datetime import datetime
 from pathlib import Path
 
 from .agents import no_edges, normalized, validate_note_evidence, validate_output, validate_summary
-from .notes import impact, new_note, references, summary_content, update_note, valid_note
+from .identities import (
+    registered_relationship_key,
+    relationship_identity,
+    relationship_key,
+    revision_identity,
+)
+from .notes import (
+    bibliography,
+    impact,
+    new_note,
+    references,
+    summary_content,
+    update_note,
+    valid_note,
+)
 from .review_state import capture_dependencies, dependency_text, note_differences
 from .sources import usable_pages
 from .storage import (
@@ -34,16 +48,50 @@ KINDS = {
 
 
 def proposal(kind: str, payload: dict, registry: dict, notes: dict[str, str], changes: dict) -> str:
-    # Wording changes alone cannot resurrect a rejected conceptual relationship.
+    stable_identity = (
+        relationship_identity(payload, notes)
+        if kind == "link"
+        else revision_identity(payload, notes)
+        if kind == "revision"
+        else None
+    )
+    if stable_identity and "revised_from" not in payload:
+        for existing, record in registry.items():
+            if record["kind"] != kind:
+                continue
+            previous = (
+                digest(registered_relationship_key(record, notes))
+                if kind == "link"
+                else record.get("revision_identity") or revision_identity(record["payload"], notes)
+            )
+            if stable_identity == previous:
+                if kind == "link" and record.get("resolution") and not record.get("applied"):
+                    return proposal(
+                        kind, {**payload, "revised_from": existing}, registry, notes, changes
+                    )
+                if (
+                    kind == "link"
+                    and record.get("decision", "pending") == "pending"
+                    and not record.get("applied")
+                    and payload["target"] not in notes
+                    and record["payload"].get("target_concept") != payload.get("target_concept")
+                ):
+                    continue  # Definitions need a separate comparison; wording is not equivalence.
+                record["suppressed_duplicates"] = record.get("suppressed_duplicates", 0) + 1
+                return existing
+    # Proposal identity remains distinct from the persistent scientific identity.
     identity = (
         {
             **{k: payload[k] for k in ("source", "target", "relationship")},
             "evidence": sorted({(e["note"], normalized(e["quote"])) for e in payload["evidence"]}),
+            "target_definition": payload.get("target_concept")
+            if payload["target"] not in notes
+            else None,
         }
         if kind == "link" and "revised_from" not in payload
         else payload
     )
-    pid = digest([kind, identity])[:24]
+    pid = digest([kind, stable_identity, identity] if stable_identity else [kind, identity])[:24]
     if pid in registry:
         if registry[pid].get("resolution"):
             # An old duplicate closure must not suppress a new review if the edge disappears.
@@ -73,6 +121,9 @@ def proposal(kind: str, payload: dict, registry: dict, notes: dict[str, str], ch
         "proposed_at": meta["proposed_at"],
         "kind": kind,
         "editable_revision": kind in {"claim", "link"},
+        **({"relationship_identity": stable_identity} if kind == "link" else {}),
+        **({"relationship_key": relationship_key(payload, notes)} if kind == "link" else {}),
+        **({"revision_identity": stable_identity} if kind == "revision" else {}),
     }
     capture_dependencies(registry[pid], notes)
     changes[path] = markdown(
@@ -95,6 +146,46 @@ def proposal(kind: str, payload: dict, registry: dict, notes: dict[str, str], ch
     return pid
 
 
+def archive_finalized(root, registry, changes):
+    """Stage moves with registry/application updates in the SAME journaled transaction."""
+    archived = []
+    for pid, record in registry.items():
+        if record.get("archived_at"):
+            continue
+        old = record["path"]
+        text = changes.get(old)
+        if text is None:
+            text = inside(root, old).read_text(encoding="utf-8")
+        meta, _ = frontmatter(text)
+        record["decision"] = meta["status"]
+        bucket = (
+            "superseded"
+            if record.get("superseded_by")
+            else "resolved"
+            if record.get("resolution")
+            else "approved"
+            if record.get("applied")
+            else "rejected"
+            if meta["status"] == "rejected"
+            else None
+        )
+        if bucket is None:
+            continue
+        target = f".pipeline/review_history/{bucket}/{pid}.md"
+        if inside(root, target).exists():
+            raise VaultError(f"Review history destination already exists: {target}")
+        record.update(
+            path=target,
+            original_path=old,
+            archived_at=now(),
+            application_outcome="applied" if record.get("applied") else bucket,
+        )
+        changes[target] = text
+        changes[old] = None
+        archived.append(pid)
+    return archived
+
+
 def link_proposal(
     payload: dict, registry: dict, notes: dict[str, str], changes: dict, warnings=()
 ) -> str | None:
@@ -111,6 +202,17 @@ def link_proposal(
         },
     )
     source, target = payload["source"], payload["target"]
+    identity = relationship_identity(payload, notes)
+    for record in registry.values():
+        if (
+            record["kind"] == "consolidation"
+            and record.get("applied")
+            and any(
+                relationship_identity(link, notes) == identity
+                for link in record["payload"]["links"]
+            )
+        ):
+            return None
     if not valid_note(source) or not valid_note(target) or source not in notes or source == target:
         raise VaultError("Link proposal has invalid or absent endpoints")
     for endpoint in [source, target]:
@@ -248,6 +350,8 @@ def read_reviews(root: Path, registry: dict) -> dict[str, dict]:
             )
         if meta.get("status") not in ("pending", "approved", "rejected"):
             raise VaultError(f"Invalid review status in {record['path']}")
+        if record.get("archived_at") and meta.get("status") != record.get("decision"):
+            raise VaultError(f"Archived decisions are immutable: {record['path']}")
         if record["kind"] == "removal" and meta.get("decision") not in (
             "pending",
             "flag",
@@ -288,7 +392,11 @@ def relationship_present(text, target, relationship, source, notes, *, allow_unt
             if text[ref.end : end].startswith(f" — {relationship}:"):
                 return True
             # A manually authored link already connects these endpoints, with no typed assertion.
-            if allow_untyped and "(approval " not in line and not text[ref.end:end].startswith(" — "):
+            if (
+                allow_untyped
+                and "(approval " not in line
+                and not text[ref.end : end].startswith(" — ")
+            ):
                 return True
     return False
 
@@ -415,7 +523,12 @@ def apply_decisions(
         )
     for pid, record in registry.copy().items():
         review = reviews[pid]
-        if record["applied"] or record.get("superseded_by") or record.get("resolution") or review["status"] != "approved":
+        if (
+            record["applied"]
+            or record.get("superseded_by")
+            or record.get("resolution")
+            or review["status"] != "approved"
+        ):
             continue
         if review.get("revision") is not None:
             raise VaultError(
@@ -468,6 +581,13 @@ def apply_decisions(
                 payload["draft"]["title"],
                 content,
             )
+            if context["kind"] == "literature":
+                notes[target] = bibliography(
+                    notes[target],
+                    context["key"],
+                    context["metadata"]["zotero"],
+                    context.get("library", "users/0"),
+                )
             changes[target] = notes[target]
             current.update(claim_review_status="approved", processed=True)
         elif kind == "link":
@@ -476,7 +596,9 @@ def apply_decisions(
                 if endpoint in notes and notes[endpoint].startswith("---\n"):
                     meta, _ = frontmatter(notes[endpoint])
                     if meta.get("kind") == "concept-redirect":
-                        raise VaultError(f"Concept endpoint was consolidated: {endpoint}; review a revised link to {meta.get('redirect_target')}")
+                        raise VaultError(
+                            f"Concept endpoint was consolidated: {endpoint}; review a revised link to {meta.get('redirect_target')}"
+                        )
             if source not in notes:
                 raise VaultError("Approved source no longer exists")
             warnings = validate_note_evidence(payload["evidence"], original_notes)
@@ -491,11 +613,19 @@ def apply_decisions(
                 if concept:
                     try:
                         meta, _ = frontmatter(notes[target])
-                        identical = (meta.get("generated") is True and meta.get("kind") == "concept"
-                                     and dependency_text(notes[target]) == dependency_text(new_note(meta["id"], "concept", concept["title"], concept["body"])))
+                        identical = (
+                            meta.get("generated") is True
+                            and meta.get("kind") == "concept"
+                            and dependency_text(notes[target])
+                            == dependency_text(
+                                new_note(meta["id"], "concept", concept["title"], concept["body"])
+                            )
+                        )
                     except (VaultError, KeyError):
                         pass
-                if not identical and (target not in created_concepts or created_concepts[target] != concept):
+                if not identical and (
+                    target not in created_concepts or created_concepts[target] != concept
+                ):
                     raise VaultError(
                         f"Proposed new concept already appeared: {target}. "
                         f"Review: {record['path']} (source: {source}; "
@@ -509,15 +639,22 @@ def apply_decisions(
                 if not concept or not target.startswith("Concepts/"):
                     raise VaultError("Approved target no longer exists")
                 notes[target] = new_note(
-                    "concept:" + digest([target, pid])[:24], "concept", concept["title"], concept["body"]
+                    "concept:" + digest(target)[:24],
+                    "concept",
+                    concept["title"],
+                    concept["body"],
                 )
                 changes[target] = notes[target]
                 created_concepts[target] = concept
             text = notes[source]
-            if not relationship_present(text, target, payload["relationship"], source, notes, allow_untyped=False):
+            if not relationship_present(
+                text, target, payload["relationship"], source, notes, allow_untyped=False
+            ):
                 from .consolidations import append_link
 
-                text = append_link(text, target, payload['relationship'], payload['justification'], pid)
+                text = append_link(
+                    text, target, payload["relationship"], payload["justification"], pid
+                )
                 notes[source] = text
                 changes[source] = text
         elif kind == "removal":

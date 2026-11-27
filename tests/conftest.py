@@ -155,7 +155,7 @@ def decide(root, state, pid, status="approved", decision=None):
     path.write_text(markdown(meta, body))
 
 
-def link(source="Literature/PAPER001.md", target="Concepts/mechanism.md"):
+def link(source="Literature/Synthetic item — PAPER001.md", target="Concepts/mechanism.md"):
     return {
         "source": source,
         "target": target,

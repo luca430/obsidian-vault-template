@@ -18,11 +18,26 @@ def dependency_text(text: str) -> str:
     """Ignore only known graph bookkeeping and YAML presentation, never scientific text."""
     body = text.replace("\r\n", "\n")
     prefix = ""
+    meta = {}
     if body.startswith("---\n"):
         meta, body = frontmatter(body)
         # These keys affect display only. Identity, aliases and provenance remain dependencies.
         meta.pop("cssclasses", None)
         prefix = yaml.safe_dump(meta, sort_keys=True, allow_unicode=True)
+    if meta.get("generated") is True and meta.get("kind") in {"literature", "manuscript"}:
+        managed_start, managed_end = "<!-- managed:start -->", "<!-- managed:end -->"
+        if body.count(managed_start) == body.count(managed_end) == 1:
+            before, rest = body.split(managed_start)
+            managed, after = rest.split(managed_end)
+            managed = re.sub(r"^# [^\n]*\n", "", managed.lstrip(), count=1)
+            managed = re.sub(
+                r"<!-- bibliography:start -->.*?<!-- bibliography:end -->\s*",
+                "",
+                managed,
+                flags=re.S,
+            )
+            managed = managed.split("### Source metadata (attribution only)")[0]
+            body = before + managed_start + "\n" + managed.strip() + "\n" + managed_end + after
     start, end = "<!-- links:start -->", "<!-- links:end -->"
     if body.count(start) == body.count(end) == 1 and body.index(start) < body.index(end):
         before, rest = body.split(start)
@@ -58,7 +73,12 @@ def note_differences(record: dict, notes: dict[str, str]) -> list[dict]:
             raise VaultError(f"Review snapshot integrity mismatch: {name}")
         current = notes.get(name)
         same = current is not None and digest(current) == expected
-        if not same and previous is not None and current is not None and record["kind"] == "link":
+        if (
+            not same
+            and previous is not None
+            and current is not None
+            and record["kind"] in {"link", "claim"}
+        ):
             same = dependency_text(previous) == dependency_text(current)
         if same:
             continue

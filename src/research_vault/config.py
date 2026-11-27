@@ -22,6 +22,7 @@ PROCESSING_DEFAULTS = {
     "candidate_terms": 32,
     "candidate_pool": 128,
     "startup_max_documents": 5,
+    "max_retry_attempts": 3,
 }
 
 OCR_DEFAULTS = {
@@ -36,7 +37,15 @@ OCR_DEFAULTS = {
 KEY = re.compile(r"^[A-Z0-9]{8}$")
 ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$")
 PROVIDERS = ("codex", "claude")
-ROLES = ("literature", "manuscript", "concepts", "linking", "synthesis", "maintenance", "consolidation")
+ROLES = (
+    "literature",
+    "manuscript",
+    "concepts",
+    "linking",
+    "synthesis",
+    "maintenance",
+    "consolidation",
+)
 
 
 def load_yaml(path: Path) -> dict:

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import yaml
+
 from .agents import no_edges
+from .scientific import math_markdown
 from .sources import coverage_error, usable_pages
 from .storage import VaultError, frontmatter, inside, markdown, replace_section
 
@@ -43,7 +47,7 @@ def new_note(identity: str, kind: str, title: str, content: str, **meta) -> str:
     no_edges(content)
     return markdown(
         {"id": identity, "generated": True, "kind": kind, **meta},
-        f"<!-- managed:start -->\n# {title}\n\n{content.rstrip()}\n<!-- managed:end -->\n\n"
+        f"<!-- managed:start -->\n# {title}\n\n{(math_markdown(content) if kind == 'concept' else content).rstrip()}\n<!-- managed:end -->\n\n"
         "## Approved conceptual relationships\n\n<!-- links:start -->\n<!-- links:end -->\n\n"
         "## Your additions\n\nWrite here. This section is preserved by synchronization.\n",
     )
@@ -57,7 +61,97 @@ def update_note(old: str | None, identity: str, kind: str, title: str, content: 
         raise VaultError("Refusing to overwrite a note with mismatched ownership or identity")
     no_edges(content)
     no_edges(title)
-    return replace_section(old, "managed", f"# {title}\n\n{content}")
+    return replace_section(
+        old, "managed", f"# {title}\n\n{math_markdown(content) if kind == 'concept' else content}"
+    )
+
+
+def bibliography(text, key, metadata, library="users/0"):
+    """Zotero supplies attribution; no agent guesses bibliographic fields."""
+    data = metadata.get("data", {})
+
+    def plain(value):
+        return (
+            str(value)
+            .replace("\n", " ")
+            .replace("\r", " ")
+            .translate(str.maketrans({"[": "［", "]": "］", "<": "＜", ">": "＞"}))
+        )
+
+    title = plain(data.get("title") or key)
+    authors = [
+        plain(c.get("name") or " ".join(filter(None, [c.get("firstName"), c.get("lastName")])))
+        for c in data.get("creators", [])
+        if c.get("creatorType") == "author"
+    ]
+    year = re.search(r"\b\d{4}\b", str(data.get("date", "")))
+    fields = [
+        ("Authors", "; ".join(authors)),
+        ("Year", year[0] if year else ""),
+        ("Journal", data.get("publicationTitle")),
+        ("DOI", data.get("DOI")),
+    ]
+    uri = (
+        f"zotero://select/groups/{library.split('/')[1]}/items/{key}"
+        if library.startswith("groups/")
+        else f"zotero://select/library/items/{key}"
+    )
+    block = (
+        "<!-- bibliography:start -->\n"
+        + "\n\n".join(
+            f"{label}: {plain(value)}" for label, value in [*fields, ("Zotero", uri)] if value
+        )
+        + "\n<!-- bibliography:end -->"
+    )
+    # Validate ownership before touching existing managed content.
+    replace_section(text, "managed", "")
+    start, end = text.index("<!-- managed:start -->"), text.index("<!-- managed:end -->")
+    managed = text[start + len("<!-- managed:start -->") : end].strip()
+    managed = re.sub(r"^# [^\n]*\n?", "", managed, count=1).lstrip()
+    managed = re.sub(
+        r"<!-- bibliography:start -->.*?<!-- bibliography:end -->\s*", "", managed, flags=re.S
+    )
+    return replace_section(text, "managed", f"# {title}\n\n{block}\n\n{managed}")
+
+
+def append_aliases(text, additions):
+    """Change only the alias value, preserving other frontmatter bytes and comments."""
+    meta, _ = frontmatter(text)
+    aliases = meta.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    if not isinstance(aliases, list) or not all(isinstance(a, str) for a in aliases):
+        raise VaultError("Note aliases must be text or a list of strings")
+    additions = [a for a in dict.fromkeys(additions) if a not in aliases]
+    if not additions:
+        return text
+    head, tail = text[4:].split("\n---\n", 1)
+    node = yaml.compose(head)
+    matches = [value for key, value in node.value if key.value == "aliases"]
+    if len(matches) > 1:
+        raise VaultError("Ambiguous duplicate aliases fields")
+    encoded = [json.dumps(a, ensure_ascii=False) for a in additions]
+    if not matches:
+        head += "\naliases: " + json.dumps([*aliases, *additions], ensure_ascii=False)
+    else:
+        value = matches[0]
+        if isinstance(value, yaml.SequenceNode) and value.flow_style:
+            index = value.value[-1].end_mark.index if value.value else value.start_mark.index + 1
+            head = head[:index] + (", " if value.value else "") + ", ".join(encoded) + head[index:]
+        elif isinstance(value, yaml.SequenceNode):
+            index = value.end_mark.index
+            indent = value.start_mark.column
+            insertion = ("\n" if index and head[index - 1] != "\n" else "") + "".join(
+                " " * indent + "- " + a + "\n" for a in encoded
+            )
+            head = head[:index] + insertion + head[index:]
+        else:
+            head = (
+                head[: value.start_mark.index]
+                + json.dumps([*aliases, *additions], ensure_ascii=False)
+                + head[value.end_mark.index :]
+            )
+    return "---\n" + head + "\n---\n" + tail
 
 
 def summary_content(result: dict, sources: list[dict], metadata: dict) -> str:
@@ -68,7 +162,7 @@ def summary_content(result: dict, sources: list[dict], metadata: dict) -> str:
             if issue
             else ""
         )
-        + result["summary"]
+        + math_markdown(result["summary"])
         + "\n\nProcessing limitation: PDF processing supplies text only. "
         + (
             "OCR was used on the pages listed below; recognition is unverified. "
@@ -97,7 +191,9 @@ def summary_content(result: dict, sources: list[dict], metadata: dict) -> str:
     text += "\n### Attributed scientific statements\n\n"
     for claim in result.get("claims", []):
         refs = "; ".join(f"{e['source']}, {e['locator']}" for e in claim["evidence"])
-        text += f"- {claim['statement']} ({refs}). Uncertainty: {claim['uncertainty']}\n"
+        text += (
+            f"- {math_markdown(claim['statement'])} ({refs}). Uncertainty: {claim['uncertainty']}\n"
+        )
     warnings = sorted(
         {
             f"{p['source']}, {p['locator']}: {warning}"
@@ -128,6 +224,15 @@ def resolve_link(raw: str, source: str, notes: dict[str, str]) -> str | None:
     if relative in notes:
         return relative
     matches = [n for n in notes if Path(n).stem == raw]
+    if not matches:
+        for name, text in notes.items():
+            if not text.startswith("---\n"):
+                continue
+            aliases = frontmatter(text)[0].get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            if raw in aliases:
+                matches.append(name)
     return matches[0] if len(matches) == 1 else None
 
 

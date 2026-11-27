@@ -222,7 +222,7 @@ def test_restore_verified_deletion_backup(vault):
     root, _, z, _, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    before = (root / "Literature/PAPER001.md").read_bytes()
+    before = (root / "Literature/Synthetic item — PAPER001.md").read_bytes()
     z.items.clear()
     pipeline.sync()
     git_init(root)
@@ -234,7 +234,7 @@ def test_restore_verified_deletion_backup(vault):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.restore(root, root / result["backup"])
-    assert (root / "Literature/PAPER001.md").read_bytes() == before
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_bytes() == before
     assert pipeline.state()["papers"]["PAPER001"]["disposition"] == "absent"
 
 
@@ -256,11 +256,13 @@ def test_internal_markdown_links_in_removal_impact_and_diagnostics():
     from research_vault.notes import diagnostics, impact
 
     notes = {
-        "Literature/PAPER001.md": "Paper.",
-        "My Notes/idea.md": "Hypothesis [paper](../Literature/PAPER001.md).",
+        "Literature/Synthetic item — PAPER001.md": "Paper.",
+        "My Notes/idea.md": "Hypothesis [paper](../Literature/Synthetic%20item%20%E2%80%94%20PAPER001.md).",
         "Concepts/idea.md": "A [missing](missing.md) and [external](https://example.invalid/).",
     }
-    assert impact("Literature/PAPER001.md", notes)["incoming"] == ["My Notes/idea.md"]
+    assert impact("Literature/Synthetic item — PAPER001.md", notes)["incoming"] == [
+        "My Notes/idea.md"
+    ]
     problems = diagnostics(notes)
     assert any("missing.md" in r["reason"] for r in problems)
     assert not any("example.invalid" in r["reason"] for r in problems)

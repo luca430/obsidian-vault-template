@@ -14,8 +14,10 @@ from .agents import (
     payload_budget,
     validate_note_evidence,
 )
+from .cancellation import check_cancelled
 from .config import ROLES, Config
-from .notes import diagnostics, impact, read_notes, summary_content, update_note
+from .identities import literature_path
+from .notes import bibliography, diagnostics, impact, read_notes, summary_content, update_note
 from .paths import environment
 from .processing import Processor
 from .recipes import reasoning_recipe, stage_recipe
@@ -24,6 +26,7 @@ from .review_state import candidate_groups, concept_catalog, migrate_matching_de
 from .review_workflow import readiness, select_reviews
 from .reviews import (
     apply_decisions,
+    archive_finalized,
     checkpoint,
     claim_proposal,
     counts,
@@ -34,6 +37,7 @@ from .reviews import (
     revise_proposals,
 )
 from .runtimes import LLMRunner
+from .scientific import graph_signature, scientific_notes, scientific_text
 from .sources import (
     coverage_error,
     inspect_pdf,
@@ -123,6 +127,48 @@ class Pipeline:
             ]
         )
 
+    def synchronization_status(self, state, reviews, notes=None):
+        previous = (state.get("last_report") or {}).get("status")
+        if previous == "failed":
+            return "failed"
+        if state.get("graph_digest") is None and not state.get("last_attempt"):
+            return "incomplete_resumable"
+        records = [*state["papers"].values(), *state["works"].values()]
+        if state.get("graph_error"):
+            return (
+                "failed"
+                if state.get("graph_retry_attempts", 0)
+                >= self.config.processing("max_retry_attempts")
+                else "incomplete_resumable"
+            )
+        if any(
+            r.get("status") == "pending"
+            or (
+                r.get("retryable")
+                and r.get("attempts", 0) < self.config.processing("max_retry_attempts")
+            )
+            for r in records
+        ):
+            return "incomplete_resumable"
+        if any(r.get("status") == "failed" for r in records):
+            return "failed"
+        if notes is not None and graph_signature(notes, reasoning_recipe(self.config)) != state.get(
+            "graph_digest"
+        ):
+            return "incomplete_resumable"
+        if any(
+            r.get("error") or r.get("completeness") in {"metadata_only", "partial"} for r in records
+        ):
+            return "completed_with_limitations"
+        active = any(
+            not r.get("applied")
+            and not r.get("superseded_by")
+            and not r.get("resolution")
+            and reviews[p]["status"] in {"pending", "approved"}
+            for p, r in state["proposals"].items()
+        )
+        return "completed_reviews_pending" if active else "up_to_date"
+
     def dashboard(self, state: dict, reviews: dict, error: str | None = None) -> str:
         path = inside(self.root, "Home.md")
         text = path.read_text(encoding="utf-8")
@@ -137,6 +183,8 @@ class Pipeline:
             f"Pending revisions: {pending['revision']}",
             f"Pending concept decisions: {pending['consolidation']}",
             f"Errors: {1 if error else 0}",
+            f"Synchronization status: {self.synchronization_status(state, reviews)}",
+            f"Archived reviews: {sum(bool(r.get('archived_at')) for r in state['proposals'].values())}",
         ]
         for status in ("pending", "skipped", "failed"):
             total = sum(
@@ -190,6 +238,7 @@ class Pipeline:
         return result
 
     def progress(self, stage: str, **details) -> None:
+        check_cancelled()
         self.last_progress = {"stage": stage, **details}
         if self.on_progress:
             self.on_progress(self.last_progress)
@@ -204,10 +253,7 @@ class Pipeline:
                 "config.yaml",
                 "works.yaml",
                 "AGENTS.md",
-                *[
-                    f"agents/{r}.md"
-                    for r in ROLES
-                ],
+                *[f"agents/{r}.md" for r in ROLES],
                 *[r["path"] for r in state["proposals"].values()],
             ]
             if inside(self.root, n).exists()
@@ -216,6 +262,19 @@ class Pipeline:
     def save(self, state, changes=None):
         changes = dict(changes or {})
         try:
+            archived = archive_finalized(self.root, state["proposals"], changes)
+            self.archived_reviews = getattr(self, "archived_reviews", 0) + len(archived)
+            if state.get("concept_registry") is not None or state["proposals"]:
+                registry = Registry(state.get("concept_registry"))
+                current_notes = dict(self._baseline_notes)
+                for name, value in changes.items():
+                    if name.startswith(("Literature/", "Concepts/", "My Notes/", "My Work/")):
+                        if value is None:
+                            current_notes.pop(name, None)
+                        else:
+                            current_notes[name] = value
+                registry.reviewed(state["proposals"], current_notes)
+                state["concept_registry"] = registry.data
             changes["Home.md"] = self.dashboard(state, self.merged_reviews(state, changes))
             changes[STATE] = json.dumps(state, ensure_ascii=False, indent=2)
             self._commit_checked(changes)
@@ -229,9 +288,27 @@ class Pipeline:
                 else:
                     self._baseline_notes[name] = text
             else:
-                self._baseline_files[name] = text.encode("utf-8")
+                if text is None:
+                    self._baseline_files.pop(name, None)
+                else:
+                    self._baseline_files[name] = text.encode("utf-8")
 
-    def sync(self, full: bool = False, dry_run: bool = False, startup: bool = False) -> dict:
+    def sync(
+        self, full: bool = False, dry_run: bool = False, startup: bool = False, retry: bool = False
+    ) -> dict:
+        self._interruption_reported = False
+        try:
+            return self._sync(full, dry_run, startup, retry)
+        except KeyboardInterrupt:
+            if not dry_run:
+                self.report_error("Synchronization interrupted; completed work remains resumable")
+                self._interruption_reported = True
+            raise
+
+    def _sync(self, full=False, dry_run=False, startup=False, retry=False):
+        self.archived_reviews = 0
+        self.current_processor = None
+        self.current_plan = {}
         state = deepcopy(self.state())
         if full and startup:
             raise VaultError("--startup is incremental; use --full separately")
@@ -244,24 +321,100 @@ class Pipeline:
         if state.get("server") and self.zotero.server and state["server"] != self.zotero.server:
             raise VaultError("Zotero instance differs from stored state; use a new vault")
         notes = deepcopy(self._baseline_notes)
+        self._run_initial_notes = dict(notes)
+        self._run_initial_proposals = set(state["proposals"])
+        self._run_initial_duplicates = sum(
+            r.get("suppressed_duplicates", 0) for r in state["proposals"].values()
+        )
         recipe = reasoning_recipe(self.config)
         summary_recipe = self.recipe("literature")
         manuscript_recipe = self.recipe("manuscript")
         processor = Processor(self.config, self.agent, recipe, self.progress, full)
-        changed_papers = [
-            key
+        self.current_processor = processor
+        identified = {}
+        for name, text in sorted(notes.items()):
+            if not name.startswith("Literature/") or not text.startswith("---\n"):
+                continue
+            meta, _ = frontmatter(text)
+            identity = meta.get("id")
+            if isinstance(identity, str) and identity.startswith("zotero:"):
+                key = identity.removeprefix("zotero:")
+                if key in identified:
+                    raise VaultError(f"Multiple literature notes share Zotero identity {key}")
+                identified[key] = name
+        for key, name in identified.items():
+            registered_path = state["papers"].get(key, {}).get("note")
+            if registered_path and registered_path != name:
+                raise VaultError(
+                    f"Literature note moved outside migration: {key}; restore its registered path {registered_path} before migrating"
+                )
+        paths = {
+            key: state["papers"].get(key, {}).get("note")
+            or identified.get(key)
+            or literature_path(key, item["metadata"], self.root)
             for key, item in snapshot.items()
-            if full
-            or key not in state["membership"]
-            or state["papers"].get(key, {}).get("fingerprint")
-            != digest([item["fingerprint"], summary_recipe])
-            or state["papers"].get(key, {}).get("status", "successful") != "successful"
-            or state["papers"].get(key, {}).get("completeness", "complete") != "complete"
-            or (
-                f"Literature/{key}.md" not in notes
-                and not state["papers"].get(key, {}).get("claim_review")
+        }
+        selection_reasons = {}
+
+        def annotation_content(value):
+            if isinstance(value, dict):
+                return {
+                    k: annotation_content(v)
+                    for k, v in sorted(value.items())
+                    if k not in {"version", "dateAdded", "dateModified", "lastModified"}
+                }
+            if isinstance(value, list):
+                return [annotation_content(v) for v in value]
+            return value
+
+        def source_signature(item):
+            return digest(
+                [
+                    sorted(
+                        (a["key"], a.get("sha256"), a["classification"], a.get("error"))
+                        for a in item["attachments"]
+                    ),
+                    sorted(annotation_content(item.get("annotations", [])), key=digest),
+                ]
             )
-        ]
+
+        def select_paper(key, item):
+            old = state["papers"].get(key, {})
+            attempt = digest([source_signature(item), summary_recipe])
+            previous_source = old.get("source_signature")
+            changed = (
+                previous_source != source_signature(item)
+                if previous_source
+                else old.get("fingerprint") != digest([item["fingerprint"], summary_recipe])
+            )
+            reason = (
+                "explicit full sync"
+                if full
+                else "explicit retry"
+                if retry
+                and (
+                    old.get("status", "successful") != "successful"
+                    or old.get("completeness", "complete") != "complete"
+                )
+                else "new collection member"
+                if key not in state["membership"]
+                else "source or summary recipe changed"
+                if changed or old.get("summary_recipe", summary_recipe) != summary_recipe
+                else "unfinished operation"
+                if old.get("status") == "pending"
+                else "temporary failure retry"
+                if old.get("retryable")
+                and old.get("attempts", 0) < self.config.processing("max_retry_attempts")
+                else "missing generated note"
+                if paths[key] not in notes and not old.get("claim_review") and old.get("processed")
+                else None
+            )
+            if reason:
+                selection_reasons[key] = reason
+            return reason, attempt
+
+        selections = {k: select_paper(k, v) for k, v in sorted(snapshot.items())}
+        changed_papers = [key for key in sorted(snapshot) if selections[key][0]]
         removed = sorted(set(state["membership"]) - set(snapshot))
         works, changed_works, warnings, skipped, partial_candidates = {}, [], [], {}, {}
         page_diagnostics = {}
@@ -301,8 +454,18 @@ class Pipeline:
                     not full
                     and old.get("metadata") == work
                     and old.get("recipe") == manuscript_recipe
-                    and old.get("status", "successful") == "successful"
-                    and old.get("completeness", "complete") == "complete"
+                    and not (
+                        retry
+                        and (
+                            old.get("status", "successful") != "successful"
+                            or old.get("completeness", "complete") != "complete"
+                        )
+                    )
+                    and old.get("status", "successful") != "pending"
+                    and not (
+                        old.get("retryable")
+                        and old.get("attempts", 0) < self.config.processing("max_retry_attempts")
+                    )
                     and old.get("source") == str(self.config.authorized(work["source_path"]))
                     and files
                     and all(file_hash(self.config.authorized(p)) == h for p, h in files.items())
@@ -332,7 +495,17 @@ class Pipeline:
                 warnings.append(
                     f"Manuscript {key} unavailable/disappeared or invalid: {exc}; its summary was retained."
                 )
+                if (
+                    not full
+                    and not retry
+                    and old.get("status") == "skipped"
+                    and old.get("error") == str(exc)
+                ):
+                    continue
             changed_works.append(key)
+            selection_reasons[f"work:{key}"] = (
+                "source/recipe changed, explicit retry, or unfinished operation"
+            )
         for key in state["works"]:
             if key not in {w["id"] for w in registered}:
                 warnings.append(f"Work {key} is no longer registered; its summary was retained.")
@@ -384,15 +557,12 @@ class Pipeline:
                     estimates[key] = chunks + (1 if chunks > 1 else 0)
                 except VaultError as exc:
                     blockers.append(f"Paper {key}: {exc}")
-            if hasattr(self.agent, "authenticate"):
-                try:
-                    self.authenticate_agent(changed_papers, changed_works, not startup)
-                except (VaultError, OSError) as exc:
-                    blockers.append(str(exc))
-        personal = {n: digest(t) for n, t in notes.items() if n.startswith("My Notes/")}
-        graph_input = digest([notes, sorted(snapshot), recipe])
+        personal = {
+            n: digest(scientific_text(t)) for n, t in notes.items() if n.startswith("My Notes/")
+        }
+        graph_input = graph_signature(notes, recipe)
         graph_needed = bool(notes or changed_papers or changed_works) and (
-            full or graph_input != state["graph_digest"] or bool(changed_papers or changed_works)
+            full or graph_input != state["graph_digest"] or bool(state.get("graph_error"))
         )
         plan = {
             "providers": {
@@ -430,16 +600,37 @@ class Pipeline:
             "warnings": warnings,
             "blocking_errors": blockers,
             "dry_run": dry_run,
+            "selection_reasons": selection_reasons,
+            "retried_operations": {
+                key: reason
+                for key, reason in selection_reasons.items()
+                if "retry" in reason or "unfinished" in reason
+            },
+            "reasoning_operations": [],
             "startup": startup,
             "reasoning_deferred": bool(startup and graph_needed),
         }
+        self.current_plan = plan
         if dry_run:
             return plan
         # Authenticate globally before accepting work requiring inference. Mock agents need no session.
+        graph_eligible = (
+            full
+            or retry
+            or state.get("graph_attempt_signature") != graph_input
+            or state.get("graph_retry_attempts", 0) < self.config.processing("max_retry_attempts")
+        )
+        graph_auth = not startup and (
+            (graph_needed and graph_eligible)
+            or any(k not in skipped for k in changed_papers)
+            or bool(works)
+        )
         if (
-            any(k not in skipped for k in changed_papers) or works or (graph_needed and notes)
+            any(k not in skipped for k in changed_papers)
+            or works
+            or (graph_needed and graph_eligible and notes)
         ) and hasattr(self.agent, "authenticate"):
-            self.authenticate_agent(changed_papers, changed_works, graph_needed and not startup)
+            self.authenticate_agent(changed_papers, changed_works, graph_auth)
         for key in removed:
             if key in state["papers"]:
                 old = state["papers"][key]
@@ -449,13 +640,26 @@ class Pipeline:
             state["papers"].setdefault(
                 key,
                 {
-                    "note": f"Literature/{key}.md",
+                    "note": paths[key],
                     "processed": False,
                     "removal_epoch": 0,
                     "completeness": "metadata_only",
                 },
             )
-            state["papers"][key].update(status="pending", disposition="active")
+            record = state["papers"][key]
+            attempt = selections[key][1]
+            record.update(
+                status="pending",
+                disposition="active",
+                attempts=record.get("attempts", 0) + 1
+                if record.get("attempt_fingerprint") == attempt
+                else 1,
+                attempt_fingerprint=attempt,
+                source_signature=source_signature(snapshot[key]),
+                summary_recipe=summary_recipe,
+                metadata=snapshot[key]["metadata"],
+                fingerprint=digest([snapshot[key]["fingerprint"], summary_recipe]),
+            )
             if startup and key in skipped:
                 record = state["papers"][key]
                 record.update(status="skipped", completeness="metadata_only", error=skipped[key])
@@ -478,8 +682,26 @@ class Pipeline:
             warnings=warnings,
             last_attempt=now(),
         )
+        presentation = {}
+        for key, item in sorted(snapshot.items()):
+            state["papers"].setdefault(key, {})["metadata"] = item["metadata"]
+            path = paths[key]
+            if path in notes:
+                meta, _ = frontmatter(notes[path])
+                if (
+                    meta.get("id") != f"zotero:{key}"
+                    or meta.get("generated") is not True
+                    or meta.get("kind") != "literature"
+                ):
+                    raise VaultError("Refusing to update bibliography with mismatched ownership")
+                text = bibliography(
+                    notes[path], key, item["metadata"], self.config.zotero.get("library", "users/0")
+                )
+                if text != notes[path]:
+                    notes[path] = text
+                    presentation[path] = text
         # Membership is complete independently of attachment processing; never infer removals from I/O.
-        self.save(state)
+        self.save(state, presentation)
         failed, partial = {}, {}
         scheduled_papers, scheduled_works = changed_papers, changed_works
         if startup:
@@ -543,15 +765,15 @@ class Pipeline:
                 )
                 if old["completeness"] == "failed":
                     failed[key] = error
-                    old.update(status="failed", error=error)
+                    old.update(status="failed", error=error, retryable=True)
                 else:
                     skipped[key] = error
-                    old.update(status="skipped", error=error)
+                    old.update(status="skipped", error=error, retryable=False)
                 warnings.append(f"Paper {key}: {error}; existing note retained.")
                 self.save(state)
                 completed += 1
                 continue
-            path = f"Literature/{key}.md"
+            path = paths[key]
             changes = {}
             verification = processor.warnings_for(result)
             if verification:
@@ -561,6 +783,7 @@ class Pipeline:
                     "kind": "literature",
                     "category": "papers",
                     "key": key,
+                    "library": self.config.zotero.get("library", "users/0"),
                     "fingerprint": digest([item["fingerprint"], summary_recipe]),
                     "pages": pages,
                     "metadata": {
@@ -588,6 +811,9 @@ class Pipeline:
                 notes[path] = update_note(
                     notes.get(path), f"zotero:{key}", "literature", result["title"], content
                 )
+                notes[path] = bibliography(
+                    notes[path], key, item["metadata"], self.config.zotero.get("library", "users/0")
+                )
                 changes[path] = notes[path]
                 old.pop("claim_review", None)
                 old.pop("claim_review_status", None)
@@ -604,6 +830,7 @@ class Pipeline:
                 disposition="active",
                 files=item["attachments"],
                 error="; ".join(partial.get(key, {}).values()) or None,
+                retryable=bool(attachment_errors),
             )
             if not verification:
                 old["passages"] = self.store_passages(key, item["fingerprint"], pages)
@@ -635,7 +862,11 @@ class Pipeline:
             except (OSError, VaultError) as exc:
                 failed[f"work:{key}"] = str(exc)
                 old.update(
-                    status="failed", completeness="partial" if issue else "failed", error=str(exc)
+                    status="failed",
+                    completeness="partial" if issue else "failed",
+                    error=str(exc),
+                    retryable=True,
+                    attempts=old.get("attempts", 0) + 1,
                 )
                 warnings.append(f"Manuscript {key} failed: {exc}")
                 self.save(state)
@@ -680,6 +911,7 @@ class Pipeline:
                 note=path,
                 status="successful",
                 error=issue,
+                retryable=False,
             )
             if not verification:
                 old["passages"] = self.store_passages(
@@ -713,21 +945,27 @@ class Pipeline:
                     changes,
                 )
         self.save(state, changes)
-        graph_error = None
-        if graph_needed and notes and not startup:
+        graph_needed = (
+            full
+            or graph_signature(notes, recipe) != state["graph_digest"]
+            or bool(state.get("graph_error"))
+        )
+        graph_attempt = graph_signature(notes, recipe)
+        if state.get("graph_attempt_signature") != graph_attempt:
+            state.update(graph_attempt_signature=graph_attempt, graph_retry_attempts=0)
+        graph_retry_allowed = (
+            full
+            or retry
+            or state.get("graph_retry_attempts", 0) < self.config.processing("max_retry_attempts")
+        )
+        graph_error = state.get("graph_error") if graph_needed and not graph_retry_allowed else None
+        if graph_needed and notes and not startup and graph_retry_allowed:
+            state["graph_retry_attempts"] = state.get("graph_retry_attempts", 0) + 1
             prior = state.get("graph_notes", {})
-            changed = {n for n, t in notes.items() if full or prior.get(n) != digest(t)}
-            changed.update(
-                f"Literature/{k}.md" for k in changed_papers if f"Literature/{k}.md" in notes
-            )
-            changed.update(f"My Work/{k}.md" for k in changed_works if f"My Work/{k}.md" in notes)
-            if (
-                state.get("graph_recipe") != recipe
-                or removed
-                or state.get("graph_error")
-                or set(prior) - set(notes)
-                or state.get("graph_membership") != sorted(snapshot)
-            ):
+            changed = {
+                n for n, t in notes.items() if full or prior.get(n) != digest(scientific_text(t))
+            }
+            if state.get("graph_recipe") != recipe:
                 changed = set(notes)
             passages = {}
             for record in [*state["papers"].values(), *state["works"].values()]:
@@ -735,10 +973,7 @@ class Pipeline:
                     passages[record["note"]] = read_json(inside(self.root, record["passages"]), [])
             statuses = {
                 r["note"]: {
-                    "processing": r.get("status", "successful"),
-                    "collection": r.get("disposition", "registered"),
                     "completeness": r.get("completeness", "complete"),
-                    "source_fingerprint": r.get("fingerprint"),
                 }
                 for r in [*state["papers"].values(), *state["works"].values()]
                 if r.get("note")
@@ -749,20 +984,77 @@ class Pipeline:
                 for name in set(concept_registry.data["documents"]) - notes.keys():
                     concept_registry.remove(name)
                 indexed = 0
-                for name, text in notes.items():
-                    self.progress("concepts", current=name)
-                    provenance = {"note_fingerprint": digest(text), **statuses.get(name, {})}
+                for name, text in sorted(scientific_notes(notes).items()):
+                    self.progress(
+                        "concepts",
+                        current=name,
+                        reason="Scientific content or concept recipe changed; completed indexing is reused",
+                    )
+                    provenance = {
+                        "note_fingerprint": digest(text),
+                        "source_fingerprint": next(
+                            (
+                                r.get("source_signature") or r.get("fingerprint")
+                                for r in [*state["papers"].values(), *state["works"].values()]
+                                if r.get("note") == name
+                            ),
+                            None,
+                        ),
+                    }
                     if concept_registry.update(self.config, name, text, provenance, processor):
                         indexed += 1
-                        if indexed % 20 == 0:
-                            self.save(state)
-                concept_registry.reviewed(state["proposals"])
+                        self.save(state)
+                concept_registry.reviewed(state["proposals"], notes)
                 batches = concept_registry.batches(
-                    self.config, notes, changed, sorted(snapshot), passages, statuses
+                    self.config,
+                    scientific_notes(notes),
+                    changed,
+                    sorted(snapshot),
+                    passages,
+                    statuses,
                 )
                 for number, payload in enumerate(batches, 1):
-                    self.progress("reasoning", batch=number, focus_notes=len(changed))
+                    self.progress(
+                        "reasoning",
+                        batch=number,
+                        focus_notes=len(changed),
+                        reason="Changed scientific focus, stage recipe, or unfinished batch",
+                    )
                     for role in ("linking", "synthesis", "maintenance"):
+                        operation = digest(
+                            [
+                                stage_recipe(self.config, role),
+                                role,
+                                {
+                                    k: v
+                                    for k, v in payload.items()
+                                    if k
+                                    not in {
+                                        "existing_relationships",
+                                        "document_status",
+                                        "active_literature",
+                                    }
+                                },
+                            ]
+                        )
+                        ledger = state.setdefault("reasoning_operations", {})
+                        if not full and operation in ledger:
+                            processor.hits += 1
+                            continue
+                        selection = {
+                            "role": role,
+                            "focus": payload["focus_fragment"]["note"],
+                            "operation": operation,
+                            "completed": False,
+                            "reason": "explicit full sync"
+                            if full
+                            else "reasoning recipe changed"
+                            if state.get("graph_recipe") != recipe
+                            else "unfinished reasoning batch"
+                            if state.get("graph_error")
+                            else "scientific focus changed",
+                        }
+                        plan["reasoning_operations"].append(selection)
                         result = processor.run(
                             role,
                             payload,
@@ -770,8 +1062,13 @@ class Pipeline:
                         )
                         registry, changes = self.reasoning_changes(result, payload, state, notes)
                         state["proposals"] = registry
-                        if changes:
-                            self.save(state, changes)
+                        selection["completed"] = True
+                        ledger[operation] = {
+                            "completed_at": now(),
+                            "role": role,
+                            "focus": payload["focus_fragment"]["note"],
+                        }
+                        self.save(state, changes)
             except (AuthenticationError, IntegrationError):
                 raise
             except (VaultError, OSError) as exc:
@@ -785,21 +1082,34 @@ class Pipeline:
                 warnings.append(f"Conceptual reasoning incomplete: {exc}")
             if not graph_error:
                 state.update(
-                    graph_digest=digest([notes, sorted(snapshot), recipe]),
-                    graph_notes={n: digest(t) for n, t in notes.items()},
+                    graph_digest=graph_signature(notes, recipe),
+                    graph_notes={n: digest(scientific_text(t)) for n, t in notes.items()},
                     graph_recipe=recipe,
                     graph_membership=sorted(snapshot),
+                    graph_retry_attempts=0,
                 )
             changes = {}
             for revision in diagnostics(notes):
                 proposal("revision", revision, state["proposals"], notes, changes)
             self.save(state, changes)
         elif not graph_needed or not notes:
-            state["graph_digest"] = digest([notes, sorted(snapshot), recipe])
+            state["graph_digest"] = graph_signature(notes, recipe)
         refresh_pending(
             self.root, {p: v for p, v in state["proposals"].items() if p in reviews}, notes, reviews
         )
         state["graph_error"] = graph_error
+        outstanding = {
+            k: r.get("error")
+            for group in (state["papers"], state["works"])
+            for k, r in group.items()
+            if r.get("error")
+        }
+        limitations = {
+            k: r.get("completeness")
+            for group in (state["papers"], state["works"])
+            for k, r in group.items()
+            if r.get("completeness") in {"partial", "metadata_only"}
+        }
         complete = not (
             skipped
             or work_errors
@@ -808,6 +1118,7 @@ class Pipeline:
             or graph_error
             or deferred
             or (startup and graph_needed)
+            or outstanding
         )
         state["warnings"] = warnings
         if complete:
@@ -838,6 +1149,85 @@ class Pipeline:
             + sum(len(e) for k, e in partial.items() if k not in failed)
             + int(bool(graph_error)),
         )
+        final_reviews = self.merged_reviews(state, {})
+        pending_total = sum(counts(final_reviews, state["proposals"]).values())
+        approved_unapplied = sum(
+            not r.get("applied")
+            and not r.get("superseded_by")
+            and not r.get("resolution")
+            and final_reviews[p]["status"] == "approved"
+            for p, r in state["proposals"].items()
+        )
+        retry_pending = any(
+            r.get("status") == "pending"
+            or (
+                r.get("retryable")
+                and r.get("attempts", 0) < self.config.processing("max_retry_attempts")
+            )
+            for group in (state["papers"], state["works"])
+            for r in group.values()
+        )
+        plan.update(
+            status="incomplete_resumable"
+            if (graph_error and graph_retry_allowed)
+            or retry_pending
+            or deferred
+            or (startup and graph_needed)
+            else "failed"
+            if graph_error
+            or any(
+                r.get("status") == "failed"
+                for group in (state["papers"], state["works"])
+                for r in group.values()
+            )
+            else "completed_with_limitations"
+            if limitations or outstanding
+            else "completed_reviews_pending"
+            if pending_total or approved_unapplied
+            else "up_to_date",
+            scientific_notes_changed=sorted(
+                n
+                for n, t in notes.items()
+                if state.get("graph_notes", {}).get(n) != digest(scientific_text(t))
+            )
+            if graph_error
+            else sorted(
+                n
+                for n, t in notes.items()
+                if digest(scientific_text(self._run_initial_notes.get(n, "")))
+                != digest(scientific_text(t))
+            ),
+            new_proposals=len(set(state["proposals"]) - self._run_initial_proposals),
+            suppressed_duplicates=sum(
+                r.get("suppressed_duplicates", 0) for r in state["proposals"].values()
+            )
+            - self._run_initial_duplicates,
+            archived_reviews=self.archived_reviews,
+            outstanding_failures=outstanding,
+            extraction_limitations=limitations,
+            reasoning_needed=bool(graph_needed),
+            technical_complete=not (
+                graph_error
+                or retry_pending
+                or deferred
+                or failed
+                or (startup and graph_needed)
+                or any(
+                    r.get("status") == "failed"
+                    for group in (state["papers"], state["works"])
+                    for r in group.values()
+                )
+            ),
+            source_coverage_complete=not limitations and not outstanding,
+            human_reviews_pending=pending_total,
+            approved_unapplied=approved_unapplied,
+        )
+        if not processor.calls and not changed_papers and not changed_works:
+            plan["message"] = (
+                "Vault is up to date; no inference was required."
+                if not outstanding
+                else "No eligible changes; retained source limitations are documented. No inference was required."
+            )
         self.progress(
             "complete" if complete else "incomplete",
             processed=completed,
@@ -1019,7 +1409,7 @@ class Pipeline:
                 raise VaultError(f"File changed during processing: {name}; retry sync")
         for name in changes:
             if (
-                name.startswith("Reviews/")
+                name.startswith(("Reviews/", ".pipeline/review_history/"))
                 and name not in self._baseline_files
                 and inside(self.root, name).exists()
             ):
@@ -1031,7 +1421,20 @@ class Pipeline:
         reviews = read_reviews(self.root, state["proposals"])
         notes = read_notes(self.root)
         migrate_matching_dependencies(state["proposals"], notes)
-        return readiness(self.root, state, notes, reviews, self.config)
+        return {
+            **readiness(self.root, state, notes, reviews, self.config),
+            "history": [
+                {
+                    "id": p,
+                    "path": r["path"],
+                    "decision": reviews[p]["status"],
+                    "outcome": r.get("application_outcome"),
+                    "archived_at": r.get("archived_at"),
+                }
+                for p, r in state["proposals"].items()
+                if r.get("archived_at")
+            ],
+        }
 
     def refresh_review(self, pid: str) -> dict:
         """Register a new pending version; never copy an earlier approval."""
@@ -1143,6 +1546,46 @@ class Pipeline:
         self.save(state, changes)
         return {
             "superseded": pid,
+            "replacement": replacement,
+            "path": state["proposals"][replacement]["path"],
+            "status": "pending",
+        }
+
+    def reconsider_review(self, pid, evidence_note, evidence_quote):
+        """Explicit human request with a new, verified supporting excerpt."""
+        state = deepcopy(self.state())
+        self.baseline(state)
+        reviews = read_reviews(self.root, state["proposals"])
+        record = state["proposals"].get(pid)
+        if (
+            not record
+            or record["kind"] not in {"link", "revision"}
+            or reviews[pid]["status"] != "rejected"
+        ):
+            raise VaultError("Choose a rejected link or advisory revision")
+        notes = read_notes(self.root)
+        evidence = {"note": evidence_note, "quote": evidence_quote}
+        if not evidence_note or not evidence_quote or validate_note_evidence([evidence], notes):
+            raise VaultError(
+                "Supply a new exact excerpt using --evidence-note and --evidence-quote"
+            )
+        if evidence in record["payload"]["evidence"]:
+            raise VaultError("Reconsideration needs a new supporting excerpt")
+        payload = {
+            **record["payload"],
+            "evidence": [*record["payload"]["evidence"], evidence],
+            "revised_from": pid,
+        }
+        changes = {}
+        replacement = (
+            link_proposal(payload, state["proposals"], notes, changes)
+            if record["kind"] == "link"
+            else proposal("revision", payload, state["proposals"], notes, changes)
+        )
+        if replacement is None:
+            raise VaultError("Relationship is already represented")
+        self.save(state, changes)
+        return {
             "replacement": replacement,
             "path": state["proposals"][replacement]["path"],
             "status": "pending",
@@ -1264,6 +1707,7 @@ class Pipeline:
         changes, previews, destructive = apply_decisions(
             self.root, state, notes, select_reviews(reviews, selected)
         )
+        archived = archive_finalized(self.root, state["proposals"], changes)
         token = digest(
             {
                 "selected": sorted(selected),
@@ -1278,6 +1722,7 @@ class Pipeline:
             "impact_previews": previews,
             "destructive": destructive,
             "dry_run": dry_run,
+            "archived_reviews": len(archived),
             "readiness": report,
             "selected_ids": sorted(selected),
             "can_apply": can_apply,
@@ -1309,7 +1754,28 @@ class Pipeline:
             concept_registry = Registry(state["concept_registry"])
             for name in set(concept_registry.data["documents"]) - notes.keys():
                 concept_registry.remove(name)
-            concept_registry.reviewed(state["proposals"])
+            concept_registry.reviewed(state["proposals"], notes)
+            # A link approval has already reviewed its proposed concept definition.
+            # Index it deterministically rather than re-infer the same definition.
+            if all(
+                state["proposals"][p]["kind"] in {"link", "revision"} for p in selected
+            ) and graph_signature(self._baseline_notes, reasoning_recipe(self.config)) == state.get(
+                "graph_digest"
+            ):
+
+                class IndexOnly:
+                    full = False
+
+                    def run(self, role, payload, validator):
+                        return {"concepts": []}
+
+                for name in sorted(notes.keys() - self._baseline_notes.keys()):
+                    text = scientific_text(notes[name])
+                    concept_registry.update(
+                        self.config, name, text, {"note_fingerprint": digest(text)}, IndexOnly()
+                    )
+                state["graph_digest"] = graph_signature(notes, reasoning_recipe(self.config))
+                state["graph_notes"] = {n: digest(scientific_text(t)) for n, t in notes.items()}
         updated = self.merged_reviews(state, changes)
         changes["Home.md"] = self.dashboard(state, updated)
         changes[STATE] = json.dumps(state, ensure_ascii=False, indent=2)
@@ -1368,6 +1834,17 @@ class Pipeline:
             },
             "progress": read_json(inside(self.root, ".pipeline/progress.json")),
             "last_report": state.get("last_report"),
+            "status": self.synchronization_status(state, reviews, read_notes(self.root)),
+            "review_history": [
+                {
+                    "id": p,
+                    "path": r["path"],
+                    "decision": r.get("decision"),
+                    "outcome": r.get("application_outcome"),
+                }
+                for p, r in state["proposals"].items()
+                if r.get("archived_at")
+            ],
             "completed_operations": (state.get("last_report") or {}).get("completed_operations", 0),
             "processing_failures": (state.get("last_report") or {}).get("processing_failures", 0),
             "background_runs": [
@@ -1386,9 +1863,7 @@ class Pipeline:
             },
             "reasoning_pending": bool(state.get("graph_error"))
             or state.get("graph_digest")
-            != digest(
-                [read_notes(self.root), sorted(state["membership"]), reasoning_recipe(self.config)]
-            ),
+            != graph_signature(read_notes(self.root), reasoning_recipe(self.config)),
             "reasoning_error": state.get("graph_error"),
             "pending": counts(reviews, state["proposals"]),
             "pending_claim_reviews": counts(reviews, state["proposals"])["claim"],
@@ -1560,7 +2035,33 @@ class Pipeline:
     def report_error(self, message: str) -> None:
         self.log("error", {"error": message})
         try:
+            if inside(self.root, ".pipeline/transaction.json").exists():
+                return
             state = self.state()
+            processor = getattr(self, "current_processor", None)
+            state["last_report"] = {
+                **getattr(self, "current_plan", {}),
+                "status": "failed",
+                "complete": False,
+                "technical_complete": False,
+                "error": message,
+                "completed_at": now(),
+                "inference_operations": processor.calls if processor else 0,
+                "cache_hits": processor.hits if processor else 0,
+                "completed_operations": processor.completed_operations if processor else 0,
+                "inference_metadata": processor.operations if processor else [],
+                "archived_reviews": getattr(self, "archived_reviews", 0),
+                "new_proposals": len(
+                    set(state["proposals"])
+                    - getattr(self, "_run_initial_proposals", set(state["proposals"]))
+                ),
+            }
+            self.baseline(state)
+            self.save(state)
+            atomic(
+                inside(self.root, ".pipeline/progress.json"),
+                json.dumps({"time": now(), "stage": "failed", "error": message}),
+            )
             reviews = read_reviews(self.root, state["proposals"])
             atomic(inside(self.root, "Home.md"), self.dashboard(state, reviews, message))
         except (VaultError, OSError):

@@ -32,19 +32,21 @@ def test_missing_supplement_processes_main_then_reuses_it(vault):
     assert record["status"] == "successful" and record["completeness"] == "partial"
     assert record["attachment_processing"]["PDF00001"]["completeness"] == "complete"
     assert record["attachment_processing"]["PDF00002"]["completeness"] == "metadata_only"
-    text = (root / "Literature/PAPER001.md").read_text()
+    text = (root / "Literature/Synthetic item — PAPER001.md").read_text()
     assert "Processing coverage: partial" in text
     assert "Main results" in text and "Supplementary scientific measurements" not in text
-    assert pipeline.sync()[
-        "partial"
-    ]  # Retry the unavailable attachment; main inference stays cached.
+    unchanged = pipeline.sync()
+    assert unchanged["extraction_limitations"] and not unchanged["inference_operations"]
     z.items["PAPER001"] = complete
     assert pipeline.sync()["complete"]
     assert pipeline.state()["papers"]["PAPER001"]["completeness"] == "complete"
     calls = [p for role, p in agent.calls if role == "literature" and p.get("item_key")]
     assert sum(p["attachments"][0]["key"] == "PDF00001" for p in calls) == 1
     assert sum(p["attachments"][0]["key"] == "PDF00002" for p in calls) == 1
-    assert "Supplementary scientific measurements" in (root / "Literature/PAPER001.md").read_text()
+    assert (
+        "Supplementary scientific measurements"
+        in (root / "Literature/Synthetic item — PAPER001.md").read_text()
+    )
 
 
 def test_failed_supplement_keeps_main_scientific_summary(vault):
@@ -57,7 +59,7 @@ def test_failed_supplement_keeps_main_scientific_summary(vault):
     record = pipeline.state()["papers"]["PAPER001"]
     assert "PAPER001" in result["partial"]
     assert record["attachment_processing"]["PDF00002"]["completeness"] == "failed"
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert not proposals(pipeline, "removal")
 
 
@@ -67,7 +69,7 @@ def test_metadata_only_never_calls_summary_or_creates_fulltext_claims(vault):
     assert not pipeline.sync()["complete"]
     assert pipeline.status()["completeness"]["metadata_only"] == ["PAPER001"]
     assert not agent.calls
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
 def test_registry_persists_candidates_and_source_provenance_without_public_edges(vault):
@@ -98,9 +100,11 @@ def test_registry_persists_candidates_and_source_provenance_without_public_edges
     assert registry["concepts"]
     concept = next(iter(registry["concepts"].values()))
     assert concept["status"] == "unreviewed_retrieval_annotation"
-    assert concept["sources"]["Literature/PAPER001.md"]["provenance"]["source_fingerprint"]
+    assert concept["sources"]["Literature/Synthetic item — PAPER001.md"]["provenance"][
+        "source_fingerprint"
+    ]
     assert not list((root / "Concepts").glob("*.md"))
-    assert "[[" not in (root / "Literature/PAPER001.md").read_text()
+    assert "[[" not in (root / "Literature/Synthetic item — PAPER001.md").read_text()
     before = len(agent.calls)
     Pipeline(pipeline.config, vault[2], agent).sync()
     assert len(agent.calls) == before
@@ -297,7 +301,8 @@ def test_registry_retrieves_old_personal_notes_and_manuscripts_for_new_paper(vau
     assert pipeline.sync()["complete"]
     payloads = [p for r, p in agent.calls[before:] if r == "linking"]
     assert any(
-        {"Literature/PAPER001.md", "My Notes/transport.md", "My Work/draft.md"} <= p["notes"].keys()
+        {"Literature/Synthetic item — PAPER001.md", "My Notes/transport.md", "My Work/draft.md"}
+        <= p["notes"].keys()
         for p in payloads
     )
     assert personal.read_text().startswith("Bifurcation under conserved transport;")
@@ -348,7 +353,7 @@ def test_consolidation_failure_retains_validated_attachment_claims(vault):
     result = pipeline.sync()
     assert "consolidation" in result["partial"]["PAPER001"]
     assert pipeline.state()["papers"]["PAPER001"]["completeness"] == "partial"
-    note = (root / "Literature/PAPER001.md").read_text()
+    note = (root / "Literature/Synthetic item — PAPER001.md").read_text()
     assert "Parent consolidation incomplete" in note and "Supplementary measurements." in note
     assert "PDF00001, page 1" in note and "PDF00002, page 1" in note
     agent.run = original

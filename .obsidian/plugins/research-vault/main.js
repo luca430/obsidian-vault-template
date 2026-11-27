@@ -44,6 +44,7 @@ var import_node_child_process = require("node:child_process");
 var import_node_fs = require("node:fs");
 var import_node_path = __toESM(require("node:path"));
 var import_node_string_decoder = require("node:string_decoder");
+var import_node_crypto = require("node:crypto");
 
 // src/settings.ts
 function defaults(platform) {
@@ -154,6 +155,8 @@ var OutputParser = class {
   }
 };
 function outcome(code, result) {
+  if (result?.status === "failed") return "failed";
+  if ((code === 0 || code === 2) && result?.technical_complete === true && result?.status === "completed_with_limitations") return "completed";
   if (code === 2) return "incomplete";
   if (code !== 0) return "failed";
   if (Array.isArray(result?.blocking_errors) && result.blocking_errors.length) return "failed";
@@ -170,6 +173,7 @@ function progress(snapshot, value) {
   if (value.stage === "cache" && typeof value.reused === "number") snapshot.cacheHits = value.reused;
 }
 function statusDetails(snapshot, value) {
+  if (typeof value.status === "string") snapshot.syncStatus = value.status;
   if (isRecord(value.pending)) snapshot.pending = value.pending;
   if ("last_success" in value) snapshot.lastSuccess = typeof value.last_success === "string" ? value.last_success : void 0;
   if (isRecord(value.progress)) progress(snapshot, value.progress);
@@ -190,7 +194,8 @@ var ACTION_ARGS = {
   doctor: ["doctor"],
   readiness: ["review", "status"],
   refresh: ["review", "refresh"],
-  consolidate: ["concepts", "suggest"]
+  consolidate: ["concepts", "suggest"],
+  history: ["review", "history"]
 };
 var nodeSpawn = (command, args, options) => (0, import_node_child_process.spawn)(command, args, options);
 function validText(value, label) {
@@ -268,10 +273,14 @@ async function prepare(vault, settings, platform, action, launch = nodeSpawn, ch
   const venvConfig = api.join(api.dirname(bin), "pyvenv.cfg");
   let isVenv = false;
   const args = ["-u", script, "--vault", root, ...ACTION_ARGS[action]];
+  if (selection?.controlId) {
+    if (!["sync", "full", "startup", "dry"].includes(action) || !/^[a-f0-9]{32}$/.test(selection.controlId)) throw new Error("Invalid sync control identifier.");
+    args.push("--control-id", selection.controlId);
+  }
   if (action === "consolidate" && selection?.memberPaths) {
     if (selection.id || selection.memberPaths.length < 2 || selection.memberPaths.some((p) => !/^Concepts\/[^\\\u0000-\u001f]+\.md$/.test(p) || p.split("/").includes(".."))) throw new Error("Select distinct concept paths.");
     for (const member of selection.memberPaths) args.push("--member", member);
-  } else if (action === "refresh" || action === "consolidate") {
+  } else if (action === "refresh" || action === "consolidate" || action === "history" && selection?.id) {
     if (!selection?.id || !/^[a-f0-9]{24}$/.test(selection.id)) throw new Error("Select a valid review or candidate ID.");
     args.push(selection.id);
   }
@@ -354,6 +363,32 @@ var Runner = class {
     this.busy = false;
     this.disposed = false;
   }
+  get canInterrupt() {
+    return this.busy && !!this.control && !this.control.interrupted;
+  }
+  async interrupt() {
+    const control = this.control;
+    if (!this.canInterrupt || !control) return;
+    control.interrupted = true;
+    try {
+      this.interrupting = (async () => {
+        for (const directory of [import_node_path.default.join(control.vault, ".pipeline"), import_node_path.default.join(control.vault, ".pipeline", "cancel")]) {
+          await import_node_fs.promises.mkdir(directory).catch((error) => {
+            if (error.code !== "EEXIST") throw error;
+          });
+          const info = await import_node_fs.promises.lstat(directory);
+          if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("Cancellation directory must be a local directory, without symlinks.");
+        }
+        await import_node_fs.promises.writeFile(import_node_path.default.join(control.vault, ".pipeline", "cancel", control.id), "interrupt\n", { flag: "wx" });
+        this.snapshot.stage = "Stopping synchronization at a safe boundary";
+        this.changed();
+      })();
+      await this.interrupting;
+    } catch (error) {
+      control.interrupted = false;
+      throw error;
+    }
+  }
   log(line, max) {
     this.snapshot.logs.push(redact(line).slice(0, 4e3));
     if (this.snapshot.logs.length > max) this.snapshot.logs.splice(0, this.snapshot.logs.length - max);
@@ -365,6 +400,10 @@ var Runner = class {
     if (this.busy || activeVaults.has(key)) throw new Error("A Research Vault command is already running in this vault.");
     activeVaults.add(key);
     this.busy = true;
+    if (["sync", "full", "startup", "dry"].includes(action)) {
+      this.control = { vault, id: (0, import_node_crypto.randomBytes)(16).toString("hex"), interrupted: false };
+      selection = { ...selection, controlId: this.control.id };
+    }
     this.snapshot = {
       ...this.snapshot,
       status: "running",
@@ -374,7 +413,8 @@ var Runner = class {
       skipped: void 0,
       failed: void 0,
       cacheHits: void 0,
-      diagnostics: []
+      diagnostics: [],
+      syncStatus: void 0
     };
     this.log(`Starting ${action}`, settings.maxLogLines);
     this.changed();
@@ -382,6 +422,7 @@ var Runner = class {
     try {
       const command = await prepare(vault, settings, platform, action, this.launch, void 0, selection);
       if (this.disposed) throw new Error("Plugin unloaded before the command started.");
+      if (this.control?.interrupted) throw new Error("Synchronization interrupted before launch.");
       const code = await new Promise((resolve, reject) => {
         const child = this.launch(command.executable, command.args, command.options);
         const consume = (value, stdout) => {
@@ -413,7 +454,8 @@ var Runner = class {
           resolve(exitCode);
         });
       });
-      this.snapshot.status = outcome(code, result);
+      this.snapshot.status = this.control?.interrupted ? "failed" : outcome(code, result);
+      if (typeof result?.status === "string") this.snapshot.syncStatus = result.status;
       this.snapshot.stage = `${action}: ${this.snapshot.status}`;
       if (!result) this.log("No final JSON report was available; inspect logs and run Research: Status.", settings.maxLogLines);
       if (result) {
@@ -435,6 +477,10 @@ var Runner = class {
       this.snapshot.diagnostics.push(redact(String(error)).slice(0, 4e3));
       throw error;
     } finally {
+      await this.interrupting?.catch(() => void 0);
+      if (this.control) await import_node_fs.promises.unlink(import_node_path.default.join(this.control.vault, ".pipeline", "cancel", this.control.id)).catch(() => void 0);
+      this.interrupting = void 0;
+      this.control = void 0;
       this.busy = false;
       activeVaults.delete(key);
       this.changed();
@@ -449,6 +495,7 @@ var COMMANDS = [
   ["full", "Research: Full Sync"],
   ["dry", "Research: Dry Run"],
   ["apply", "Research: Apply Reviews"],
+  ["interrupt", "Research: Interrupt Sync"],
   ["status", "Research: Status"],
   ["doctor", "Research: Doctor"],
   ["dashboard", "Research: Open Dashboard"],
@@ -607,7 +654,7 @@ var ReviewPicker = class extends import_obsidian.SuggestModal {
       const status = this.app.metadataCache.getFileCache(file)?.frontmatter?.status;
       const superseded = this.app.metadataCache.getFileCache(file)?.frontmatter?.superseded_by;
       const resolved = this.app.metadataCache.getFileCache(file)?.frontmatter?.resolved === "already_represented";
-      return this.history ? status === "approved" || status === "rejected" || typeof superseded === "string" || resolved : status === "pending" && !superseded && !resolved;
+      return this.history ? status === "approved" || status === "rejected" || typeof superseded === "string" || resolved : (status === "pending" || status === "approved") && !superseded && !resolved;
     }).sort((a, b) => a.path.localeCompare(b.path));
   }
   getSuggestionText(file) {
@@ -621,6 +668,26 @@ var ReviewPicker = class extends import_obsidian.SuggestModal {
   }
   onChooseSuggestion(file) {
     void this.app.workspace.getLeaf(false).openFile(file);
+  }
+};
+var HistoryPicker = class extends import_obsidian.SuggestModal {
+  constructor(app, plugin, records) {
+    super(app);
+    this.plugin = plugin;
+    this.records = records;
+    this.setPlaceholder("Search archived review decisions");
+  }
+  getSuggestions(query) {
+    return this.records.filter((record) => `${record.path} ${record.decision} ${record.kind}`.toLowerCase().includes(query.toLowerCase()));
+  }
+  getSuggestionText(record) {
+    return `${record.path} (${record.decision}; ${record.outcome})`;
+  }
+  renderSuggestion(record, el) {
+    el.setText(this.getSuggestionText(record));
+  }
+  onChooseSuggestion(record) {
+    void this.plugin.openArchivedReview(String(record.id));
   }
 };
 var ResearchView = class extends import_obsidian.ItemView {
@@ -649,7 +716,8 @@ var ResearchView = class extends import_obsidian.ItemView {
     el.addClass("research-vault-view");
     el.createEl("h2", { text: "Research Vault" });
     const state = this.plugin.runner.snapshot;
-    el.createEl("p", { text: `Status: ${state.status}`, cls: `research-vault-status status-${state.status}` });
+    const labels = { up_to_date: "Up to date", completed_reviews_pending: "Completed, reviews pending", completed_with_limitations: "Completed with limitations", incomplete_resumable: "Incomplete, resumable", failed: "Failed" };
+    el.createEl("p", { text: `Status: ${state.status === "failed" ? "Failed" : labels[state.syncStatus ?? ""] ?? state.status}`, cls: `research-vault-status status-${state.status}` });
     el.createEl("p", { text: `Stage: ${redact(state.stage)}` });
     const stats = el.createEl("dl", { cls: "research-vault-stats" });
     for (const [label, value] of [
@@ -669,11 +737,16 @@ var ResearchView = class extends import_obsidian.ItemView {
       stats.createEl("dd", { text: typeof value === "number" || typeof value === "string" ? redact(String(value)) : "Not reported" });
     }
     const controls = el.createDiv({ cls: "research-vault-controls" });
-    for (const [action, label] of [["sync", "Sync"], ["apply", "Apply Reviews"], ["doctor", "Doctor"], ["status", "Refresh Status"]]) {
+    for (const [action, label] of [["sync", "Sync"], ["dry", "Dry Run Sync"], ["apply", "Apply Reviews"], ["doctor", "Doctor"], ["status", "Refresh Status"]]) {
       const button = controls.createEl("button", { text: label });
       button.disabled = this.plugin.runner.busy;
       button.addEventListener("click", () => this.plugin.request(action));
     }
+    const stop = controls.createEl("button", { text: "Interrupt Sync" });
+    stop.disabled = !this.plugin.runner.canInterrupt;
+    stop.addEventListener("click", () => {
+      void this.interrupt();
+    });
     controls.createEl("button", { text: "Open Review Queue" }).addEventListener("click", () => this.plugin.openReviews());
     controls.createEl("button", { text: "Review History" }).addEventListener("click", () => this.plugin.openReviews(true));
     controls.createEl("button", { text: "Open Dashboard" }).addEventListener("click", () => {
@@ -686,6 +759,13 @@ var ResearchView = class extends import_obsidian.ItemView {
     const logs = el.createEl("pre", { text: state.logs.join("\n"), cls: "research-vault-logs" });
     logs.scrollTop = follow ? logs.scrollHeight : scroll;
     el.createEl("p", { text: "Full reports: .pipeline/logs. Review decisions are edited in review notes and validated by Python.", cls: "setting-item-description" });
+  }
+  async interrupt() {
+    try {
+      await this.plugin.runner.interrupt();
+    } catch (error) {
+      new import_obsidian.Notice(`Cannot interrupt synchronization: ${redact(String(error))}`);
+    }
   }
 };
 var ResearchVaultPlugin = class extends import_obsidian.Plugin {
@@ -704,6 +784,7 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
         else if (id === "reviews") this.openReviews();
         else if (id === "review-history") this.openReviews(true);
         else if (id === "review-readiness") void this.previewReviews();
+        else if (id === "interrupt") void this.runner.interrupt().catch((error) => new import_obsidian.Notice(`Cannot interrupt synchronization: ${redact(String(error))}`));
         else this.request(id);
       } });
     }
@@ -864,8 +945,22 @@ var ResearchVaultPlugin = class extends import_obsidian.Plugin {
     if (file instanceof import_obsidian.TFile) await this.app.workspace.getLeaf(false).openFile(file);
     else new import_obsidian.Notice("Home.md is missing from this vault.");
   }
-  openReviews(history = false) {
-    new ReviewPicker(this.app, history).open();
+  async openReviews(history = false) {
+    if (!history) {
+      new ReviewPicker(this.app).open();
+      return;
+    }
+    const result = await this.execute("history", true);
+    if (result && Array.isArray(result.history) && !this.runner.disposed) new HistoryPicker(this.app, this, result.history.filter(isRecord)).open();
+  }
+  async openArchivedReview(id) {
+    const result = await this.execute("history", true, { id });
+    if (!result || typeof result.markdown !== "string" || this.runner.disposed) return;
+    const modal = new import_obsidian.Modal(this.app);
+    modal.contentEl.createEl("h2", { text: "Archived review" });
+    modal.contentEl.createEl("pre", { text: result.markdown, cls: "research-vault-diagnostic" });
+    modal.contentEl.createEl("pre", { text: JSON.stringify(result.record, null, 2), cls: "research-vault-diagnostic" });
+    modal.open();
   }
   async saveSettings() {
     await this.saveData(this.settings);

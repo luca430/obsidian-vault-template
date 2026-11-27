@@ -69,3 +69,6 @@ processing:
   candidate_terms: 32        # Maximum rare query terms used per registry fragment.
   candidate_pool: 128        # Hard bound on candidate fragments scored per query.
   startup_max_documents: 5   # --startup caps document work and defers concept/reasoning stages.
+  max_retry_attempts: 3      # Bound unchanged temporary failures; sync --retry overrides.
+  # Persistent source-coverage limitations wait for changed inputs/settings or --retry.
+  # Dry-run estimates never authenticate, invoke inference, or update research state.

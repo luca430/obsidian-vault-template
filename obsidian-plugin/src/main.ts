@@ -10,6 +10,7 @@ export const VIEW_TYPE = 'research-vault-sidebar';
 export const COMMANDS = [
   ['sync', 'Research: Sync'], ['full', 'Research: Full Sync'],
   ['dry', 'Research: Dry Run'], ['apply', 'Research: Apply Reviews'],
+  ['interrupt', 'Research: Interrupt Sync'],
   ['status', 'Research: Status'], ['doctor', 'Research: Doctor'],
   ['dashboard', 'Research: Open Dashboard'], ['reviews', 'Research: Open Review Queue'],
   ['review-history', 'Research: Open Review History'],
@@ -129,7 +130,7 @@ class ReviewPicker extends SuggestModal<TFile> {
         const status: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.status;
         const superseded: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.superseded_by;
         const resolved = this.app.metadataCache.getFileCache(file)?.frontmatter?.resolved === 'already_represented';
-        return this.history ? status === 'approved' || status === 'rejected' || typeof superseded === 'string' || resolved : status === 'pending' && !superseded && !resolved;
+        return this.history ? status === 'approved' || status === 'rejected' || typeof superseded === 'string' || resolved : (status === 'pending' || status === 'approved') && !superseded && !resolved;
       })
       .sort((a, b) => a.path.localeCompare(b.path));
   }
@@ -141,6 +142,16 @@ class ReviewPicker extends SuggestModal<TFile> {
   }
   renderSuggestion(file: TFile, el: HTMLElement): void { el.setText(this.getSuggestionText(file)); }
   onChooseSuggestion(file: TFile): void { void this.app.workspace.getLeaf(false).openFile(file); }
+}
+
+class HistoryPicker extends SuggestModal<RecordValue> {
+  constructor(app: App, private plugin: ResearchVaultPlugin, private records: RecordValue[]) { super(app); this.setPlaceholder('Search archived review decisions'); }
+  getSuggestions(query: string): RecordValue[] {
+    return this.records.filter(record => `${record.path} ${record.decision} ${record.kind}`.toLowerCase().includes(query.toLowerCase()));
+  }
+  getSuggestionText(record: RecordValue): string { return `${record.path} (${record.decision}; ${record.outcome})`; }
+  renderSuggestion(record: RecordValue, el: HTMLElement): void { el.setText(this.getSuggestionText(record)); }
+  onChooseSuggestion(record: RecordValue): void { void this.plugin.openArchivedReview(String(record.id)); }
 }
 
 export class ResearchView extends ItemView {
@@ -158,7 +169,8 @@ export class ResearchView extends ItemView {
     el.empty(); el.addClass('research-vault-view');
     el.createEl('h2', { text: 'Research Vault' });
     const state = this.plugin.runner.snapshot;
-    el.createEl('p', { text: `Status: ${state.status}`, cls: `research-vault-status status-${state.status}` });
+    const labels: Record<string, string> = { up_to_date: 'Up to date', completed_reviews_pending: 'Completed, reviews pending', completed_with_limitations: 'Completed with limitations', incomplete_resumable: 'Incomplete, resumable', failed: 'Failed' };
+    el.createEl('p', { text: `Status: ${state.status === 'failed' ? 'Failed' : labels[state.syncStatus ?? ''] ?? state.status}`, cls: `research-vault-status status-${state.status}` });
     el.createEl('p', { text: `Stage: ${redact(state.stage)}` });
     const stats = el.createEl('dl', { cls: 'research-vault-stats' });
     for (const [label, value] of [
@@ -173,11 +185,14 @@ export class ResearchView extends ItemView {
       stats.createEl('dd', { text: typeof value === 'number' || typeof value === 'string' ? redact(String(value)) : 'Not reported' });
     }
     const controls = el.createDiv({ cls: 'research-vault-controls' });
-    for (const [action, label] of [['sync', 'Sync'], ['apply', 'Apply Reviews'], ['doctor', 'Doctor'], ['status', 'Refresh Status']] as const) {
+    for (const [action, label] of [['sync', 'Sync'], ['dry', 'Dry Run Sync'], ['apply', 'Apply Reviews'], ['doctor', 'Doctor'], ['status', 'Refresh Status']] as const) {
       const button = controls.createEl('button', { text: label });
       button.disabled = this.plugin.runner.busy;
       button.addEventListener('click', () => this.plugin.request(action));
     }
+    const stop = controls.createEl('button', { text: 'Interrupt Sync' });
+    stop.disabled = !this.plugin.runner.canInterrupt;
+    stop.addEventListener('click', () => { void this.interrupt(); });
     controls.createEl('button', { text: 'Open Review Queue' }).addEventListener('click', () => this.plugin.openReviews());
     controls.createEl('button', { text: 'Review History' }).addEventListener('click', () => this.plugin.openReviews(true));
     controls.createEl('button', { text: 'Open Dashboard' }).addEventListener('click', () => { void this.plugin.openDashboard(); });
@@ -188,6 +203,10 @@ export class ResearchView extends ItemView {
     const logs = el.createEl('pre', { text: state.logs.join('\n'), cls: 'research-vault-logs' });
     logs.scrollTop = follow ? logs.scrollHeight : scroll;
     el.createEl('p', { text: 'Full reports: .pipeline/logs. Review decisions are edited in review notes and validated by Python.', cls: 'setting-item-description' });
+  }
+  private async interrupt(): Promise<void> {
+    try { await this.plugin.runner.interrupt(); }
+    catch (error) { new Notice(`Cannot interrupt synchronization: ${redact(String(error))}`); }
   }
 }
 
@@ -207,6 +226,7 @@ export default class ResearchVaultPlugin extends Plugin {
         else if (id === 'reviews') this.openReviews();
         else if (id === 'review-history') this.openReviews(true);
         else if (id === 'review-readiness') void this.previewReviews();
+        else if (id === 'interrupt') void this.runner.interrupt().catch(error => new Notice(`Cannot interrupt synchronization: ${redact(String(error))}`));
         else this.request(id);
       } });
     }
@@ -354,7 +374,22 @@ export default class ResearchVaultPlugin extends Plugin {
     if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
     else new Notice('Home.md is missing from this vault.');
   }
-  openReviews(history = false): void { new ReviewPicker(this.app, history).open(); }
+  async openReviews(history = false): Promise<void> {
+    if (!history) { new ReviewPicker(this.app).open(); return; }
+    const result = await this.execute('history', true);
+    if (result && Array.isArray(result.history) && !this.runner.disposed) new HistoryPicker(this.app, this, result.history.filter(isRecord)).open();
+  }
+  async openArchivedReview(id: string): Promise<void> {
+    const result = await this.execute('history', true, { id });
+    if (!result || typeof result.markdown !== 'string' || this.runner.disposed) return;
+    const modal = new Modal(this.app);
+    modal.contentEl.createEl('h2', { text: 'Archived review' });
+    // Hidden .pipeline files are not indexed by Obsidian. Python validates and
+    // supplies the exact archived payload without adding review graph edges.
+    modal.contentEl.createEl('pre', { text: result.markdown, cls: 'research-vault-diagnostic' });
+    modal.contentEl.createEl('pre', { text: JSON.stringify(result.record, null, 2), cls: 'research-vault-diagnostic' });
+    modal.open();
+  }
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
 }
 

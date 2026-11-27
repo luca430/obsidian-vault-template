@@ -3,12 +3,12 @@ id: assigned-by-pipeline
 kind: link
 proposed_at: 'ISO-8601 timestamp'
 status: pending
-source: Literature/ITEMKEY.md
+source: Literature/Paper title — ITEMKEY.md
 target: Concepts/concept.md
 relationship: mechanism
 justification: Scientific reason independent of bibliographic citation.
 evidence:
-  - note: Literature/ITEMKEY.md
+  - note: Literature/Paper title — ITEMKEY.md
     quote: Exact supporting excerpt.
 target_concept:
   title: Concept title

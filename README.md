@@ -377,8 +377,7 @@ Successful document notes/state commit individually using the existing write-ahe
 journal. An interruption resumes pending jobs without repeating completed inference.
 One missing PDF, offline cloud file, extraction error or invalid LLM response does
 not discard other completed papers. Parents with no successfully summarized attachment retain their older note.
-Partial parents keep successful attachment findings and retry unavailable/failed
-sources. No full-text scientific claims are generated from metadata alone.
+Partial parents keep successful attachment findings. Persistent coverage limitations wait for changed inputs/settings or explicit `sync --retry`; transient inference failures retry up to `processing.max_retry_attempts` (default 3). No full-text scientific claims are generated from metadata alone.
 
 Coverage is separate from job status, at both parent and attachment levels:
 
@@ -491,7 +490,7 @@ reprocesses the current project without changing its identity.
 
 ### Main and supplementary attachments
 
-All PDF children of one bibliographic item contribute to `Literature/ITEMKEY.md`.
+All PDF children of one bibliographic item contribute to one title-named literature note. The filename is `<sanitized Zotero title> — ITEMKEY.md`; `id: zotero:ITEMKEY` remains the immutable identity.
 By default, titles/filenames containing `supplement`, `supporting` or `appendix`
 are supplementary; other PDFs are main. Multiple main PDFs are allowed. Review
 these heuristics before the first run.
@@ -679,7 +678,8 @@ plugin name). Commands use the existing Python CLI, without changing its semanti
 | --- | --- |
 | Research: Sync | `sync`, incremental |
 | Research: Full Sync | `sync --full`, after a warning and confirmation |
-| Research: Dry Run | `sync --dry-run`, inspect changes without inference or research writes |
+| Research: Dry Run | `sync --dry-run`, inspect changes without authentication, inference or research writes |
+| Research: Interrupt Sync | Cooperatively stop the current plugin sync; record Failed and retain completed work |
 | Research: Apply Reviews | Readiness, explicit selection, selected preview, confirmation, selected apply |
 | Research: Status | `status` |
 | Research: Doctor | `doctor` |
@@ -690,7 +690,7 @@ plugin name). Commands use the existing Python CLI, without changing its semanti
 
 Click the **microscope ribbon icon** or **Settings → Research Vault → Open sidebar**
 to open the Research Vault sidebar. The ribbon can be disabled in settings (reload
-the plugin after changing it). The sidebar has Sync, Apply Reviews, Doctor, Refresh
+the plugin after changing it). The sidebar has Sync, Dry Run Sync, Interrupt Sync, Apply Reviews, Doctor, Refresh
 Status and navigation buttons. **Open sidebar automatically** is optional.
 
 Run Doctor, then Dry Run, then Sync manually for your first run. Processing runs
@@ -719,16 +719,16 @@ never as executable content or HTML from scientific sources.
 
 Use **Open Review Queue** to search paths in `Reviews/Links/`,
 `Reviews/Removals/`, `Reviews/Revisions/` and `Reviews/Concepts/`; results include the note's current
-status. Only active `status: pending` files appear in the active queue. Once a saved
-decision becomes approved or rejected, the file leaves that view. Use the sidebar's
-**Review History** button or **Research: Open Review History** command to inspect
-approved/rejected, superseded and resolved reviews, including approvals that have not been applied yet.
-Approved decisions still require **Apply Reviews**; changing the status alone
-does not integrate a proposal. Ordinary unapplied decisions can return to the
-queue by setting their status back to pending. Superseded and resolved records
-stay in history; their Python-managed markers must not be edited. Files stay at their registered paths to preserve
-the evidence, integrity checks, rejection memory and audit trail; they are not
-deleted or moved. Review the actual evidence and edit decisions in Obsidian
+status. Pending reviews and approved but unapplied reviews remain in the active queue,
+including stale, conflicting or blocked approvals. A successful writer moves applied,
+rejected, superseded and otherwise resolved reviews into
+`.pipeline/review_history/{approved,rejected,superseded,resolved}/` in the same
+transaction as registry/application updates. Original payloads, decisions, timestamps,
+evidence and application outcomes remain available. **Review History** reads these
+hidden files through Python and displays the exact archived Markdown and record;
+Obsidian does not index `.pipeline` as research notes. Archived decisions are immutable.
+Approved decisions still require **Apply Reviews**; changing status alone does not
+integrate a proposal. Review the actual evidence and edit active decisions in Obsidian
 Properties or source mode. Claim drafts also reside in `Reviews/Revisions/`. The plugin
 never writes approvals or scientific notes directly. Apply Reviews first displays
 **Review Readiness**. Select the ready approvals you want, click **Preview selected**,
@@ -1079,6 +1079,74 @@ rewritten. If the paper returns to the collection, the same parent key reactivat
 its existing note or regenerates the deleted note without creating a new identity.
 See [recovery instructions](docs/operations.md) before restoring a backup.
 
+## Note presentation, incremental identity and migration
+
+New literature files use the original Zotero title and a stable item-key suffix.
+Unicode is normalized, invalid Windows/Obsidian characters are removed, device names
+are protected, and filename lengths are bounded. Duplicate titles remain distinct.
+The full title, authors, year, journal, DOI and Zotero selection URI appear in the
+managed header when metadata is available. Bibliography changes update presentation
+without re-extracting PDFs or asking an LLM. Existing filenames remain stable during
+sync; use migration for renaming existing notes or following a changed title.
+Generated scientific prose uses `$...$` and `$$...$$`; evidence excerpts retain
+original text and unreliable extracted equations are never reconstructed.
+
+Before migrating, back up the complete vault including `.pipeline`. Preview with:
+
+```bash
+.venv/bin/python scripts/research.py migrate
+.venv/bin/python scripts/research.py migrate --execute --plan-token TOKEN_FROM_PREVIEW
+```
+
+Use the corresponding `.venv\Scripts\python.exe` on native Windows. Migration
+uses Zotero metadata and stored notes; it does not read source PDFs or call inference.
+It preserves item IDs, additions, aliases, relationships, processing records and
+proposal IDs. Renamed notes gain old-path and old-key aliases. Managed relationship
+references and registered review dependencies move consistently. Exact original
+review bytes/records are retained in `.pipeline/migration_history/` for audit.
+Unmanaged references appear in `user_note_previews` and stay unchanged by default.
+To authorize only those link rewrites, first preview with repeated
+`--authorize-note 'My Notes/example.md'`, inspect the exact diff, then repeat those
+same paths on `--execute` with that preview token. Changed previews refuse execution.
+Missing ownership markers or occupied destinations stop the migration. All file
+moves, history moves and state changes share the recovery journal.
+
+Scientific fingerprints exclude bibliography, presentation-only frontmatter,
+processing diagnostics and Python-owned graph sections. Source fingerprints,
+stage recipes, approved relationships, human decisions and unfinished operations
+have separate records. An unchanged incremental run makes zero LLM calls and creates
+zero proposals. Applying/rejecting ordinary relationships does not invalidate
+scientific reasoning. New/changed scientific notes use targeted retrieval; successful
+reasoning batches are checkpointed by role and scientific input and survive interruption.
+`sync --full` explicitly reconsiders the whole vault.
+
+Relationship identities use immutable note IDs when available (stable paths for
+notes without an ID), exact declared aliases/consolidation redirects and canonical
+types. `shared-concept` and `contradiction` are symmetric; `generalization` and
+`special-case` are inverse; other types keep direction. Wording/evidence selection
+does not reopen approved or rejected relationships. Rejected relationships require
+explicit `review reconsider` with a new verified supporting excerpt. Unreviewed
+conflicting definitions still require concept comparison. Advisory revision identities
+use note identity, issue category and supporting scientific paragraphs; acknowledgements
+and rejections survive rewording. Structural deduplication is conservative and is not
+a general semantic-equivalence classifier.
+
+The sidebar's **Interrupt Sync** and command-palette action write a run-specific
+cancellation request shared by native Python and WSL. Python checks it at safe
+boundaries and while waiting for inference/OCR, terminates the waiting runtime, and
+records **Failed**. Completed documents, chunks and reasoning batches remain resumable.
+A transaction is allowed to finish or roll back before stopping. **Sync** resumes
+unfinished work; **Dry Run Sync** inspects the plan without performing inference or
+changing research state. Interruption is available for plugin-started syncs, including
+dry runs; Apply Reviews cannot be interrupted through this control. Native extraction
+and API reads stop at their next boundary/timeout rather than midway through an I/O call.
+
+Reports include selection reasons, new/modified/unchanged documents, scientific-note
+changes, inference operations/cache hits, proposals, suppressed duplicates, archived
+reviews, outstanding failures and extraction limitations. If nothing needs inference,
+the report says so explicitly. Source limitations remain documented even when no
+retry is eligible. Changing inputs/settings or `--retry` enables another attempt.
+
 ## Initial sync, incremental work and request budgets
 
 The first `sync` processes parents progressively, then reasons across their summaries.
@@ -1118,7 +1186,7 @@ Reports separate `completed_operations` (successful inference jobs, including ca
 reuse), `completed_documents`, `pending_claim_reviews`, `pending_link_reviews` and
 `processing_failures`. Pending reviews do not prevent `last_success` advancing.
 A completed attempt with skipped/failed documents
-or incomplete reasoning exits **2**, with details in JSON. Blocking configuration,
+or incomplete reasoning exits **2**, with details in JSON. Exhausted processing failures exit **1**. Reports distinguish `technical_complete`, `source_coverage_complete` and `human_reviews_pending`; the human-readable status is Up to date, Completed/reviews pending, Completed with limitations, Incomplete/resumable, or Failed. Blocking configuration,
 API, authentication, ownership, concurrent-edit or transaction errors exit **1**;
 keyboard interruption exits **130**. Progress events are JSON on stderr; the final
 result stays on stdout. `doctor` exits 1 only for blocking errors; attachment and
@@ -1165,7 +1233,12 @@ The wrapper script selects its own vault directory, even when called from elsewh
 | `sync --background` | Launch a detached finite incremental run; inspect its final report |
 | `sync --startup --background` | Bounded startup document jobs; defer concept extraction and reasoning |
 | `sync --full` | Reprocess all active papers/available works and reconsider graph context |
-| `sync --dry-run` | Inspect metadata, fingerprints and text availability; show operations/skip reasons; no writes or inference |
+| `sync --dry-run` | Inspect metadata, fingerprints and native text availability; show operations/selection reasons; no authentication, writes or inference |
+| `sync --retry` | Explicitly retry unchanged failures and persistent extraction limitations |
+| `migrate` | Preview title filenames, bibliographic presentation, reference changes and finalized-review archiving; no PDF extraction or inference |
+| `migrate --execute --plan-token TOKEN` | Apply the exact migration preview transactionally |
+| `review history [ID]` | List archived reviews, or read one complete original record and Markdown |
+| `review reconsider ID --evidence-note PATH --evidence-quote TEXT` | Explicitly request a new pending link/revision with a new exact supporting excerpt |
 | `review status` | Read-only readiness, before/after diffs and concept candidates; no inference |
 | `review refresh ID` | Create a pending replacement, close an already represented duplicate, or direct alternative definitions to comparison; no Sync or inference |
 | `concepts candidates` | Read-only duplicate/conflicting concept candidate groups |

@@ -149,7 +149,7 @@ def test_tesseract_adapter_streams_png_and_sets_timeout_without_shell(tmp_path, 
         assert not kwargs.get("shell")
         return subprocess.CompletedProcess(args, 0, RECOGNIZED.encode(), b"")
 
-    monkeypatch.setattr(sources.subprocess, "run", run)
+    monkeypatch.setattr(sources, "run_process", run)
     pages = sources.pdf(
         path, "PDF00001", {"enabled": True, "language": "eng+ita", "timeout_seconds": 7}
     )
@@ -159,7 +159,7 @@ def test_tesseract_adapter_streams_png_and_sets_timeout_without_shell(tmp_path, 
 def test_unavailable_tesseract_does_not_discard_native_pages(tmp_path, monkeypatch):
     path = make_pdf(tmp_path / "mixed.pdf", ["text", "scan"])
     monkeypatch.setattr(sources.shutil, "which", lambda name: None)
-    monkeypatch.setattr(sources.subprocess, "run", lambda *a, **k: pytest.fail("No engine"))
+    monkeypatch.setattr(sources, "run_process", lambda *a, **k: pytest.fail("No engine"))
     pages = sources.pdf(path, "PDF00001", {"enabled": True})
     assert pages[0]["extraction_status"] == "text"
     assert "OCR unavailable" in pages[1]["reason"]
@@ -169,8 +169,8 @@ def test_tesseract_language_failure_records_stderr_for_diagnosis(tmp_path, monke
     path = make_pdf(tmp_path / "scan.pdf", ["scan"])
     monkeypatch.setattr(sources.shutil, "which", lambda name: "tesseract")
     monkeypatch.setattr(
-        sources.subprocess,
-        "run",
+        sources,
+        "run_process",
         lambda *a, **k: subprocess.CompletedProcess(a, 1, b"", b"Error opening language data eng"),
     )
     pages = sources.pdf(path, "PDF00001", {"enabled": True})
@@ -203,7 +203,7 @@ def test_partial_paper_records_coverage_excludes_unread_evidence_and_reuses_summ
     payload = next(p for r, p in agent.calls if r == "literature")
     assert [p["locator"] for p in payload["pages"]] == ["page 1"]
     assert payload["coverage"] == "partial" and len(payload["page_processing"]) == 3
-    note = (root / "Literature/PAPER001.md").read_text()
+    note = (root / "Literature/Synthetic item — PAPER001.md").read_text()
     processed = note.split("### Processed sources")[1].split("### Unprocessed pages")[0]
     assert "page 1 (text)" in processed and "page 2" not in processed
     assert "Unprocessed pages (not read)" in note and "page 3" in note
@@ -213,6 +213,8 @@ def test_partial_paper_records_coverage_excludes_unread_evidence_and_reuses_summ
     summaries = sum(r == "literature" for r, p in agent.calls)
     assert not pipeline.sync()["complete"]
     assert sum(r == "literature" for r, p in agent.calls) == summaries
+    assert extracted_pages == [0, 1, 2]
+    pipeline.sync(retry=True)
     assert extracted_pages == [0, 1, 2, 1, 2]
 
 
@@ -233,7 +235,7 @@ def test_ocr_retry_reuses_successful_pages_then_becomes_complete(vault, monkeypa
     assert not pipeline.sync()["complete"]
     assert calls == [0, 1]
     recovered = True
-    assert pipeline.sync()["complete"]
+    assert pipeline.sync(retry=True)["complete"]
     assert calls == [0, 1, 1]
     record = pipeline.state()["papers"]["PAPER001"]
     assert record["completeness"] == "complete"
@@ -241,7 +243,7 @@ def test_ocr_retry_reuses_successful_pages_then_becomes_complete(vault, monkeypa
         p["extraction_status"] == "ocr"
         for p in record["attachment_processing"]["PDF00001"]["page_processing"]
     )
-    note = (root / "Literature/PAPER001.md").read_text()
+    note = (root / "Literature/Synthetic item — PAPER001.md").read_text()
     assert "page 2 (ocr)" in note and "recognition is unverified" in note
     before = len(agent.calls)
     assert pipeline.sync()["complete"]
@@ -279,7 +281,7 @@ def test_fully_scanned_without_ocr_records_partial_coverage_without_inference(va
     record = pipeline.state()["papers"]["PAPER001"]
     assert record["completeness"] == "partial"
     assert len(record["attachment_processing"]["PDF00001"]["page_processing"]) == 2
-    assert not agent.calls and not (root / "Literature/PAPER001.md").exists()
+    assert not agent.calls and not (root / "Literature/Synthetic item — PAPER001.md").exists()
 
 
 def test_pdf_manuscript_coverage_is_partial_and_retried(vault, monkeypatch):
@@ -300,7 +302,7 @@ def test_pdf_manuscript_coverage_is_partial_and_retried(vault, monkeypatch):
     assert pipeline.state()["works"]["draft"]["completeness"] == "partial"
     assert "Unprocessed pages (not read)" in (root / "My Work/draft.md").read_text()
     monkeypatch.setattr(sources, "ocr_page", lambda *a: RECOGNIZED)
-    assert pipeline.sync()["complete"]
+    assert pipeline.sync(retry=True)["complete"]
     assert pipeline.status()["manuscript_processing"]["draft"]["completeness"] == "complete"
 
 

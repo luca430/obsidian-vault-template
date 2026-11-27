@@ -285,7 +285,7 @@ def test_unverifiable_evidence_remains_review_required_for_both_providers(
     pipeline = Pipeline(old.config, z, runner)
     report = pipeline.sync()
     assert report["complete"] and report["pending_claim_reviews"] == 1
-    assert not (root / "Literature/PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     event = next(r for r in report["inference_metadata"] if r["role"] == "literature")
     assert event["validation_status"] == "review_required"
     assert event["warnings"][0]["evidence"]["source"] == "PDF00001"

@@ -18,6 +18,7 @@ from .agents import (
     prompt_prefix,
     validate_output,
 )
+from .cancellation import run_process
 from .config import PROVIDERS, ROLES, Config
 from .storage import VaultError, atomic, inside
 
@@ -130,7 +131,7 @@ class ClaudeCode(CLIAdapter):
         if settings.get("model"):
             command.extend(["--model", settings["model"]])
         try:
-            process = subprocess.run(
+            process = run_process(
                 command,
                 input=json.dumps(payload, ensure_ascii=False),
                 capture_output=True,

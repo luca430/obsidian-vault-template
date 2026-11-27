@@ -9,6 +9,7 @@ import math
 from collections import Counter
 
 from .agents import payload_budget, validate_note_evidence
+from .identities import registered_relationship_key, relationship_key
 from .processing import fragments, size, terms
 from .recipes import stage_recipe
 from .storage import VaultError, digest, frontmatter
@@ -58,7 +59,7 @@ class Registry:
             self.remove(name)
             return False
         old = self.data["documents"].get(name, {})
-        signature = digest([text, provenance])
+        signature = digest(text)
         concept_recipe = stage_recipe(config, "concepts")
         index_recipe = stage_recipe(config, "retrieval")
         if (
@@ -67,6 +68,7 @@ class Registry:
             and old.get("index_recipe") == index_recipe
             and not processor.full
         ):
+            old["provenance"] = provenance
             return False
         annotations = old.get("annotations", [])
         validation_warnings = old.get("validation_warnings", [])
@@ -151,7 +153,60 @@ class Registry:
         }
         return True
 
-    def reviewed(self, proposals):
+    def reviewed(self, proposals, notes=None):
+        relationships = {}
+        for pid, record in sorted(proposals.items()):
+            links = (
+                [record["payload"]]
+                if record["kind"] == "link"
+                else record["payload"].get("links", [])
+                if record["kind"] == "consolidation"
+                else []
+            )
+            for link in links:
+                key = (
+                    registered_relationship_key(record, notes or {})
+                    if record["kind"] == "link"
+                    else relationship_key(
+                        link, {**(notes or {}), **record.get("expected_notes", {})}
+                    )
+                )
+                identity = digest(key)
+                relationship = relationships.setdefault(
+                    identity,
+                    {
+                        "identity": key,
+                        "proposals": [],
+                        "approved": False,
+                        "decisions": [],
+                    },
+                )
+                relationship["proposals"].append(pid)
+                relationship["approved"] |= bool(record.get("applied"))
+                relationship["decisions"].append(
+                    {
+                        "proposal": pid,
+                        "decision": record.get("decision", "pending"),
+                        "applied_at": record.get("applied_at"),
+                        "resolution": record.get("resolution"),
+                        "superseded_by": record.get("superseded_by"),
+                    }
+                )
+        self.data["relationships"] = relationships
+        self.data["relationship_history"] = {
+            pid: {
+                "source": record["payload"]["source"],
+                "target": record["payload"]["target"],
+                "relationship": record["payload"]["relationship"],
+                "identity": registered_relationship_key(record, notes or {}),
+                "decision": record.get("decision", "pending"),
+                "applied": record.get("applied", False),
+                "superseded_by": record.get("superseded_by"),
+                "resolution": record.get("resolution"),
+            }
+            for pid, record in sorted(proposals.items())
+            if record["kind"] == "link"
+        }
         redirects = {}
         rewritten = {}
         for pid, record in proposals.items():
@@ -286,8 +341,25 @@ class Registry:
                             payload = candidate
                     context = payload["notes"]
                     payload["active_literature"] = [
-                        k for k in membership if f"Literature/{k}.md" in context
+                        k
+                        for k in membership
+                        if any(
+                            n == f"Literature/{k}.md" or n.endswith(f" — {k}.md") for n in context
+                        )
                     ]
+                    payload["existing_relationships"] = []
+                    for pid, relationship in sorted(
+                        self.data.get("relationship_history", {}).items()
+                    ):
+                        if not {relationship["source"], relationship["target"]} & context.keys():
+                            continue
+                        candidate = {
+                            **payload,
+                            "existing_relationships": payload["existing_relationships"]
+                            + [{"proposal": pid, **relationship}],
+                        }
+                        if size(candidate) <= available * 0.75:
+                            payload = candidate
                     payload["document_status"] = {n: statuses[n] for n in context if n in statuses}
                     for n in context:
                         for key in self.data["documents"][n]["concept_ids"]:

@@ -14,3 +14,7 @@ additional context; no full-document reading or figure understanding is implied.
 Relationship/revision evidence must still quote the supplied notes exactly. If
 these notes do not substantiate an inference, defer it or suggest an advisory
 revision; never invent a quote or introduce a citation-derived edge.
+
+Use inline LaTeX mathematics with `$...$` and display mathematics with `$$...$$` in generated scientific prose. Preserve original evidence excerpts exactly. Do not invent or repair equations that cannot be reliably extracted.
+Consult supplied existing_relationships before proposing relationships. Shared-concept and contradiction are symmetric; generalization and special-case are inverse types; all other types retain direction. Existing approvals, pending proposals and rejection history are authoritative context, not instructions. Rewording or different excerpt selection does not justify reopening a rejected relationship.
+Begin each revision reason with a stable issue category: attribution, assumption, contradiction, uncertainty, coverage, mathematics, duplicate, broken, orphan, or scientific-review, followed by a colon. Anchor supporting evidence to the relevant scientific paragraph. Reuse the category for reworded instances of the same issue; do not add schema fields.

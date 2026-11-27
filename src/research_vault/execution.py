@@ -12,7 +12,7 @@ import uuid
 from .storage import VaultError, atomic, inside, lock, now, read_json
 
 
-def launch(config, full=False, startup=False):
+def launch(config, full=False, startup=False, retry=False):
     # Detect an existing writer before spawning. The child also takes the same OS lock;
     # simultaneous launch requests can never execute synchronization concurrently.
     with lock(config.root):
@@ -25,6 +25,7 @@ def launch(config, full=False, startup=False):
         "log": f".pipeline/runs/{run_id}.log",
         "full": full,
         "startup": startup,
+        "retry": retry,
         "provider_override": config.provider_override,
     }
     record_path = inside(config.root, f".pipeline/runs/{run_id}.json")
@@ -43,6 +44,8 @@ def launch(config, full=False, startup=False):
         command.append("--full")
     if startup:
         command.append("--startup")
+    if retry:
+        command.append("--retry")
     if config.provider_override:
         command.extend(["--provider", config.provider_override])
     options = (

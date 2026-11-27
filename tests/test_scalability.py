@@ -108,17 +108,19 @@ def test_new_document_retrieves_old_and_original_passages(vault):
     root, source, z, agent, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    old = (root / "Literature/PAPER001.md").read_bytes()
+    old = (root / "Literature/Synthetic item — PAPER001.md").read_bytes()
     before = len(agent.calls)
     path = write_pdf(source / "new.pdf", "Synthetic scientific evidence about a shared mechanism.")
     z.paper("PAPER002", [("PDF00002", path, "main")])
     pipeline.sync()
-    assert (root / "Literature/PAPER001.md").read_bytes() == old
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_bytes() == old
     recent = agent.calls[before:]
     assert sum(role == "literature" for role, _ in recent) == 1
     graph = [p for r, p in recent if r == "linking"]
     assert any(
-        {"Literature/PAPER001.md", "Literature/PAPER002.md"} <= p["notes"].keys() for p in graph
+        {"Literature/Synthetic item — PAPER001.md", "Literature/Synthetic item — PAPER002.md"}
+        <= p["notes"].keys()
+        for p in graph
     )
     assert any(r["source"] == "PDF00001" for p in graph for r in p["source_passages"])
 
@@ -132,7 +134,7 @@ def test_failed_paper_does_not_lose_successful_paper_or_approval(vault):
     decide(root, pipeline.state(), pid)
     review = root / pipeline.state()["proposals"][pid]["path"]
     approval = review.read_bytes()
-    original = (root / "Literature/PAPER001.md").read_bytes()
+    original = (root / "Literature/Synthetic item — PAPER001.md").read_bytes()
     path = write_pdf(source / "new.pdf")
     z.paper("PAPER002", [("PDF00002", path, "main")])
     agent.links = []
@@ -142,7 +144,7 @@ def test_failed_paper_does_not_lose_successful_paper_or_approval(vault):
     assert pipeline.state()["papers"]["PAPER002"]["status"] == "failed"
     assert pipeline.state()["papers"]["PAPER001"]["status"] == "successful"
     assert review.read_bytes() == approval
-    assert (root / "Literature/PAPER001.md").read_bytes() == original
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_bytes() == original
     agent.fail_role = None
     assert pipeline.sync()["complete"]
 
@@ -174,13 +176,13 @@ def test_attachment_inaccessibility_retains_note_and_never_removes_member(vault)
     root, _, z, _, pipeline = vault
     add_paper(vault)
     pipeline.sync()
-    original = (root / "Literature/PAPER001.md").read_bytes()
+    original = (root / "Literature/Synthetic item — PAPER001.md").read_bytes()
     saved = deepcopy(z.items["PAPER001"])
     z.items["PAPER001"]["attachments"][0]["error"] = "temporarily inaccessible OneDrive file"
     z.items["PAPER001"]["fingerprint"] = "inaccessible"
     result = pipeline.sync()
     assert not result["complete"] and "PAPER001" in result["skipped"]
-    assert (root / "Literature/PAPER001.md").read_bytes() == original
+    assert (root / "Literature/Synthetic item — PAPER001.md").read_bytes() == original
     assert not proposals(pipeline, "removal")
     assert pipeline.state()["membership"] == ["PAPER001"]
     z.items["PAPER001"] = saved
@@ -212,7 +214,7 @@ def test_real_adapter_recovers_from_unavailable_managed_and_linked_files(vault, 
     assert diagnostic["resolved_path"] == str(path)
     write_pdf(path)
     assert pipeline.sync()["complete"]
-    assert (root / "Literature/PAPER001.md").exists()
+    assert (root / pipeline.state()["papers"]["PAPER001"]["note"]).exists()
 
 
 def test_nonexistent_source_is_not_cached_as_success(vault):
@@ -274,8 +276,8 @@ def test_failed_document_does_not_block_later_new_document(vault):
 
     agent.run = fail_first
     assert not pipeline.sync()["complete"]
-    assert not (root / "Literature/PAPER001.md").exists()
-    assert (root / "Literature/PAPER002.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER002.md").exists()
     assert pipeline.status()["documents"]["papers"]["failed"] == ["PAPER001"]
     assert pipeline.status()["documents"]["papers"]["successful"] == ["PAPER002"]
     agent.run = original
@@ -295,7 +297,7 @@ def test_transaction_failure_rolls_back_only_current_document(vault, monkeypatch
 
     def fail_second(path, content):
         nonlocal failed
-        if path.name == "PAPER002.md" and not failed:
+        if path.name == "Synthetic item — PAPER002.md" and not failed:
             failed = True
             raise OSError("Synthetic transaction I/O failure")
         return atomic(path, content)
@@ -303,8 +305,8 @@ def test_transaction_failure_rolls_back_only_current_document(vault, monkeypatch
     monkeypatch.setattr(storage, "atomic", fail_second)
     with pytest.raises(VaultError, match="transaction I/O failure"):
         pipeline.sync()
-    assert (root / "Literature/PAPER001.md").exists()
-    assert not (root / "Literature/PAPER002.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER001.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER002.md").exists()
     assert pipeline.state()["papers"]["PAPER001"]["status"] == "successful"
     assert pipeline.state()["papers"]["PAPER002"]["status"] == "pending"
     assert not pipeline.status()["transaction_requires_recovery"]
@@ -332,7 +334,7 @@ def test_interrupted_reasoning_preserves_pending_proposals_and_cache(vault):
     assert pipeline.status()["reasoning_pending"]
     agent.run = original
     assert pipeline.sync()["complete"]
-    assert review.read_bytes() == before
+    assert (root / pipeline.state()["proposals"][pid]["path"]).read_bytes() == before
     assert sum(r == "linking" for r, _ in agent.calls) == 1
     assert sum(r == "literature" for r, _ in agent.calls) == 1
 
@@ -376,7 +378,7 @@ def test_old_state_records_migrate_without_removing_decisions(vault):
     (root / ".pipeline/state.json").write_text(json.dumps(state))
     pipeline.sync()
     assert pipeline.state()["schema"] == 1
-    assert review.read_bytes() == before
+    assert (root / pipeline.state()["proposals"][pid]["path"]).read_bytes() == before
     assert pipeline.status()["documents"]["papers"]["successful"] == ["PAPER001"]
 
 
@@ -452,6 +454,6 @@ def test_untrusted_metadata_cannot_inject_links_or_abort_other_documents(vault):
     z.paper("PAPER002", [("PDF00002", path, "main")])
     result = pipeline.sync()
     assert "contains links" in result["failed"]["PAPER001"]
-    assert not (root / "Literature/PAPER001.md").exists()
-    assert (root / "Literature/PAPER002.md").exists()
+    assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
+    assert (root / "Literature/Synthetic item — PAPER002.md").exists()
     assert not (root / "Concepts/injected.md").exists()

@@ -46,7 +46,7 @@ all selected supported attachments and consolidation succeed. Attachments record
 metadata_only/partial/complete/failed independently of parent coverage and job
 status. With no usable current result, the existing note stays intact. Never infer
 full-text claims from metadata. Each attachment checkpoint and usable parent note
-commits through the existing journal, and missing/failed work retries next sync. A complete Zotero membership snapshot is saved independently
+commits through the existing journal. Transient inference failures retry up to `processing.max_retry_attempts`; persistent coverage limitations wait for changed inputs/settings or `sync --retry`. A complete Zotero membership snapshot is saved independently
 of source accessibility, so unavailable attachments never become removals.
 `last_success` advances only if all jobs and conceptual reasoning finish; exit 2
 means partial completion. Invalid configuration, API/authentication failure,
@@ -126,7 +126,7 @@ Validated results use distinct content-addressed cache namespaces under
 | --- | --- | --- |
 | Source attachment/page extraction | `extractions` | Attachment SHA256, source key, page number (page records), PDF extractor implementation/version, PyMuPDF version and OCR settings |
 | Individual document summaries / consolidation | `document_summaries` | Exact source/chunk or summary payload, own role/global instructions, provider/model configuration, summary/chunking contract and upstream extraction version |
-| Concept extraction | `concept_extraction` | Exact note fragment, source provenance/completeness, own role/global instructions, concept schema/contract and provider/model configuration |
+| Concept extraction | `concept_extraction` | Canonical scientific note fragment, own role/global instructions, concept schema/contract and provider/model configuration |
 | Relationship proposals | `relationship_proposals` | Exact retrieved notes/concepts/passages/coverage, own role/global instructions, relationship schema/contract and provider/model configuration |
 | High-level synthesis | `high_level_synthesis` | Exact bounded reasoning context, synthesis instructions/schema/contract and provider/model configuration |
 | Maintenance | `maintenance` | Exact bounded context, maintenance instructions/schema/contract and provider/model configuration |
@@ -146,7 +146,7 @@ PDFs retain per-page `text`/`ocr`/`unprocessed` records with original locators,
 incomplete flags and failure reasons. Native extraction runs first; optional local
 Tesseract processes only pages below the configured non-whitespace threshold.
 Successful pages are reusable; partial document/page cache entries are recorded
-but retried next sync. This allows an engine/language-data repair to recover missing
+and retried with changed inputs/settings or `sync --retry`. This allows an engine/language-data repair to recover missing
 pages without repeating successful page OCR. Partial text does not qualify as full
 coverage. Blank pages remain unprocessed rather than being claimed as read.
 Only usable text enters summary evidence or passage retrieval; missing-page
@@ -327,3 +327,66 @@ exit 0 means launched, not scientifically complete; inspect the child report's
 exit code/result. The final child report distinguishes complete, incomplete and
 failed. Abrupt termination can leave a last-reported running/launching record;
 it never authorizes success or requires deleting a lock file. Retry ordinary sync.
+
+## Cancellation, migration and finalized-review recovery
+
+The plugin passes a random `--control-id` to each sync. Its Interrupt action writes
+only `.pipeline/cancel/<control-id>`; Python polls that marker at safe boundaries
+and while waiting for an inference/OCR subprocess. It never kills the WSL launcher
+or interrupts Apply Reviews. An acknowledged interruption records status `failed`,
+retains `last_success`, and exits 130. Completed documents, valid chunks, concept
+indexing and role-specific reasoning batches remain durable. The next Sync resumes
+unfinished operations. Native text extraction/API calls reach their next boundary
+or timeout first. A process forcibly killed by the OS cannot always record its final
+status; recover the transaction on the next mutating run. Do not delete lock/state files.
+
+Dry-run synchronization never authenticates, runs OCR/inference, writes caches or
+updates research notes/state. It inspects native text and reports limitations and
+approximate operation estimates. Plugin cancellation uses a transient marker even
+for a dry run; its UI outcome is Failed and that marker is removed on completion.
+
+Source byte signatures and summary recipes control document work. Canonical scientific
+note fingerprints independently control concept extraction and graph reasoning.
+Presentation headers, bibliographic JSON, processing reports and Python-owned link
+sections are excluded. Completed reasoning-role batches have a scientific-input key
+separate from proposal history; changing review status or adding graph bookkeeping
+does not invalidate those operations. `sync --full` bypasses reuse deliberately.
+Retries are bounded for unchanged temporary failures; use `--retry` after repairing
+an external dependency or to retry persistent limitations. Missing/unread pages
+always retain explicit incomplete coverage.
+
+`migrate` previews existing key/title filenames, bibliography and finalized reviews.
+It uses a complete Zotero snapshot plus stored metadata for retained absent items,
+and performs no PDF extraction or inference. Back up the complete private vault,
+inspect `diffs`, `renames` and `user_note_previews`, then execute the unchanged plan
+with `migrate --execute --plan-token TOKEN`. User-authored reference changes require
+explicit repeated `--authorize-note PATH` on BOTH preview and execution. By default
+those references remain intact and old paths/keys become aliases. No destination
+collision or missing ownership marker is bypassed. Missing bibliographic metadata
+is reported and that item is retained. Original proposal records and Markdown are
+saved verbatim under `.pipeline/migration_history/`; migrated payload paths and
+hashes are updated without reapproving scientific relationships or rebasing stale science.
+
+Review archives live under `.pipeline/review_history/approved`, `rejected`,
+`superseded` and `resolved`. Applied approvals and finalized closures move with the
+registry/application transaction. Unapplied, stale or conflicting approvals remain
+in Reviews. Archive Markdown retains the original decision/payload/timestamp;
+registry records retain application outcome/time and archive time. A failed move
+rolls back the application and registry update together. Restore archived reviews
+alongside state from the SAME backup; never move files manually to resurrect approvals.
+Use `review history [ID]` or the plugin history picker for full records. Reconsidering
+a rejected link/revision requires the explicit `review reconsider` command and a new
+verified supporting excerpt, which creates a separately pending proposal.
+
+Statuses separate technical completion, coverage and human decisions. Persisted
+`status` values are `up_to_date`, `completed_reviews_pending`,
+`completed_with_limitations`, `incomplete_resumable`, and `failed`.
+`technical_complete`, `source_coverage_complete`, `human_reviews_pending` and the
+outstanding-error/limitation maps provide the independent dimensions. Legacy
+`complete` remains false for incomplete source coverage. The GUI displays the
+specific status even when legacy CLI exit 2 indicates retained limitations.
+
+Migration and archive failures use the same write-ahead rollback mechanism as note
+application. On power loss, the next mutating command recovers before planning.
+Synthetic fault-injection tests cover rollback; native Windows/WSL process behavior
+and live provider installations still need environment-specific verification.

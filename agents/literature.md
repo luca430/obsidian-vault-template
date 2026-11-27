@@ -23,3 +23,5 @@ uncertain equations, table structure and figures. section and character_offset a
 text heuristics; context_before/context_after provide adjacent explanatory text.
 Partial attachment coverage is not full-parent coverage. Never infer full-text
 findings from bibliographic metadata or inaccessible supplements.
+
+Use inline LaTeX mathematics with `$...$` and display mathematics with `$$...$$` in generated scientific prose. Preserve original evidence excerpts exactly. Do not invent or repair equations that cannot be reliably extracted.

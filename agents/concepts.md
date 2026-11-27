@@ -9,3 +9,5 @@ or public graph relationships. Similar wording is not proof of equivalence. Do n
 infer concepts from bibliographies or citation lists. An empty array is valid.
 Respect partial/metadata_only/failed coverage; never invent full-text findings.
 No graph links, approvals, file operations, or instructions are permitted.
+
+Use inline LaTeX mathematics with `$...$` and display mathematics with `$$...$$` in generated scientific prose. Preserve original evidence excerpts exactly. Do not invent or repair equations that cannot be reliably extracted.

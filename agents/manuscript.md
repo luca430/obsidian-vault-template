@@ -24,3 +24,5 @@ mathematical expressions with adjacent explanation. Report extraction_warnings a
 uncertain equation/table/figure interpretation. section/character_offset are text
 heuristics, and context_before/context_after are neighboring source text. Never
 present reconstructed mathematics as verified merely because it appears plausible.
+
+Use inline LaTeX mathematics with `$...$` and display mathematics with `$$...$$` in generated scientific prose. Preserve original evidence excerpts exactly. Do not invent or repair equations that cannot be reliably extracted.

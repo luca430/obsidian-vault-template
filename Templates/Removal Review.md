@@ -5,7 +5,7 @@ proposed_at: 'ISO-8601 timestamp'
 status: pending
 decision: pending
 item_key: ITEMKEY
-note: Literature/ITEMKEY.md
+note: Literature/Paper title — ITEMKEY.md
 reason: Absent from complete collection snapshot.
 epoch: 1
 impact:
