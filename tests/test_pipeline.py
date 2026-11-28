@@ -294,7 +294,9 @@ def test_deletion_backup_cleanup_and_personal_note_preserved(vault):
     add_paper(vault)
     pipeline.sync()
     personal = root / "My Notes/idea.md"
-    personal.write_text("User hypothesis refers to [[Literature/Synthetic item — PAPER001]].")
+    personal.write_text(
+        "User hypothesis refers to [[Literature/Synthetic item — PAPER001]].", encoding="utf-8"
+    )
     # An approved relationship is in a Python-owned links region.
     from research_vault.notes import new_note
 
@@ -303,7 +305,8 @@ def test_deletion_backup_cleanup_and_personal_note_preserved(vault):
         new_note("concept:existing", "concept", "Existing", "Synthetic concept.").replace(
             "<!-- links:start -->",
             "<!-- links:start -->\n- [[Literature/Synthetic item — PAPER001]]",
-        )
+        ),
+        encoding="utf-8",
     )
     git_init(root)
     z.items.clear()
@@ -319,7 +322,7 @@ def test_deletion_backup_cleanup_and_personal_note_preserved(vault):
     assert (root / result["backup"]).exists()
     assert not (root / "Literature/Synthetic item — PAPER001.md").exists()
     assert personal.read_bytes() == before
-    assert "[[Literature/Synthetic item — PAPER001]]" not in concept.read_text()
+    assert "[[Literature/Synthetic item — PAPER001]]" not in concept.read_text(encoding="utf-8")
     assert any(
         "Source removed" in r["payload"].get("reason", "")
         for r in proposals(pipeline, "revision").values()

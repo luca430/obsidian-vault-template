@@ -41,7 +41,7 @@ def test_applying_another_link_preserves_other_approval_and_relationship_type(va
     assert second in report["ready_ids"]
     preview = pipeline.apply(dry_run=True, proposal_ids=[second])
     pipeline.apply(proposal_ids=[second], plan_token=preview["plan_token"])
-    text = (root / "Literature/Synthetic item — PAPER001.md").read_text()
+    text = (root / "Literature/Synthetic item — PAPER001.md").read_text(encoding="utf-8")
     assert " — method:" in text and " — mechanism:" in text
 
 
@@ -168,7 +168,10 @@ def prepare_merge(vault, operation="merge"):
     from research_vault.consolidations import append_link
 
     (root / source).write_text(
-        append_link((root / source).read_text(), b, "method", "Measured under B.", "a" * 24)
+        append_link(
+            (root / source).read_text(encoding="utf-8"), b, "method", "Measured under B.", "a" * 24
+        ),
+        encoding="utf-8",
     )
     personal = root / "My Notes/idea.md"
     personal.write_text("A personal hypothesis refers to [[Concepts/Feedback controls]].")
@@ -237,13 +240,13 @@ def test_merge_preview_preserves_history_and_redirects_with_exact_link_impact(va
 def test_separate_or_related_concepts_keep_their_definitions(vault, operation):
     root, _, _, _, pipeline = vault
     a, b, _, pid = prepare_merge(vault, operation)
-    before = {p: dependency_text((root / p).read_text()) for p in [a, b]}
+    before = {p: dependency_text((root / p).read_text(encoding="utf-8")) for p in [a, b]}
     decide(root, pipeline.state(), pid)
     pipeline.apply(proposal_ids=[pid])
-    assert all(dependency_text((root / p).read_text()) == before[p] for p in [a, b])
+    assert all(dependency_text((root / p).read_text(encoding="utf-8")) == before[p] for p in [a, b])
     assert not pipeline.review_status()["concept_candidates"]
     if operation == "relate":
-        assert " — special-case:" in (root / a).read_text()
+        assert " — special-case:" in (root / a).read_text(encoding="utf-8")
 
 
 def test_changed_merge_member_blocks_old_merge_and_exposes_diff(vault):
@@ -314,7 +317,7 @@ def test_suggested_merge_is_pending_and_preserves_both_relationship_types(vault)
     preview = pipeline.apply(dry_run=True, proposal_ids=[pid])
     assert preview["can_apply"]
     pipeline.apply(proposal_ids=[pid], plan_token=preview["plan_token"])
-    text = (root / first["source"]).read_text()
+    text = (root / first["source"]).read_text(encoding="utf-8")
     assert " — mechanism:" in text and " — assumption:" in text
     for old, record in proposals(pipeline, "link").items():
         assert not record["applied"] and record["superseded_by"] == pid

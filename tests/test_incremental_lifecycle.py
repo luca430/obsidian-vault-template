@@ -194,7 +194,11 @@ def legacy_layout(vault):
     # Registered review payloads and their byte snapshots move consistently.
     for record in state["proposals"].values():
         path = root / record["path"]
-        path.write_text(path.read_text().replace(current, legacy))
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(current, legacy),
+            encoding="utf-8",
+            newline="\n",
+        )
         record["payload_hash"] = digest(record["payload"])
     state["graph_digest"] = graph_signature(read_notes(root), reasoning_recipe(pipeline.config))
     atomic(root / ".pipeline/state.json", json.dumps(state, ensure_ascii=False))
@@ -359,11 +363,11 @@ def test_personal_approved_graph_lines_do_not_reenter_scientific_index(vault):
     (root / source).write_text("Synthetic scientific evidence.")
     agent.links = [link(source)]
     pipeline.sync()
-    before_science = scientific_text((root / source).read_text())
+    before_science = scientific_text((root / source).read_text(encoding="utf-8"))
     pid = next(iter(proposals(pipeline, "link")))
     decide(root, pipeline.state(), pid)
     pipeline.apply()
-    assert scientific_text((root / source).read_text()) == before_science
+    assert scientific_text((root / source).read_text(encoding="utf-8")) == before_science
     before = len(agent.calls)
     assert not pipeline.sync()["inference_operations"]
     assert len(agent.calls) == before
@@ -386,7 +390,7 @@ def test_migration_moves_approved_review_history_without_losing_original_payload
     record = pipeline.state()["proposals"][pid]
     assert record["applied"] and record["decision"] == "approved"
     assert record["payload"]["source"] == new and original["source"] == old
-    audit = json.loads((root / record["migration_history"][-1]).read_text())
+    audit = json.loads((root / record["migration_history"][-1]).read_text(encoding="utf-8"))
     assert audit["record"]["payload"] == original
     assert read_reviews(root, pipeline.state()["proposals"])[pid]["status"] == "approved"
     assert "[[Concepts/mechanism]]" in (root / new).read_text()
@@ -402,7 +406,7 @@ def test_authorized_migration_reference_changes_require_unchanged_preview(vault)
     with pytest.raises(VaultError, match="preview changed"):
         migrate(pipeline, True, "0" * 64, [name])
     migrate(pipeline, True, preview["plan_token"], [name])
-    assert (root / name).read_text() == "[[" + new[:-3] + "|original]]"
+    assert (root / name).read_text(encoding="utf-8") == "[[" + new[:-3] + "|original]]"
     assert not (root / old).exists()
 
 
@@ -419,7 +423,11 @@ def test_migration_updates_withheld_legacy_claim_destination_without_processing(
     state = json.loads(json.dumps(pipeline.state(), ensure_ascii=False).replace(new, old))
     for record in state["proposals"].values():
         path = root / record["path"]
-        path.write_text(path.read_text().replace(new, old))
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(new, old),
+            encoding="utf-8",
+            newline="\n",
+        )
         record["payload_hash"] = digest(record["payload"])
     atomic(root / ".pipeline/state.json", json.dumps(state, ensure_ascii=False))
     before = len(agent.calls)

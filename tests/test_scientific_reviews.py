@@ -33,9 +33,9 @@ def uncertain_summaries(agent, item="PAPER001", stage=None):
 
 def edit_revision(root, state, pid, revision):
     path = root / state["proposals"][pid]["path"]
-    meta, body = frontmatter(path.read_text())
+    meta, body = frontmatter(path.read_text(encoding="utf-8"))
     meta["revision"] = revision
-    path.write_text(markdown(meta, body))
+    path.write_text(markdown(meta, body), encoding="utf-8", newline="\n")
 
 
 def test_uncertain_summary_is_successful_quarantined_cached_and_isolated(vault):

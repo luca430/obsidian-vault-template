@@ -148,11 +148,11 @@ def decide(root, state, pid, status="approved", decision=None):
     path = root / state["proposals"][pid]["path"]
     from research_vault.storage import frontmatter, markdown
 
-    meta, body = frontmatter(path.read_text())
+    meta, body = frontmatter(path.read_text(encoding="utf-8"))
     meta["status"] = status
     if decision:
         meta["decision"] = decision
-    path.write_text(markdown(meta, body))
+    path.write_text(markdown(meta, body), encoding="utf-8", newline="\n")
 
 
 def link(source="Literature/Synthetic item — PAPER001.md", target="Concepts/mechanism.md"):

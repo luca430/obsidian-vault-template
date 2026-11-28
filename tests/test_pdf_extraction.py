@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import PurePosixPath
 
 import pymupdf
 import pytest
@@ -328,17 +329,18 @@ def test_bibliography_does_not_make_unread_pdf_manuscript_processable(vault):
 
 def test_wsl_ocr_executable_uses_existing_local_path_translation(monkeypatch):
     raw = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    translated = PurePosixPath("/mnt/c/Program Files/Tesseract-OCR/tesseract.exe")
     seen = []
 
     def translate(value):
         seen.append(value)
-        return sources.Path("/mnt/c/Program Files/Tesseract-OCR/tesseract.exe")
+        return translated
 
     monkeypatch.setattr(sources, "local_path", translate)
     monkeypatch.setattr(sources.shutil, "which", lambda name: name)
     result = sources.ocr_diagnostics({**sources.OCR_DEFAULTS, "enabled": True, "executable": raw})
     assert seen == [raw] and result["status"] == "available"
-    assert result["resolved_executable"].startswith("/mnt/c/")
+    assert result["resolved_executable"] == str(translated)
 
 
 @pytest.mark.parametrize("available", [False, True])
