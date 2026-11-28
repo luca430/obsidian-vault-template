@@ -65,6 +65,21 @@ def test_latex_cycle_and_dynamic_includes_fail_explicitly(vault):
         latex(pipeline.config, main)
 
 
+def test_latex_preserves_graphics_commands_in_included_source(vault):
+    _, source, _, _, pipeline = vault
+    main = source / "main.tex"
+    main.write_text(r"\include{chapter}", encoding="utf-8")
+    chapter = source / "chapter.tex"
+    graphics_commands = [r"\includegraphics{figure}", r"\includegraphics*[width=2cm]{detail}"]
+    chapter.write_text("\n".join(graphics_commands), encoding="utf-8")
+
+    pages, hashes = latex(pipeline.config, main)
+
+    assert set(hashes) == {str(main.resolve()), str(chapter.resolve())}
+    assert pages[-1]["locator"] == "resolved LaTeX"
+    assert pages[-1]["text"].strip() == "\n".join(graphics_commands)
+
+
 def test_lock_exclusion_and_release(vault):
     root, *_ = vault
     with lock(root):

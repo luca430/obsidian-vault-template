@@ -198,7 +198,8 @@ def latex(config: Config, path: Path) -> tuple[list[dict], dict[str, str]]:
         hashes[str(current)] = file_hash(current)
         # Keep mathematics; remove only unescaped comment tails for include parsing.
         text = re.sub(r"(?<!\\)%[^\n]*", "", text)
-        if re.search(r"\\(?:input|include)\s*(?!\s*\{)[^\s{]", text):
+        # Match complete control words so commands like \includegraphics are ignored here.
+        if re.search(r"\\(?:input|include)(?![A-Za-z])\s*(?!\s*\{)[^\s{]", text):
             raise VaultError("Only literal braced LaTeX input/include directives are supported")
         pages.append({"source": str(current), "locator": "LaTeX source", "text": text})
 
